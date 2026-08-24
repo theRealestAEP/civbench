@@ -1,0 +1,14 @@
+# The same duel, played by the scripted baseline. Free, deterministic, and the ELO floor (§13).
+seed: 8891234
+game:
+  build: "1.4.2"
+  start_age: antiquity
+  map_size: small
+  turn_limit: 6
+  filler_ai: none
+  game_modes: []
+control_mode: direct
+agents:
+  - { slot: 0, player_id: 0, name: alpha, budget: { actions_per_turn: 30, seconds_per_turn: 30 } }
+  - { slot: 1, player_id: 1, name: beta,  budget: { actions_per_turn: 30, seconds_per_turn: 30 } }
+harness: { stall_strikes: 3 }

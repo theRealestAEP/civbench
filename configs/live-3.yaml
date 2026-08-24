@@ -1,0 +1,48 @@
+# Three LLM agents, quick speed, biased hard toward a military outcome.
+#
+# Civ VII has no per-victory toggle — victories are tied to Ages and Legacy Paths (see
+# docs/FINDINGS.md). But VICTORY_DOMINATION exists in EVERY Age, not just Modern, so a single
+# Antiquity age at quick speed on a tiny map makes conquest the only outcome reachable inside the
+# turn budget. That is the closest the game allows to "military only" — and it avoids starting
+# mid-game in the Modern age, which needs prior-age legacy setup the host path cannot supply.
+seed: 8891234
+
+game:
+  build: "1.4.2"
+  start_age: antiquity       # domination is available in every Age
+  single_age: true           # one age, no transitions — the match ends in a victory
+  game_speed: GAMESPEED_QUICK
+  # map_size: left at the platform default. MAPSIZE_TINY is rejected on macOS with
+  # "MAP SIZE UNSUPPORTED", and the refusal only appears as an in-game dialog.
+  map_size: default
+  turn_limit: 40
+  filler_ai: none            # agents only, per the brief
+  crises: true
+  game_modes: []
+
+# hotseat, not direct: a SERVER_TYPE_NONE single-player game gives exactly ONE human seat no
+# matter how many slots are marked SS_TAKEN — the rest are converted back to AI at load time.
+# Hotseat is the mode built for several humans on one machine.
+control_mode: hotseat
+
+agents:
+  - slot: 0
+    player_id: 0
+    name: sonnet-a
+    brain: { model: claude-sonnet-5 }
+    budget: { actions_per_turn: 40, seconds_per_turn: 600 }
+  - slot: 1
+    player_id: 1
+    name: sonnet-b
+    brain: { model: claude-sonnet-5 }
+    budget: { actions_per_turn: 40, seconds_per_turn: 600 }
+  - slot: 2
+    player_id: 2
+    name: sonnet-c
+    brain: { model: claude-sonnet-5 }
+    budget: { actions_per_turn: 40, seconds_per_turn: 600 }
+
+harness:
+  hud_fields: default
+  autosave_every_turn: true
+  stall_strikes: 3

@@ -1,0 +1,30 @@
+{
+  "name": "civbench",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "demo": "node tools/demo.ts",
+    "probe": "node tools/probe.ts",
+    "extract-sources": "node tools/extract-game-sources.mjs",
+    "replay": "node tools/replay.ts",
+    "enable-debug": "node tools/enable-debug.ts",
+    "match": "node tools/run-match.ts",
+    "score": "node tools/score.ts",
+    "launch": "node tools/launch.ts",
+    "live": "node tools/live-session.ts",
+    "spectate": "node tools/spectate.ts",
+    "start": "node tools/start.ts",
+    "agent-log": "node tools/agent-log.ts"
+  },
+  "dependencies": {
+    "@mariozechner/pi-agent-core": "^0.73.1",
+    "@mariozechner/pi-ai": "^0.73.1",
+    "@tinysandbox/tinysandbox": "^0.5.0",
+    "yaml": "^2.9.0"
+  }
+}

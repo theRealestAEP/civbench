@@ -1,0 +1,41 @@
+# A two-agent duel. The smallest useful benchmark match (docs/PLAN.md §13).
+seed: 8891234
+
+game:
+  build: "1.4.2"          # pinned; a patch closes the season (§14)
+  dlc: [all]
+  start_age: antiquity
+  age_length: standard
+  map_type: continents_plus
+  map_size: small
+  difficulty: sovereign   # applies to filler AI only
+  crises: true
+  turn_limit: 150
+  filler_ai: none
+  game_modes: []          # none are covered yet; listing one refuses the match
+
+control_mode: direct      # confirmed possible by FINDINGS item 4; hotseat is the fallback
+
+agents:
+  - slot: 0
+    player_id: 0
+    name: alpha
+    leader: HATSHEPSUT
+    civ: EGYPT
+    civ_switch: agent
+    brain: { model: claude-sonnet-5 }
+    budget: { tokens_per_game: 40000000, seconds_per_turn: 180, actions_per_turn: 60 }
+
+  - slot: 1
+    player_id: 1
+    name: beta
+    leader: CONFUCIUS
+    civ: HAN
+    civ_switch: agent
+    brain: { model: gpt-5 }
+    budget: { tokens_per_game: 40000000, seconds_per_turn: 180, actions_per_turn: 60 }
+
+harness:
+  hud_fields: default
+  autosave_every_turn: true
+  stall_strikes: 3

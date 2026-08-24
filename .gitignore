@@ -1,0 +1,27 @@
+# Secrets. Never commit these.
+.env
+.env.*
+!.env.example
+
+# Internal planning and working notes. Not part of the published project.
+docs/
+
+# Match output: transcripts, dumps, saves, replays. Large, and it carries model output
+# verbatim — agent reasoning, journals, and anything they said to each other.
+runs/
+*.log
+
+# Generated at startup from CLI flags; never hand-edited, never meaningful to share.
+configs/generated/
+
+# The game's own decompiled UI source, extracted locally from the installed copy.
+# Firaxis' code: local reference only, not ours to redistribute.
+reference/
+
+node_modules/
+
+# macOS and editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

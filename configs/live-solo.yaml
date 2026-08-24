@@ -1,0 +1,12 @@
+# One scripted seat against the live game. The smallest end-to-end live check.
+seed: 8891234
+game:
+  build: "1.4.2"
+  start_age: antiquity
+  turn_limit: 4
+  filler_ai: filler
+  game_modes: []
+control_mode: direct
+agents:
+  - { slot: 0, player_id: 0, name: alpha, budget: { actions_per_turn: 20, seconds_per_turn: 120 } }
+harness: { stall_strikes: 3 }
