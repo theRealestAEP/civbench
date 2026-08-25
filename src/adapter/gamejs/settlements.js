@@ -20,7 +20,20 @@ for (const id of player?.Cities?.getCityIds?.() ?? []) {
     currentFood: city.Growth?.currentFood ?? null,
     projectType: city.Growth?.projectType ?? null,
     productionTurnsLeft: city.BuildQueue?.getTurnsLeft?.() ?? null,
-    productionHash: city.BuildQueue?.currentProductionTypeHash ?? null,
+    // The NAME, resolved here. The raw hash used to be all the dump carried, and it survived only
+    // into the JSONL — the one thing this codebase forbids showing an agent. So `prod_turns_left=3`
+    // told a player its city would finish something in three turns without saying what.
+    building: (() => {
+      const h = city.BuildQueue?.currentProductionTypeHash;
+      if (h === null || h === undefined || h === -1) return null;
+      return typeName("Units", h) ?? typeName("Constructibles", h) ?? typeName("Projects", h) ?? null;
+    })(),
+    // Growth, as the city panel shows it: how much food, how much is needed, how long.
+    foodToGrow: city.Growth?.getNextGrowthFoodThreshold?.()?.value ?? null,
+    foodPerTurn: city.Growth?.foodPerTurn ?? null,
+    turnsToGrow: city.Growth?.turnsUntilGrowth ?? null,
+    urbanPopulation: city.Population?.urbanPopulation ?? null,
+    ruralPopulation: city.Population?.ruralPopulation ?? null,
     queueEmpty: city.BuildQueue?.isEmpty ?? null,
     happiness: city.Happiness?.netHappinessPerTurn ?? null,
     hasUnrest: city.Happiness?.hasUnrest ?? null,

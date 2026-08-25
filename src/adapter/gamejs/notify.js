@@ -20,10 +20,10 @@ function findId(wanted) {
 // button does when the game refuses it.
 let target = null;
 if (TARGET_ID === null || TARGET_ID === undefined || TARGET_ID === "") {
-  try {
-    const blockingType = Game.Notifications?.getEndTurnBlockingType?.(PLAYER_ID);
-    target = Game.Notifications?.findEndTurnBlocking?.(PLAYER_ID, blockingType) ?? null;
-  } catch { target = null; }
+  // endTurnBlocker() is the one place that knows findEndTurnBlocking needs the type as a second
+  // argument AND that NONE is 0 rather than null. This re-implemented it and dropped the NONE
+  // check, so with nothing blocking it asked the engine to find a notification of type NONE.
+  target = endTurnBlocker(PLAYER_ID)?.id ?? null;
   if (!target) return { ok: false, code: "NOTHING_BLOCKING", message: "nothing is blocking your turn" };
 } else {
   target = findId(TARGET_ID);

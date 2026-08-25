@@ -6,8 +6,9 @@
 import { join } from "node:path";
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import type { GameAdapter } from "../adapter/game.ts";
-import { writeSnapshot, emptyMemory, type PlayerMemory } from "../dump/snapshot.ts";
+import { writeSnapshot, emptyMemory, pad as turnDirName, type PlayerMemory } from "../dump/snapshot.ts";
 import type { MatchFacts } from "../dump/hud.ts";
+import { actionLines, type LegalActions } from "../dump/actions.ts";
 import { mergeTiles, mergeForeignSettlements } from "../dump/merge.ts";
 import {
   tileLines, unitLines, settlementLines, playerLines, pendingLines, toJsonl,
@@ -33,7 +34,10 @@ export type ActionRequest = {
     | "city_operation"
     | "city_command"
     | "player_operation"
-    | "choose";
+    | "choose"
+    | "diplomacy"
+    | "notify"
+    | "deal";
   targetId?: string | number;
   actionType: string;
   args?: Record<string, unknown>;
@@ -72,6 +76,8 @@ export class MatchServer {
   autosave = true;
   #runDir: string;
   #match?: MatchFacts;
+  /** Seats whose dump was written before the engine had applied their last action. */
+  #dumpStale = new Set<number>();
   #agents: Map<number, AgentConfig>;
   #memory = new Map<number, PlayerMemory>();
   #turnState = new Map<number, TurnState>();
@@ -94,7 +100,15 @@ export class MatchServer {
     for (const a of agents) {
       this.#memory.set(a.playerId, emptyMemory());
       mkdirSync(this.agentDir(a.playerId), { recursive: true });
-      const notes = join(this.agentDir(a.playerId), "notes.md");
+      // Seed the journal into the WRITABLE mount.
+      //
+      // agentDir() is mounted read-only as /run. Seeding there put a notes.md the agent could see
+      // but never write, while /notes/notes.md — the path the briefing calls "the ONLY thing you
+      // keep between turns" — did not exist at all. Every agent's first read of its own journal
+      // failed, and a decoy sat in /run to confuse it.
+      const notesDir = join(runDir, "notes", a.name);
+      mkdirSync(notesDir, { recursive: true });
+      const notes = join(notesDir, "notes.md");
       if (!existsSync(notes)) {
         writeFileSync(
           notes,
@@ -134,6 +148,12 @@ export class MatchServer {
       notesText = readFileSync(join(this.#runDir, "notes", this.#nameOf(playerId), "notes.md"), "utf8");
     } catch { /* first turn, or the agent has not written any */ }
 
+    // messages.txt has to exist BEFORE the snapshot renders the HUD, or the "Messages" section
+    // reads an absent file and is silently empty every turn. It used to be written afterwards.
+    const turnDirForMessages = join(this.agentDir(playerId), "turns", turnDirName(raw.header.turn));
+    mkdirSync(turnDirForMessages, { recursive: true });
+    writeFileSync(join(turnDirForMessages, "messages.txt"), renderMessages(unread));
+
     const written = writeSnapshot(
       this.agentDir(playerId),
       raw,
@@ -146,9 +166,15 @@ export class MatchServer {
     this.#currentTurnDir.set(playerId, written.dir);
     this.#lastTurnSeen.set(playerId, raw.header.turn);
 
-    // Deliver anything other seats have said to this one (§13).
-    writeFileSync(join(written.dir, "messages.txt"), renderMessages(unread));
     this.#chat.markRead(this.#nameOf(playerId));
+    // What the engine says is legal, this turn, for free. Never fatal: a match without it is
+    // worse for the agent but still a match.
+    try {
+      const legal = (await this.legalActions(playerId)) as LegalActions;
+      writeFileSync(join(written.dir, "actions.txt"), actionLines(legal).join("\n") + "\n");
+    } catch { /* the agent still has `civ what-can` */ }
+
+    this.#dumpStale.delete(playerId);
     this.#turnState.set(playerId, { actionsUsed: 0, ended: false, illegalCount: 0, repeats: new Map() });
     this.#log.append({
       turn: raw.header.turn,
@@ -252,6 +278,17 @@ export class MatchServer {
     } catch { /* the turn directory may already be gone */ }
   }
 
+  /** What other civs have said to this seat this turn. */
+  currentMessages(playerId: number): string | null {
+    const dir = this.#currentTurnDir.get(playerId);
+    if (!dir) return null;
+    try {
+      return readFileSync(join(dir, "messages.txt"), "utf8");
+    } catch {
+      return null;
+    }
+  }
+
   /** This turn's tile dump, read back from disk — the same bytes the agent can read. */
   currentTilesText(playerId: number): string | null {
     const dir = this.#currentTurnDir.get(playerId);
@@ -294,21 +331,53 @@ export class MatchServer {
     return this.act(playerId, { kind: "choose", actionType: what, targetId, args: { thing: value } });
   }
 
-  /** Dismiss or open a notification. With no id, act on whatever is blocking the turn. */
-  async notify(playerId: number, mode: "dismiss" | "activate", id?: string): Promise<unknown> {
-    return this.#adapter.run<unknown>("notify", playerId, { MODE: mode, TARGET_ID: id ?? null });
+  /** What you can do to another civilization, and doing it. */
+  async diplomacy(playerId: number, other?: number, action?: string): Promise<unknown> {
+    if (other === undefined || !action) {
+      return this.#adapter.run<unknown>("diplomacy", playerId, {
+        OTHER_PLAYER: other ?? null,
+        ACTION: null,
+      });
+    }
+    return this.act(playerId, {
+      kind: "diplomacy",
+      actionType: action,
+      targetId: String(other),
+      args: { other, action },
+    });
   }
 
-  /** What a settlement can build right now, with names rather than hashes. */
-  async production(playerId: number, settlementId: string): Promise<unknown> {
-    return this.#adapter.run<unknown>("produce", playerId, { TARGET_ID: Number(settlementId) });
+  /** Dismiss or open a notification. With no id, act on whatever is blocking the turn. */
+  async notify(playerId: number, mode: "dismiss" | "activate", id?: string): Promise<unknown> {
+    // Through act(), not straight to the adapter. This changes game state, so it must spend the
+    // action budget and land in events.jsonl like anything else — metrics.ts scores hygiene from
+    // `kind === "action"` events alone, so an unlogged mutation is invisible to the benchmark and
+    // a seat could spend a whole turn dismissing notifications with a spotless record.
+    return this.act(playerId, {
+      kind: "notify",
+      actionType: mode,
+      targetId: id,
+      args: { mode, id: id ?? null },
+    });
   }
 
   /** Trade deals — the one part of diplomacy that is not an operation (§13). */
-  async deal(playerId: number, mode: string, otherPlayer: number): Promise<unknown> {
-    return this.#adapter.run<unknown>("deal", playerId, {
-      DEAL_MODE: mode,
-      OTHER_PLAYER: otherPlayer,
+  async deal(
+    playerId: number,
+    mode: string,
+    otherPlayer: number,
+    extra?: { kind?: string; amount?: number; subject?: string },
+  ): Promise<unknown> {
+    // `items` and `pending` only read; `send` and `clear` change the game and are accounted for.
+    const reads = mode === "items" || mode === "pending";
+    if (reads) {
+      return this.#adapter.run<unknown>("deal", playerId, { DEAL_MODE: mode, OTHER_PLAYER: otherPlayer });
+    }
+    return this.act(playerId, {
+      kind: "deal",
+      actionType: mode,
+      targetId: String(otherPlayer),
+      args: { mode, other: otherPlayer, itemKind: extra?.kind, amount: extra?.amount, subject: extra?.subject },
     });
   }
 
@@ -319,6 +388,25 @@ export class MatchServer {
    * agent needs a stable "what changed since last turn" to reason against. Only the current-state
    * files move.
    */
+  /**
+   * Everything this seat can legally do right now, asked of the engine.
+   *
+   * Written to the turn directory each turn so an agent can grep it for free. The alternative it
+   * replaces was /run/rules/operations.txt: 229 lines, written once at match start, listing every
+   * operation the build knows whether or not it applies. 36% of all actions ever taken were
+   * refused, and the commonest refusal carried no reason, because the engine gives none for a
+   * wrong argument. Agents had nowhere to look, so they guessed.
+   */
+  async legalActions(playerId: number): Promise<unknown> {
+    return this.#adapter.run<unknown>("actions", playerId, {});
+  }
+
+  /** Bring the dump up to date if the last refresh raced the engine. Cheap when it did not. */
+  async settleDump(playerId: number): Promise<void> {
+    if (!this.#dumpStale.delete(playerId)) return;
+    await this.refreshDump(playerId).catch(() => undefined);
+  }
+
   async refreshDump(playerId: number): Promise<void> {
     const dir = this.#currentTurnDir.get(playerId);
     if (!dir) return;
@@ -338,6 +426,14 @@ export class MatchServer {
     writeFileSync(join(dir, "players.txt"), playerLines(raw.players.known).join("\n") + "\n");
     writeFileSync(join(dir, "pending.txt"), pendingLines(raw.pending).join("\n") + "\n");
     writeFileSync(join(dir, "header.json"), JSON.stringify(raw.header, null, 2));
+
+    // actions.txt too. It was written once at turn start and left to rot: after the first move of
+    // the turn it described a position the agent no longer had, while the briefing tells agents to
+    // trust it over guessing.
+    try {
+      const legal = (await this.legalActions(playerId)) as LegalActions;
+      writeFileSync(join(dir, "actions.txt"), actionLines(legal).join("\n") + "\n");
+    } catch { /* the previous copy is better than none */ }
   }
 
   /** Legal actions for a settlement, or for the player themselves. */
@@ -459,7 +555,12 @@ export class MatchServer {
 
     state.actionsUsed++;
     const result = await this.#adapter.run<ActionResult>(
-      request.kind === "choose" ? "choose" : "act",
+      request.kind === "choose" ||
+        request.kind === "diplomacy" ||
+        request.kind === "notify" ||
+        request.kind === "deal"
+        ? request.kind
+        : "act",
       playerId,
       {
         KIND: request.kind,
@@ -468,6 +569,13 @@ export class MatchServer {
         ACTION_TYPE: request.actionType,
         ARGS: request.args ?? {},
         THING: request.args?.thing ?? null,
+        OTHER_PLAYER: request.args?.other ?? null,
+        ACTION: request.args?.action ?? null,
+        MODE: request.args?.mode ?? null,
+        DEAL_MODE: request.args?.mode ?? null,
+        ITEM_KIND: request.args?.itemKind ?? null,
+        AMOUNT: request.args?.amount ?? null,
+        SUBJECT: request.args?.subject ?? null,
       },
     );
     if (!result.ok) state.illegalCount++;
@@ -478,7 +586,17 @@ export class MatchServer {
     // settlements.txt and found nothing there — six times in one observed turn. It then thrashed:
     // turn 1 took 17s, turn 2 took 312s and timed out. A read costs about 0.2s, which is nothing
     // beside that.
-    if (result.ok) await this.refreshDump(playerId).catch(() => undefined);
+    // Refresh now AND mark the dump stale.
+    //
+    // The engine applies a request asynchronously, so this refresh often captures the state from
+    // BEFORE the action — which is why the harness must never describe state in an action reply.
+    // The stale flag makes the next command refresh again, by which point a model round trip has
+    // passed and the engine has caught up. The files are the agent's source of truth, so they
+    // have to be right rather than merely recent.
+    if (result.ok) {
+      this.#dumpStale.add(playerId);
+      await this.refreshDump(playerId).catch(() => undefined);
+    }
 
     this.#log.append({
       turn: await this.#adapter.turn(),
@@ -506,8 +624,6 @@ export class MatchServer {
    * An agent searching for how settling works had to read past all of it. Strip the icon and tip
    * tags and keep the words they wrap.
    */
-  static stripMarkupIn = stripMarkup;
-
   async exportRules(): Promise<{ tables: number; rows: number }> {
     // A useful subset, not everything: the whole database is enormous and most of it is art and
     // audio bindings the agent will never need.
@@ -515,7 +631,13 @@ export class MatchServer {
       "Units", "Constructibles", "Buildings", "Improvements", "Yields", "Resources",
       "Terrains", "Biomes", "Features", "Civilizations", "Leaders", "Ages",
       "ProgressionTreeNodes", "Traditions", "Projects", "LegacyPaths", "Victories",
-      "UnitOperations", "UnitCommands", "CityOperations", "PlayerOperations", "DiplomacyActions",
+      "UnitOperations", "UnitCommands", "PlayerOperations", "DiplomacyActions",
+      // The tables that make the ones above worth having. Without ProgressionTreeNodeUnlocks an
+      // agent picks research blind; without Unit_Stats it cannot judge a fight without a combat
+      // preview per target; without AgeProgressionMilestones the Legacy targets have no source.
+      "ProgressionTreeNodeUnlocks", "Unit_Stats", "Constructible_Adjacencies", "Constructible_YieldChanges",
+      "AgeProgressionMilestones", "UnitPromotions", "UnitPromotionDisciplines", "Attributes",
+      "GoldenAges", "Beliefs", "Religions", "Independents",
     ];
     const available = new Set(await this.#adapter.ruleTables().catch(() => []));
     let tables = 0;

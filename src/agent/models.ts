@@ -127,7 +127,22 @@ export function resolveModel(id: string): ModelDescriptor {
   const known = MODELS[id];
   if (known) return known;
   const fromPi = piGetModel(id) as ModelDescriptor | undefined;
-  if (fromPi) return { ...fromPi, cacheControlFormat: "anthropic", apiKeyEnv: "ANTHROPIC_API_KEY" };
+  // Only an Anthropic model may be stamped with Anthropic's key and cache format.
+  //
+  // This used to accept anything pi's registry knew — OpenAI and Google models included — and
+  // hand each one ANTHROPIC_API_KEY plus `cacheControlFormat: "anthropic"`. That either sends a
+  // valid Anthropic key to a third-party base URL, or fails mid-match with a 400 when the
+  // provider rejects cache_control markers it has never heard of.
+  if (fromPi && fromPi.provider === "anthropic") {
+    return { ...fromPi, cacheControlFormat: "anthropic", apiKeyEnv: "ANTHROPIC_API_KEY" };
+  }
+  if (fromPi) {
+    throw new Error(
+      `${id} is a ${fromPi.provider} model and is not declared here. Add it to MODELS with its own ` +
+        `apiKeyEnv and reasoning flag, verified with tools/dev/brain-probe.ts. Known here: ` +
+        Object.keys(MODELS).join(", "),
+    );
+  }
   throw new Error(
     `unknown model: ${id}. Known here: ${Object.keys(MODELS).join(", ")}`,
   );

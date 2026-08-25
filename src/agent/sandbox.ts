@@ -6,10 +6,10 @@
 //   - events.jsonl is not mounted
 //   - /run is a read-only VFS, so the agent cannot doctor its own record
 //   - no fetch handler is registered, so the sandbox has no network at all
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { Sandbox } from "@tinysandbox/tinysandbox";
-import { grep, headTail, printf, find as findCmd, type Call, type Output } from "./tools.ts";
+import { grep, headTail, printf, sed as sedCmd, find as findCmd, type Call, type Output } from "./tools.ts";
 import type { CommandCall, CommandOutput } from "@tinysandbox/tinysandbox";
 import { createReadOnlyVfs } from "./readonly-vfs.ts";
 import { runCivCommand } from "../cli/civ.ts";
@@ -80,13 +80,27 @@ export function createAgentSandbox(
     return { exitCode: 0, stdout: out };
   };
 
+  /**
+   * `test -f` / `-e` / `-d`.
+   *
+   * `-d` used to run the same readMount() as `-f`, and readFileSync on a directory throws — so
+   * `test -d` was ALWAYS false. An agent checking whether a directory existed before reading it
+   * got told "no" every time, for directories that were right there.
+   */
   const test = (call: CommandCall): CommandOutput => {
-    const args = call.args;
-    const flag = args[0];
-    const target = args[1];
-    if ((flag === "-f" || flag === "-e" || flag === "-d") && target) {
-      return { exitCode: readMount(target) === null ? 1 : 0 };
+    const [flag, target] = call.args;
+    if (!target) return { exitCode: 1 };
+    const host = hostPathOf(target);
+    if (!host) return { exitCode: 1 };
+    let stats;
+    try {
+      stats = statSync(host);
+    } catch {
+      return { exitCode: 1 };
     }
+    if (flag === "-d") return { exitCode: stats.isDirectory() ? 0 : 1 };
+    if (flag === "-f") return { exitCode: stats.isFile() ? 0 : 1 };
+    if (flag === "-e") return { exitCode: 0 };
     return { exitCode: 1 };
   };
 
@@ -127,6 +141,9 @@ export function createAgentSandbox(
   };
 
   const civ = async (call: CommandCall): Promise<CommandOutput> => {
+    // A model round trip has passed since the last action, so the engine has caught up. Settle
+    // any dump that was written before it did, then run the command.
+    await server.settleDump(playerId).catch(() => undefined);
     // call.args excludes the command name, so it is already the argument list.
     const result = await runCivCommand(server, playerId, call.args, lastHud);
     return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
@@ -158,6 +175,9 @@ export function createAgentSandbox(
       tail: headTail(hostPathOf, "tail"),
       printf: printf(),
       find: findCmd(hostPathOf),
+      // The briefing lists `sed`; the sandbox only ever handled `s///`, so the two commonest
+      // shapes — `sed -n '1,20p'` and `sed 3d` — failed on a tool agents were told they had.
+      sed: sedCmd(readMount),
     },
     env: { HOME: "/notes", PLAYER: String(playerId) },
   });

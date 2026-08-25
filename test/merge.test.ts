@@ -65,3 +65,25 @@ test("the engine's unclaimed sentinel never reaches an agent", () => {
   const merged = mergeTiles(snapshot([tile(3, 3, 2, { owner: -1, cityId: null })]), null, 7);
   assert.equal(merged[0]!.owner, null);
 });
+
+// Buildings and improvements are mutable, so they follow the same rule as owner: read fresh when
+// the plot is visible, remembered when it is fogged, never re-read through fog. Reading them fresh
+// would tell a player what a rival built since they last looked.
+test("what is built on a plot is remembered through fog, not re-read", () => {
+  const seen = mergeTiles(
+    { width: 4, height: 4, tiles: [tile(1, 1, 2, { built: ["IMPROVEMENT_FARM"] })] },
+    null,
+    5,
+  );
+  assert.deepEqual(seen[0]!.built, ["IMPROVEMENT_FARM"]);
+  assert.equal(seen[0]!.lastSeenTurn, 5);
+
+  // The rival builds a wonder there, and the plot is now fogged. The player must not see it.
+  const later = mergeTiles(
+    { width: 4, height: 4, tiles: [tile(1, 1, 1, { built: ["WONDER_PYRAMIDS"] })] },
+    seen,
+    9,
+  );
+  assert.deepEqual(later[0]!.built, ["IMPROVEMENT_FARM"], "fog must show the remembered build");
+  assert.equal(later[0]!.lastSeenTurn, 5, "and say how stale that memory is");
+});

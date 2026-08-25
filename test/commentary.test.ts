@@ -8,8 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readTurns } from "../src/commentary/brief.ts";
 import {
-  commentateTurn, hasCommentary, promptFor, writeCommentary,
-} from "../src/commentary/commentate.ts";
+  commentateTurn, hasCommentary, promptFor, writeCommentary, newMemory, MEMORY_TURNS } from "../src/commentary/commentate.ts";
 import type { Speak } from "../src/commentary/speak.ts";
 
 type Event = Record<string, unknown>;
@@ -162,4 +161,46 @@ test("commentary lands outside every agent directory", () => {
   assert.equal(existsSync(join(runDir, "commentary/t0001.md")), true);
   assert.equal(existsSync(join(runDir, "agents/Ada/commentary")), false);
   assert.equal(existsSync(join(runDir, "agents/Ada/commentary.md")), false);
+});
+
+// Without memory the caster can only describe one turn at a time, and the plan's own example
+// line — "they are still the only one who has met nobody" — cannot be written at all.
+test("the caster is given its own recent lines about that seat", async () => {
+  const prompts: string[] = [];
+  const speak = async (_system: string, user: string) => {
+    prompts.push(user);
+    return `line ${prompts.length}`;
+  };
+  const memory = newMemory();
+  const turn = (n: number): CompleteTurn => ({
+    turn: n,
+    seats: [{ seat: "Ada", turn: n, did: [`ok  did thing ${n}`], endedByLoop: false, reasoning: "" }],
+  });
+
+  await commentateTurn(turn(1), speak, memory);
+  assert.doesNotMatch(prompts[0]!, /What you said about/, "the first turn has no past to compare to");
+
+  await commentateTurn(turn(2), speak, memory);
+  assert.match(prompts[1]!, /What you said about Ada/);
+  assert.match(prompts[1]!, /line 1/, "it must see what it actually said last turn");
+});
+
+test("memory is a sliding window, so a long match does not grow the prompt forever", async () => {
+  const prompts: string[] = [];
+  const speak = async (_system: string, user: string) => {
+    prompts.push(user);
+    return `line ${prompts.length}`;
+  };
+  const memory = newMemory();
+  for (let n = 1; n <= MEMORY_TURNS + 3; n++) {
+    await commentateTurn(
+      { turn: n, seats: [{ seat: "Ada", turn: n, did: ["ok  did a thing"], endedByLoop: false, reasoning: "" }] },
+      speak,
+      memory,
+    );
+  }
+  assert.equal(memory.get("Ada")!.length, MEMORY_TURNS, "the window must stay bounded");
+  const last = prompts.at(-1)!;
+  assert.doesNotMatch(last, /\bline 1\b/, "the oldest line must have fallen out of the window");
+  assert.match(last, new RegExp(`line ${prompts.length - 1}`), "the newest must still be in it");
 });

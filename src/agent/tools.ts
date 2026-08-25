@@ -212,10 +212,63 @@ export function find(resolve: Resolver) {
       for (const file of walk(host)) {
         const rel = root.replace(/\/$/, "") + "/" + relative(host, file);
         if (namePattern && !namePattern.test(rel.split("/").pop() ?? "")) continue;
-        if (type === "d") continue; // walk only yields files
+        // `-type d` used to return nothing at all, silently and with exit 0, so an agent looking
+        // for directories concluded there were none. Say so rather than lie.
+        if (type === "d") {
+          return { exitCode: 1, stderr: "find: -type d is not supported here; every mount holds files only\n" };
+        }
         out.push(rel);
       }
     }
     return { exitCode: 0, stdout: out.length ? out.join("\n") + "\n" : "" };
+  };
+}
+
+/**
+ * `sed` for the shapes agents actually reach for.
+ *
+ * The briefing listed `sed` unqualified, but the sandbox only handles `s///` — so `sed -n '1,20p'`
+ * and `sed 1d`, the two commonest ways to read part of a file, both failed. Agents were told a
+ * tool was there and found half of it.
+ *
+ * Supports: `-n` with `Np` / `M,Np` / `$p`, and `Nd` / `M,Nd`. Substitution stays with the
+ * sandbox's own implementation, which already handles it.
+ */
+export function sed(read: (path: string) => string | null): (call: Call) => Output {
+  return (call) => {
+    const args = [...call.args];
+    const quiet = args[0] === "-n" ? (args.shift(), true) : false;
+    const script = args.shift() ?? "";
+    const file = args.shift();
+    const body = file ? read(file) : asText(call.stdin);
+    if (body === null) return { exitCode: 1, stderr: `sed: ${file}: No such file or directory\n` };
+
+    // A file ending in a newline splits to a trailing empty element. Left in, it counts as a line
+    // and every range is off by one at the end.
+    const lines = body.split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    const last = lines.length;
+    const bound = (v: string) => (v === "$" ? last : Number(v));
+
+    const range = /^(\$|\d+)(?:,(\$|\d+))?([pd])$/.exec(script.trim());
+    if (!range) {
+      return {
+        exitCode: 1,
+        stderr: "sed: only s///, and line ranges like '1,20p' or '3d', are supported here\n",
+      };
+    }
+    const from = bound(range[1]!);
+    const to = range[2] ? bound(range[2]) : from;
+    const action = range[3];
+
+    // 1-based and inclusive, like sed.
+    const picked = lines.filter((_l, i) => {
+      const n = i + 1;
+      const inRange = n >= from && n <= to;
+      return action === "p" ? inRange : !inRange;
+    });
+    // `p` without -n prints matched lines twice, which is never what an agent wants here.
+    void quiet;
+    return { exitCode: 0, stdout: picked.join("\n") + (picked.length > 0 ? "\n" : "") };
   };
 }

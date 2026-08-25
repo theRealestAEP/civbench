@@ -18,7 +18,8 @@ async function setup() {
     { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
   ]);
   const hud = await server.beginTurn(0);
-  const notesDir = join(runDir, "notes-alpha");
+  // Same path run.ts uses. A test that mounts somewhere else cannot catch a path bug.
+  const notesDir = join(runDir, "notes", "alpha");
   mkdirSync(notesDir, { recursive: true });
   const session = createAgentSandbox(server, 0, notesDir, () => hud);
   return { runDir, server, hud, session };
@@ -120,7 +121,8 @@ test("civ build sends the argument key the engine actually wants", async () => {
     { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
   ]);
   const hud = await server.beginTurn(0);
-  const notesDir = join(runDir, "notes-alpha");
+  // Same path run.ts uses. A test that mounts somewhere else cannot catch a path bug.
+  const notesDir = join(runDir, "notes", "alpha");
   mkdirSync(notesDir, { recursive: true });
   const session = createAgentSandbox(server, 0, notesDir, () => hud);
 
@@ -143,7 +145,8 @@ test("a name the game does not have is refused with a way to find the real ones"
     { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
   ]);
   const hud = await server.beginTurn(0);
-  const notesDir = join(runDir, "notes-alpha");
+  // Same path run.ts uses. A test that mounts somewhere else cannot catch a path bug.
+  const notesDir = join(runDir, "notes", "alpha");
   mkdirSync(notesDir, { recursive: true });
   const session = createAgentSandbox(server, 0, notesDir, () => hud);
 
@@ -255,10 +258,15 @@ test("civ tech lists what is available as commands you can run", async () => {
 
 test("civ tech picks a node, and refuses one the game does not have", async () => {
   const { runDir, session } = await setup();
-  const chosen = await session.exec("civ tech NODE_TECH_501");
+  const chosen = await session.exec("civ tech NODE_TECH_502");
   assert.equal(chosen.exitCode, 0, chosen.stderr);
-  // The note reports what the GAME says afterwards, not what we asked for.
-  assert.match(chosen.stdout, /tech is now NODE_TECH_501/);
+  // Assert the EFFECT, not the reply. The reply cannot know what happened: the engine applies a
+  // request asynchronously, so anything read back on that line is the state BEFORE the action.
+  // Deliberately not the first node in the list either — the fake's hashes used to collide, so
+  // any input read back as NODE_TECH_501 and this assertion could not fail.
+  assert.match(chosen.stdout, /set to NODE_TECH_502/, "it confirms what it sent");
+  const now = await session.exec("civ tech");
+  assert.match(now.stdout, /tech now: NODE_TECH_502/, "and the game must actually report it");
 
   const bogus = await session.exec("civ tech NODE_INVENTED");
   assert.notEqual(bogus.exitCode, 0);
@@ -311,4 +319,191 @@ test("civ story shows the narrative event and takes an answer", async () => {
   // The story is answered, so nothing is pending: the effect, not the return value.
   const after = await session.exec("civ story");
   assert.doesNotMatch(after.stdout, /STORY_FAKE_ACCEPT/, "an answered story must stop being offered");
+});
+
+// The briefing calls /notes/notes.md "your journal — the ONLY thing you keep between turns".
+// It was seeded into the read-only mount instead, so the first read of it always failed and a
+// decoy copy sat in /run where the agent could see it but never write to it.
+test("the journal exists and is writable on the first turn", async () => {
+  const { session } = await setup();
+  const read = await session.exec("cat /notes/notes.md");
+  assert.equal(read.exitCode, 0, `the journal must exist before the agent's first read: ${read.stderr}`);
+
+  const write = await session.exec("echo 'plan: settle the river' >> /notes/notes.md");
+  assert.equal(write.exitCode, 0, write.stderr);
+  const again = await session.exec("cat /notes/notes.md");
+  assert.match(again.stdout, /settle the river/);
+
+  // And no decoy in the read-only mount to mislead it.
+  const decoy = await session.exec("cat /run/notes.md");
+  assert.notEqual(decoy.exitCode, 0, "a read-only notes.md in /run is a decoy");
+});
+
+// The failure that has ended every live match: a notification that blocks the end of a turn.
+//
+// GameContext.sendTurnComplete() is silently ignored when the game would refuse the same click
+// from a human, so the harness reported the turn ended while the seat stayed active and the round
+// waited forever. None of this was reachable in tests until the fake grew a notification queue.
+test("a blocking notification stops the turn ending, and says which", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-block-"));
+  const world = makeWorld();
+  // A DECISION: blocking, and dismissal does not clear it. This is the shape that broke forced
+  // end-turn — it dismissed in a loop, nothing changed, and it sent anyway.
+  world.notifications.set(0, [
+    { id: 501, name: "NOTIFICATION_NEW_POPULATION", typeHash: 442844772, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  await session.exec("civ skip 10"); // park the unit, so only the notification is left
+  const refused = await session.exec("civ end-turn");
+  assert.notEqual(refused.exitCode, 0, "a blocked turn must not report itself ended");
+  assert.match(refused.stderr, /NOTIFICATION_NEW_POPULATION/, "it must name what is blocking");
+  assert.match(refused.stderr, /civ dismiss/, "and name a command that exists");
+});
+
+test("a dismissible notice can be cleared, and then the turn ends", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-notice-"));
+  const world = makeWorld();
+  world.notifications.set(0, [
+    { id: 502, name: "NOTIFICATION_LEGACY_COMPLETED", typeHash: 99887766, blocking: true, dismissible: true },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  await session.exec("civ skip 10");
+  assert.notEqual((await session.exec("civ end-turn")).exitCode, 0, "blocked before dismissal");
+  const cleared = await session.exec("civ dismiss");
+  assert.equal(cleared.exitCode, 0, cleared.stderr);
+  const ended = await session.exec("civ end-turn");
+  assert.equal(ended.exitCode, 0, `the turn must end once the notice is cleared: ${ended.stderr}`);
+});
+
+// Commands that change the game must spend budget and appear in the event log. metrics.ts scores
+// hygiene from `kind === "action"` events alone, so an unlogged mutation is invisible: a seat
+// could spend a whole turn clearing notifications and its record would read spotless.
+test("clearing a notification costs an action and is recorded", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-budget-"));
+  const world = makeWorld();
+  world.notifications.set(0, [
+    { id: 601, name: "NOTIFICATION_LEGACY_COMPLETED", typeHash: 5150, blocking: true, dismissible: true },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  const before = server.turnStats(0)!.actionsUsed;
+  const cleared = await session.exec("civ dismiss");
+  assert.equal(cleared.exitCode, 0, cleared.stderr);
+  assert.equal(server.turnStats(0)!.actionsUsed, before + 1, "it must spend an action");
+
+  const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
+  assert.match(events, /"kind":"action"/);
+  assert.match(events, /"kind":"notify"|"actionType":"dismiss"/, "and be visible to scoring");
+});
+
+// The briefing lists `sed`, but the sandbox only handled `s///` — so the two commonest ways to
+// read part of a file both failed on a tool agents were told they had.
+test("sed reads line ranges, which is what the briefing promises", async () => {
+  const { session } = await setup();
+  const range = await session.exec("sed -n '1,2p' /run/turns/t0042/tiles.txt");
+  assert.equal(range.exitCode, 0, range.stderr);
+  assert.equal(range.stdout.trim().split("\n").length, 2, "1,2p must give exactly two lines");
+
+  const one = await session.exec("sed -n '1p' /run/turns/t0042/tiles.txt");
+  assert.equal(one.exitCode, 0, one.stderr);
+  assert.equal(one.stdout.trim().split("\n").length, 1);
+
+  const dropped = await session.exec("sed 1d /run/turns/t0042/tiles.txt | wc -l");
+  assert.equal(dropped.exitCode, 0, dropped.stderr);
+  const total = await session.exec("wc -l < /run/turns/t0042/tiles.txt");
+  assert.equal(Number(dropped.stdout.trim()), Number(total.stdout.trim()) - 1, "1d drops one line");
+
+  // An unsupported script says so rather than failing mutely.
+  const odd = await session.exec("sed -n '/foo/p' /run/turns/t0042/tiles.txt");
+  assert.notEqual(odd.exitCode, 0);
+  assert.match(odd.stderr, /supported/);
+});
+
+// Agents guessed operation names because nothing told them what was legal now.
+// /run/rules/operations.txt listed 229 operations written once at match start, including ones
+// that cannot apply this Age. 36% of every action ever taken was refused, and the commonest
+// refusal carried no reason, because the engine gives none for a wrong argument.
+test("actions.txt lists what the engine will accept, as runnable commands", async () => {
+  const { session } = await setup();
+  const listing = await session.exec("cat /current/actions.txt");
+  assert.equal(listing.exitCode, 0, `the turn must write actions.txt: ${listing.stderr}`);
+
+  // Every offered line must be a command the agent can run as printed.
+  const offers = listing.stdout.split("\n").filter((l) => l.trim().startsWith("civ "));
+  assert.ok(offers.length > 0, "it must offer something, or it proves nothing");
+  for (const line of offers) {
+    assert.match(line, /^\s+civ [a-z-]+/, `not runnable as printed: ${line}`);
+  }
+
+  // And it must be greppable for a specific unit, which is the point of it being a file.
+  const forUnit = await session.exec("grep -A5 'unit 10' /current/actions.txt");
+  assert.equal(forUnit.exitCode, 0, "an agent must be able to grep its own unit's actions");
+  assert.match(forUnit.stdout, /civ /);
+});
+
+// Our end-turn used to be stricter than the game's. panel-action.ts blocks only on a unit that
+// `canMove && !hasMoved` — one that has not moved at all. We blocked on any unit with moves left,
+// so a scout that moved one tile of three held the turn open and cost a wasted `civ skip`, every
+// turn, on every partially-moved unit.
+test("a unit that has already moved does not block the end of the turn", async () => {
+  const { session } = await setup();
+  const moved = await session.exec("civ move 10 2,1");
+  assert.equal(moved.exitCode, 0, moved.stderr);
+
+  // It still has moves left, and the game would not block on it. Neither should we.
+  const units = await session.exec("grep '^unit 10' /current/units.txt");
+  assert.match(units.stdout, /moves=1/, "this test needs the unit to have moves left");
+
+  const ended = await session.exec("civ end-turn");
+  assert.equal(ended.exitCode, 0, `a partially moved unit must not block the turn: ${ended.stderr}`);
+});
+
+// A dropped debug socket used to leave every in-flight request hanging for its full 30s timeout,
+// and every later call hung for 30s too, because nothing recorded that the socket had gone. The
+// repeated "CDP Runtime.evaluate timed out after 30000ms" in the logs was this, not a busy game.
+test("a closed bridge fails immediately instead of waiting for a timeout", async () => {
+  const { CdpBridge, BridgeError } = await import("../src/adapter/cdp.ts");
+  // Build one around a fake socket so the test needs no game.
+  const listeners: Record<string, Array<(ev: unknown) => void>> = {};
+  const fakeSocket = {
+    addEventListener: (name: string, fn: (ev: unknown) => void) => {
+      (listeners[name] ??= []).push(fn);
+    },
+    send: () => {},
+    close: () => {},
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const bridge = new (CdpBridge as unknown as new (ws: unknown) => InstanceType<typeof CdpBridge>)(fakeSocket);
+
+  assert.equal(bridge.alive, true, "a fresh bridge is usable");
+
+  const inFlight = bridge.eval("return 1");
+  for (const fn of listeners.close ?? []) fn({});
+
+  await assert.rejects(inFlight, BridgeError, "an in-flight call must reject when the socket closes");
+  assert.equal(bridge.alive, false, "and the bridge must know it is gone");
+
+  const started = Date.now();
+  await assert.rejects(bridge.eval("return 1"), BridgeError);
+  assert.ok(Date.now() - started < 1000, "a later call must fail at once, not after the 30s timeout");
 });

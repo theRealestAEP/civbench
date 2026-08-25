@@ -92,7 +92,12 @@ export function scoreAgent(
   const illegal = actions.filter((e) => e.result?.ok === false);
   const refused = mine.filter((e) => e.kind === "action_refused");
   const forced = mine.filter((e) => e.kind === "turn_end_forced");
-  // The engine refused to advance: the seat ended its turn while the game still wanted something.
+  // The game refused to advance the round.
+  //
+  // This is a MATCH fact, not a seat's fault: it is logged at the round barrier once every seat
+  // has played, and carries `player: null`. It used to be counted per agent, so one stalled round
+  // made every agent inadmissible and the report blamed all three. Counted for the record, and
+  // deliberately not used to disqualify anyone below.
   const blocked = events.filter((e) => e.kind === "turn_advance_timeout");
   const turns = mine.filter((e) => e.kind === "turn_begin").length;
 
@@ -111,9 +116,9 @@ export function scoreAgent(
   if (hygiene.forcedEndTurns > 0) {
     inadmissibleBecause.push(`${hygiene.forcedEndTurns} turns were ended for it`);
   }
-  if (hygiene.blockedTurns > 0) {
-    inadmissibleBecause.push(`${hygiene.blockedTurns} turns the game refused to advance`);
-  }
+  // A stalled round is deliberately NOT grounds for inadmissibility. It is the harness's problem
+  // or the game's, it is logged once for the whole round with no seat attached, and an agent that
+  // played a clean turn should not be disqualified because the engine would not move on.
 
   return {
     name,

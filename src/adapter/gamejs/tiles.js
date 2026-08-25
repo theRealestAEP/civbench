@@ -30,6 +30,25 @@ for (let y = 0; y < H; y++) {
       mountain: GameplayMap.isMountain(x, y),
       continent: shortName(typeName("Continents", GameplayMap.getContinentType(x, y))),
       elevation: GameplayMap.getElevation(x, y),
+      // What the plot is worth.
+      //
+      // A human reads these off the map and the plot tooltip; getPlotYields() in the UI's
+      // helpers.ts is the same call. Without them an agent cannot compare two settle sites, tell
+      // 3-food grassland from 1-food tundra, or judge where a district belongs — so the benchmark
+      // measured which model best recalled Civ VII terrain values from training data.
+      yields: (() => {
+        try {
+          const raw = GameplayMap.getYields(GameplayMap.getIndexFromLocation({ x, y }), PLAYER_ID);
+          if (!raw) return null;
+          const out = {};
+          for (const [type, amount] of raw) {
+            if (!amount) continue;
+            const def = GameInfo.Yields.lookup(type);
+            if (def) out[shortName(def.YieldType)] = amount;
+          }
+          return Object.keys(out).length > 0 ? out : null;
+        } catch { return null; }
+      })(),
     };
 
     // Mutable state: only read it when the plot is actually visible this turn.
@@ -37,6 +56,17 @@ for (let y = 0; y < H; y++) {
       tile.owner = GameplayMap.getOwner(x, y);
       const city = GameplayMap.getOwningCityFromXY(x, y);
       tile.cityId = city ? String(city.id ?? city) : null;
+      // What is built here. Mutable, so it follows the same VISIBLE-only rule as owner above:
+      // reporting it from a fogged plot would leak what a rival has built since you last looked.
+      try {
+        const built = [];
+        for (const cid of MapConstructibles.getConstructibles(x, y) ?? []) {
+          const instance = Constructibles.getByComponentID(cid);
+          const info = instance ? GameInfo.Constructibles.lookup(instance.type) : null;
+          if (info) built.push(info.ConstructibleType + (instance.complete === false ? "(building)" : ""));
+        }
+        tile.built = built.length > 0 ? built : null;
+      } catch { tile.built = null; }
     }
     out.push(tile);
   }

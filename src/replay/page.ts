@@ -7,6 +7,18 @@ const TERRAIN_COLORS: Record<string, string> = {
   snow: "#e6ecef", ocean: "#2b5d78", coast: "#3c7fa0", mountain: "#6b6459", hills: "#7d8f4a",
 };
 
+/**
+ * JSON safe to embed inside a script tag.
+ *
+ * `JSON.stringify` does not escape `<`, so agent-controlled text containing a closing script tag
+ * terminates the block and everything after it is parsed as HTML. Agents choose their own
+ * operation names, so this is reachable. Escaping `<` as \\u003c keeps the JSON identical to a
+ * parser and inert to the HTML tokeniser.
+ */
+function safeJson(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, "\\u003c");
+}
+
 export function renderReplayPage(data: ReplayData, title: string): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -47,7 +59,7 @@ export function renderReplayPage(data: ReplayData, title: string): string {
   </aside>
 </div>
 <script>
-const DATA = ${JSON.stringify(data)};
+const DATA = ${safeJson(data)};
 const COLORS = ${JSON.stringify(TERRAIN_COLORS)};
 const agentSel = document.getElementById("agent");
 const turnEl = document.getElementById("turn");
@@ -90,10 +102,16 @@ function draw(){
   svg.innerHTML = parts.join("");
 
   const evs = DATA.events.filter(e=>e.turn===t.turn).slice(0,60);
+  // Escape before this reaches innerHTML. actionType is typed by the agent: civ do takes a
+  // free-form operation name — so an agent naming an operation with an img onerror attribute
+  // would run script in the browser of whoever opens the replay.
+  // (No backticks in this comment: it lives inside a template literal.)
+  const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   document.getElementById("events").innerHTML = evs.length
-    ? evs.map(e=>'<div class="ev"><b>'+e.kind+'</b> p'+e.player+' '+
-        (e.request?(e.request.actionType||""):"")+' '+
-        (e.result&&e.result.ok===false?('&rarr; '+(e.result.code||"failed")):"")+'</div>').join("")
+    ? evs.map(e=>'<div class="ev"><b>'+esc(e.kind)+'</b> p'+esc(e.player)+' '+
+        esc(e.request?(e.request.actionType||""):"")+' '+
+        (e.result&&e.result.ok===false?('&rarr; '+esc(e.result.code||"failed")):"")+'</div>').join("")
     : '<div class="ev">(no events this turn)</div>';
 }
 function resetRange(){

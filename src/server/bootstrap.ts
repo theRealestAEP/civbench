@@ -92,3 +92,35 @@ export function writeManifest(
     ),
   );
 }
+
+/**
+ * Build a MatchServer the same way every time.
+ *
+ * Three tools each assembled one by hand and each forgot something different. `run-match.ts` and
+ * `live-session.ts` never called `exportRules()`, so `/run/rules/` — which the briefing tells
+ * agents to look operation names up in — did not exist on those paths. The same two never passed
+ * MatchFacts, so the `match: N turns total` line the briefing describes never appeared. And only
+ * `start.ts` honoured `autosave_every_turn`, which `match.ts` claimed was no longer ignored.
+ *
+ * Assembly belongs in one place beside seatsFrom.
+ */
+export async function startMatch(
+  adapter: GameAdapter,
+  runDir: string,
+  config: MatchConfig,
+  agents: AgentConfig[],
+  options: { turnLimit: number; majorPlayers?: number } ,
+): Promise<{ server: MatchServer; rules: { tables: number; rows: number } }> {
+  const majors = options.majorPlayers ?? agents.length;
+  const server = new MatchServer(adapter, runDir, agents, {
+    turnLimit: options.turnLimit,
+    speed: config.game.gameSpeed ?? null,
+    singleAge: config.game.singleAge !== false,
+    agentRivals: agents.length - 1,
+    aiRivals: Math.max(0, majors - agents.length),
+  });
+  server.autosave = config.harness.autosaveEveryTurn;
+  // Never fatal: a match without the ruleset is worse for the agents, but still a match.
+  const rules = await server.exportRules().catch(() => ({ tables: 0, rows: 0 }));
+  return { server, rules };
+}

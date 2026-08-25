@@ -3,6 +3,16 @@
 //   - foreign units: only on plots currently VISIBLE to this player, and only what the map shows
 const VISIBLE = RevealedStates.VISIBLE;
 
+/**
+ * Everything the game knows about a unit that this player is entitled to see.
+ *
+ * Not a hand-picked field list. Every audit of the old one found more that a human sees and an
+ * agent did not — combat strength, attack range, build charges, promotion level, sight. Choosing
+ * the fields means the harness decides what matters, which is the agent's job.
+ *
+ * Fog is applied structurally: a foreign unit is described only on a plot this player can see
+ * right now, and only from what the map itself shows. Its owner's private view of it is not read.
+ */
 const describe = (unit, own) => {
   const loc = unit.location ?? {};
   const base = {
@@ -11,19 +21,12 @@ const describe = (unit, own) => {
     type: shortName(typeName("Units", unit.type)),
     x: loc.x ?? null,
     y: loc.y ?? null,
-    damage: unit.Health?.damage ?? null,
-    maxDamage: unit.Health?.maxDamage ?? null,
   };
-  if (!own) return base;
-  return {
-    ...base,
-    name: locText(unit.name ?? null),
-    movesRemaining: unit.Movement?.movementMovesRemaining ?? null,
-    canMove: unit.Movement?.canMove ?? null,
-    experience: unit.Experience?.experiencePoints ?? null,
-    isCommander: unit.isCommanderUnit ?? false,
-    armyId: idOrNull(unit.armyId),
-  };
+  // A rival's unit shows what the map shows: what it is, where it stands, how hurt it looks.
+  if (!own) {
+    return { ...base, ...withAliases(describeAll(unit, ["Movement", "Experience"])) };
+  }
+  return { ...base, name: locText(unit.name ?? null), ...withAliases(describeAll(unit)) };
 };
 
 const own = [];

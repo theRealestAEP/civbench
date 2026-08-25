@@ -39,8 +39,11 @@ const USAGE = `civ — act on the game. Reading is done with the shell; this is 
   civ civic [NODE]                         your civics: what you can adopt, or adopt one
   civ government [TYPE]                    your government: what you can adopt, or adopt one
   civ story [ANSWER]                       the narrative event waiting on you, or answer it
-  civ civic [NODE]                         what civics you can adopt, or pick one
+  civ diplomacy [player] [ACTION]          who you have met, what you can do to them, or do it
   civ deal items <player>                  what each side could put on the table
+  civ deal offer <player> <KIND> [AMOUNT]  put one thing on the table
+  civ deal send <player>                   propose the deal you have built
+  civ deal clear <player>                  start the deal over
   civ deal pending <player>                deals awaiting a response
   civ dismiss [id]                         clear a notification; with no id, the one blocking you
   civ open <id>                            open a notification that wants a decision
@@ -141,7 +144,7 @@ export async function runCivCommand(
         const legal = (result.legal ?? [])
           .map((a) =>
             a.type === "CITYOPERATION_BUILD"
-              ? `  ${a.short}  (${a.type})  -> use: civ build ${id} <THING>, listed by civ produce ${id}`
+              ? `  ${a.short}  (${a.type})  -> use: civ build ${id} <THING>, or civ build ${id} for the list`
               : `  ${a.short}  (${a.type})`,
           )
           .join("\n");
@@ -186,6 +189,35 @@ export async function runCivCommand(
       const lines = tilesNear(tiles, cx, cy, radius);
       if (lines.length === 0) return ok(`nothing revealed within ${radius} of ${cx},${cy}\n`);
       return ok(`${lines.length} tiles within ${radius} of ${cx},${cy}:\n${lines.join("\n")}\n`);
+    }
+
+    case "diplomacy": {
+      const other = rest[0] === undefined ? undefined : Number(String(rest[0]).replace(/^p/i, ""));
+      if (rest[0] !== undefined && Number.isNaN(other)) return fail("usage: civ diplomacy [player] [ACTION]\n");
+      const r = (await server.diplomacy(playerId, other, rest[1])) as ActionResult & {
+        listing?: boolean;
+        players?: Array<{ player: string; civ: string | null; atWar: boolean }>;
+        target?: string;
+        offers?: Array<{ operation: string; action: string }>;
+      };
+      if (!r.listing) return renderResult(r);
+      if (r.players) {
+        if (r.players.length === 0) return ok("you have met nobody yet\n");
+        return ok(
+          "civilizations you have met:\n" +
+            r.players
+              .map((p) => `  ${p.player}  ${p.civ ?? "?"}${p.atWar ? "  (at war with you)" : ""}   -> civ diplomacy ${p.player}`)
+              .join("\n") +
+            "\n",
+        );
+      }
+      if ((r.offers ?? []).length === 0) return ok(`nothing you can do to ${r.target} right now\n`);
+      // Every line is the command that does it, listed only if the engine accepts it.
+      return ok(
+        `what you can do to ${r.target}:\n` +
+          (r.offers ?? []).map((o) => `  civ diplomacy ${r.target} ${o.action}`).join("\n") +
+          "\n",
+      );
     }
 
     case "combat-preview": {
@@ -268,8 +300,10 @@ export async function runCivCommand(
     }
 
     case "inbox": {
-      // The turn's messages are written into the dump, so the agent can also just read them.
-      return ok("messages are in /current/messages.txt — read that file\n");
+      // Show the messages rather than describing where they live. This used to spend one of the
+      // agent's commands to be told to read a file, which is a command it will never get back.
+      const text = server.currentMessages(playerId);
+      return ok(text && text.trim().length > 0 ? text : "nobody has said anything to you\n");
     }
 
     // One case for every "pick a thing" decision. They differ only in the argument shape the
@@ -313,8 +347,28 @@ export async function runCivCommand(
     case "deal": {
       const mode = rest[0];
       const other = Number(String(rest[1] ?? "").replace(/^p/, ""));
-      if (!mode || Number.isNaN(other)) return fail("usage: civ deal <items|pending> <player>\n");
-      return ok(JSON.stringify(await server.deal(playerId, mode, other), null, 2) + "\n");
+      const modes = ["items", "pending", "offer", "send", "clear"];
+      if (!mode || !modes.includes(mode) || Number.isNaN(other)) {
+        return fail(`usage: civ deal <${modes.join("|")}> <player> [KIND] [AMOUNT]\n`);
+      }
+      // `offer` puts one item on the table; the rest read or act on the working deal.
+      const extra = mode === "offer" ? { kind: rest[2], amount: Number(rest[3]) || undefined, subject: rest[3] } : undefined;
+      const result = (await server.deal(playerId, mode, other, extra)) as {
+        error?: string;
+        hint?: string;
+        offerable?: Array<{ from: string; kind: string; amount: number | null; city: string | null; resource: string | null }>;
+      };
+      if (result?.error) return fail(`failed: ${result.error}\n${result.hint ? `hint: ${result.hint}\n` : ""}`);
+      if (result.offerable) {
+        if (result.offerable.length === 0) return ok(`nothing either side can offer p${other} right now\n`);
+        // Every line is the command that puts it on the table.
+        const lines = result.offerable.map(
+          (i) => `  ${i.from} ${i.kind}${i.amount ? ` up to ${i.amount}` : ""}${i.city ? ` city ${i.city}` : ""}${i.resource ? ` ${i.resource}` : ""}` +
+            (i.from === `p${playerId}` ? `   -> civ deal offer ${other} ${i.kind}${i.amount ? " <amount>" : ""}` : ""),
+        );
+        return ok(`what can go on the table with p${other}:\n${lines.join("\n")}\n`);
+      }
+      return ok(JSON.stringify(result, null, 2) + "\n");
     }
 
     case "dismiss":

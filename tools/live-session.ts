@@ -15,7 +15,7 @@ import { findGamePids } from "../src/adapter/discover.ts";
 import { GameAdapter } from "../src/adapter/game.ts";
 import { MatchServer } from "../src/server/match.ts";
 import { runMatch } from "../src/server/run.ts";
-import { seatsFrom, writeManifest } from "../src/server/bootstrap.ts";
+import { seatsFrom, writeManifest , startMatch} from "../src/server/bootstrap.ts";
 import { loadMatchConfig, nextRunDir } from "../src/config/load.ts";
 import { renderReport } from "../src/server/report.ts";
 import { collectRun } from "../src/replay/build.ts";
@@ -177,7 +177,10 @@ const runDir = nextRunDir("runs", runId);
 mkdirSync(runDir, { recursive: true });
 writeManifest(runDir, config, runId, { bridge, kind: "live", detail: "CDP live-session" });
 const { seats, agents } = seatsFrom(config);
-const server = new MatchServer(adapter, runDir, agents);
+const { server, rules } = await startMatch(adapter, runDir, config, agents, {
+  turnLimit: config.game.turnLimit,
+});
+if (rules.tables > 0) console.log(`   rules exported: ${rules.tables} tables, ${rules.rows} rows`);
 const outcomes = await runMatch(
   server,
   runDir,

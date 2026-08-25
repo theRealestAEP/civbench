@@ -91,6 +91,10 @@ You can also write a script and run it, which is better for anything you repeat:
 
 There is no Python. \`js\` is the scripting language here.
 
+\`actions.txt\` is the engine's own answer to "what can I do", refreshed every turn. Every line in
+it is a command you can run as written. Grep it rather than guessing at an operation name: a
+wrong argument is refused with no reason, because the game gives none.
+
 Read delta.md first. It says what moved, what you newly revealed, and what the game is waiting on
 you for. Most turns it is the only file you need — the full dumps are there for when it points at
 something you want to look at properly. Re-reading thousands of tile lines every turn is a way to
@@ -144,7 +148,12 @@ The shell reads. The \`civ\` command is the only way to act.
   civ story [ANSWER]         a narrative event waiting on you, or your answer to it
   civ what-can player        legal player actions (research, policies, and so on)
   civ combat-preview <unit> <x,y>   what an attack would cost, before you commit
-  civ deal items <player>    what each side could trade
+  civ diplomacy [player]     who you have met, and what the game will let you do to them
+  civ diplomacy <player> <ACTION>   declare war, open borders, make peace, form an alliance
+  civ deal items <player>    what each side could put on the table
+  civ deal offer <player> <KIND> [AMOUNT]   put one thing on the table
+  civ deal send <player>     propose what you have built
+  civ deal clear <player>    start the deal over
   civ list-ops <kind>        every operation name this build knows
   civ move <unit> <x,y>      move
   civ attack <unit> <x,y>    attack
@@ -198,6 +207,7 @@ your plan, why you chose it, and what to check later. It is the one place a conc
 
 A turn will not end while a notification blocks it, or while any unit still has moves. If
 \`civ end-turn\` refuses, it says which. Clear a blocking notification with \`civ dismiss\`, and
-give every idle unit an order with \`civ move\`, \`civ skip\`, or a fortify.
+give every unit that has not moved an order — \`civ move\` or \`civ skip\`. A unit that has already
+moved does not hold the turn open.
 
 Always finish by calling \`civ end-turn\`.`;

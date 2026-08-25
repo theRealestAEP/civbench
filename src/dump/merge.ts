@@ -36,6 +36,10 @@ export function mergeTiles(
       ...tile,
       owner: remembered?.owner ?? null,
       cityId: remembered?.cityId ?? null,
+      // Buildings and improvements are remembered, not re-read. You keep knowing what you saw
+      // standing on a plot; `last_seen` says how stale that memory is. Reading it fresh here
+      // would leak what a rival has built since you last looked.
+      built: remembered?.built ?? null,
       lastSeenTurn: remembered?.lastSeenTurn ?? null,
     };
   });

@@ -19,12 +19,17 @@
     "live": "node tools/live-session.ts",
     "spectate": "node tools/spectate.ts",
     "start": "node tools/start.ts",
-    "agent-log": "node tools/agent-log.ts"
+    "agent-log": "node tools/agent-log.ts",
+    "lint": "oxlint"
   },
   "dependencies": {
     "@mariozechner/pi-agent-core": "^0.73.1",
     "@mariozechner/pi-ai": "^0.73.1",
     "@tinysandbox/tinysandbox": "^0.5.0",
     "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "^1.80.0",
+    "oxlint": "^1.80.0"
   }
 }

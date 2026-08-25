@@ -20,33 +20,24 @@ if (KIND === "unit_operation" || KIND === "unit_command") {
   const result = startOperation(api, unit.id, operationValue(KIND, ACTION_TYPE), ARGS);
   // Out of moves is the commonest silent refusal, and the engine reports no reason for it. Say
   // the unit's state so the agent stops looking for the answer in its arguments.
-  if (!result.ok) {
+  // Only when the engine gave no reason of its own.
+  //
+  // This used to append the unit's moves to EVERY failure and, at 0 moves, assert "it can act
+  // again next turn". A founder refused because the plot sits too close to another city was told
+  // to wait — so it waited, retried next turn, and failed again for the same real reason, which
+  // was sitting in result.message all along.
+  if (!result.ok && !result.message) {
     const moves = unit.Movement?.movementMovesRemaining ?? null;
-    if (moves !== null) {
-      result.message += ` (unit ${TARGET_ID} has ${moves} moves left)`;
-      if (moves <= 0) result.hint = "this unit has no moves left; it can act again next turn";
-    }
+    if (moves !== null) result.message = `the game refused this action (unit ${TARGET_ID} has ${moves} moves left)`;
   }
-  // Say when the unit is gone. "ok" alone had an agent found a city and immediately try to found
-  // again with the same id. If the engine applies the request asynchronously the unit is still
-  // here and we simply say nothing, which is the same as before.
-  if (result.ok) {
-    const after = findOwnUnit(PLAYER_ID, TARGET_ID);
-    if (!after) {
-      result.note = `unit ${TARGET_ID} is used up and no longer exists`;
-    } else if (ACTION_TYPE === "UNITOPERATION_MOVE_TO") {
-      // Only for moves. Spending the last move is what turns a good plan into a refused one:
-      // step onto the spot you meant to settle, and founding is illegal until next turn.
-      //
-      // Only for moves, because the engine applies a request asynchronously. Right after
-      // FOUND_CITY the settler still exists with its moves intact, so reporting them read as
-      // "you can act again" and an agent immediately tried to found a second city.
-      const moves = after.Movement?.movementMovesRemaining ?? null;
-      if (moves !== null) {
-        result.note = `unit ${TARGET_ID} has ${moves} moves left${moves <= 0 ? " — it cannot act again this turn" : ""}`;
-      }
-    }
-  }
+  // No state claim here, deliberately.
+  //
+  // The engine applies a request ASYNCHRONOUSLY, so anything read back on this line is the state
+  // before the action. Reporting it caused the worst agent error of the project: after founding a
+  // city the settler still looked alive with 3 moves, the harness said so, and the agent tried to
+  // found a second city with a unit the game had already consumed.
+  //
+  // The files under /current are the truth. They are refreshed once the engine has caught up.
   return result;
 }
 
@@ -58,7 +49,7 @@ if (KIND === "city_operation" || KIND === "city_command") {
   // BUILD is the one action whose arguments cannot be guessed, and the engine gives no reason
   // when they are wrong. Answer the question the agent was actually asking.
   if (!result.ok && ACTION_TYPE === "CITYOPERATION_BUILD") {
-    result.hint = `name what to build: civ build ${TARGET_ID} <THING>. Run \`civ produce ${TARGET_ID}\` for the list.`;
+    result.hint = `name what to build: \`civ build ${TARGET_ID} <THING>\`, or \`civ build ${TARGET_ID}\` for the list.`;
   }
   return result;
 }

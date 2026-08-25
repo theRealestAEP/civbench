@@ -2,6 +2,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ChatChannel, renderMessages, MAX_PER_TURN } from "../src/server/chat.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { GameAdapter } from "../src/adapter/game.ts";
+import { FakeBridge, makeWorld } from "../src/test-support/fake-game.ts";
+import { MatchServer } from "../src/server/match.ts";
 
 const msg = (from: string, to: string | null, text: string) => ({ turn: 1, from, to, text });
 
@@ -63,4 +69,24 @@ test("the whole conversation is recorded for the report", () => {
   chat.send(msg("beta", "alpha", "secret"));
   assert.equal(chat.transcript().length, 2, "private messages are logged too");
   assert.match(renderMessages([...chat.transcript()]), /from=beta to=alpha/);
+});
+
+// The pushed "Messages" section was always empty. messages.txt was written AFTER writeSnapshot
+// rendered the HUD, so the HUD read a file that did not exist yet. The `messages: N new` counter
+// still worked, which is why it looked fine — the words themselves never appeared.
+test("what another civ said reaches the HUD, not just the counter", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-msg-hud-"));
+  const world = makeWorld({ seats: 2 });
+  world.met[0] = [1];
+  world.met[1] = [0];
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+    { slot: 1, playerId: 1, name: "beta", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(1);
+  await server.say(1, null, "the river valley is mine");
+
+  const hud = await server.beginTurn(0);
+  assert.match(hud, /messages: 1 new/, "the counter must see it");
+  assert.match(hud, /the river valley is mine/, "and so must the pushed section");
 });

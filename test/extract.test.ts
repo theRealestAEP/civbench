@@ -51,14 +51,27 @@ test("players: an unmet civ is absent entirely", async () => {
   assert.equal(result.known.length, 0);
 });
 
-test("players: a met civ appears without its private data", async () => {
+// Where the line actually falls, checked against the game rather than assumed.
+//
+// The diplomacy ribbon is on a human's screen at all times and shows every MET civ's net yields,
+// settlement count and score — `createPlayerYieldsData(player, isLocal)` computes the values for
+// everyone and uses isLocal only to pick which icon to draw. So those are parity, not secrets.
+// This test used to forbid them, which meant no agent could tell whether it was winning.
+//
+// Still private, because no screen shows them: the treasury BALANCE (as against income per turn),
+// what a rival is building, and which techs it holds.
+test("a met civ shows what the ribbon shows, and nothing a screen never shows", async () => {
   const world = makeWorld();
   world.met[0] = [1];
   const result = await adapterFor(world).players(0);
   assert.equal(result.known.length, 1);
   const known = result.known[0]! as Record<string, unknown>;
-  for (const secret of ["gold", "treasury", "science", "production", "techs"]) {
-    assert.ok(!(secret in known), `rival ${secret} must not be exposed`);
+
+  for (const shown of ["gold", "science", "culture", "settlements", "atWar"]) {
+    assert.ok(shown in known, `the ribbon shows rival ${shown}; withholding it handicaps the agent`);
+  }
+  for (const secret of ["treasury", "goldBalance", "production", "productionHash", "techs", "researching"]) {
+    assert.ok(!(secret in known), `rival ${secret} is on no screen and must not be exposed`);
   }
 });
 

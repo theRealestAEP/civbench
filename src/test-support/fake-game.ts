@@ -41,7 +41,20 @@ export type FakeWorld = {
   civic: Map<number, number>;
   /** Players who have answered their pending narrative event. */
   storyAnswered: Set<number>;
+  /**
+   * Notifications per player. `blocking` stops the turn ending; `dismissible` says whether
+   * dismissal clears it. A DECISION (place a citizen, answer a story) is blocking and NOT
+   * dismissible — that asymmetry is the whole reason forced end-turn kept failing.
+   */
+  notifications: Map<number, Array<{ id: number; name: string; typeHash: number; blocking: boolean; dismissible: boolean }>>;
 };
+
+/** A small stable string hash, distinct per name. */
+function hashOf(name: string): number {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
+  return h;
+}
 
 export function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
   return {
@@ -70,6 +83,7 @@ export function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     researching: new Map(),
     civic: new Map(),
     storyAnswered: new Set(),
+    notifications: new Map(),
     ...overrides,
   };
 }
@@ -97,6 +111,9 @@ function buildGlobals(world: FakeWorld): Record<string, unknown> {
     Movement: {
       get movementMovesRemaining() { return world.unitMoves.get(u.id) ?? 2; },
       get canMove() { return (world.unitMoves.get(u.id) ?? 2) > 0; },
+      // The game blocks the end of a turn on a unit that has not moved AT ALL, not on any unit
+      // with moves left. Without this the fake cannot tell the two rules apart.
+      get hasMoved() { return world.unitMoves.has(u.id); },
     },
     Experience: { experiencePoints: 0 },
     isCommanderUnit: false,
@@ -186,6 +203,9 @@ function buildGlobals(world: FakeWorld): Record<string, unknown> {
       lastPlayerId = n;
     },
     // Saving, so autosave can be exercised without a real game.
+    // NONE is 0, not null. endTurnBlocker() checks against it, and a fake that returned null
+    // would let a wrong check pass here and fail against the real game.
+    EndTurnBlockingTypes: { NONE: 0 },
     SaveTypes: { DEFAULT: 0, SINGLE_PLAYER: 1, HOTSEAT: 2, NETWORK_MULTIPLAYER: 3 },
     CityQueryType: { Unit: 0, Constructible: 1, Project: 2 },
     SaveLocations: { DEFAULT: 0, LOCAL_STORAGE: 1, FIRAXIS_CLOUD: 2 },
@@ -242,6 +262,9 @@ function buildGlobals(world: FakeWorld): Record<string, unknown> {
           if (type === "UNITOPERATION_SKIP_TURN") {
             world.unitMoves.set(unitId, 0);
           }
+          if (type === "UNITOPERATION_MOVE_TO") {
+            world.unitMoves.set(unitId, Math.max(0, (world.unitMoves.get(unitId) ?? 2) - 1));
+          }
         },
       },
       UnitCommands: {
@@ -285,11 +308,57 @@ function buildGlobals(world: FakeWorld): Record<string, unknown> {
           if (type === "SET_CULTURE_TREE_NODE") world.civic.set(pid, node);
         },
       },
+      // A real notification queue, because a blocking notification is the failure that has ended
+      // every live match. With the old stub, endTurnBlocker() always returned null, endturn.js
+      // never took its blocking branch, the forced-dismissal loop never ran once, and pending.txt
+      // was always empty. The bug that stops the benchmark could not be reproduced here at all.
+      //
+      // getTypeName takes a notification's .Type hash, never its id — the distinction that cost
+      // the most in this project, so the fake enforces it.
       Notifications: {
-        getIdsForPlayer: () => [],
-        getEndTurnBlockingType: () => null,
-        getTypeName: () => null,
-        getSummary: () => "",
+        getIdsForPlayer: (pid: number) =>
+          (world.notifications.get(pid) ?? []).map((n) => ({ id: n.id, owner: pid })),
+        find: (cid: { id?: number } | number) => {
+          const wanted = Number((cid as { id?: number })?.id ?? cid);
+          for (const list of world.notifications.values()) {
+            const hit = list.find((n) => n.id === wanted);
+            if (hit) return { id: hit.id, Type: hit.typeHash };
+          }
+          return null;
+        },
+        getTypeName: (typeHash: number) => {
+          for (const list of world.notifications.values()) {
+            const hit = list.find((n) => n.typeHash === typeHash);
+            if (hit) return hit.name;
+          }
+          return null; // an id was passed where a type hash belongs
+        },
+        getEndTurnBlockingType: (pid: number) => {
+          const blocker = (world.notifications.get(pid) ?? []).find((n) => n.blocking);
+          return blocker ? blocker.typeHash : 0; // 0 is NONE
+        },
+        findEndTurnBlocking: (pid: number, type?: number) => {
+          // The real API returns null unless the caller passes the type as well.
+          if (type === undefined || type === 0) return null;
+          const hit = (world.notifications.get(pid) ?? []).find((n) => n.blocking && n.typeHash === type);
+          return hit ? { id: hit.id, owner: pid } : null;
+        },
+        dismiss: (cid: { id?: number } | number) => {
+          const wanted = Number((cid as { id?: number })?.id ?? cid);
+          for (const [pid, list] of world.notifications) {
+            const next = list.filter((n) => !(n.id === wanted && n.dismissible));
+            world.notifications.set(pid, next);
+          }
+        },
+        activate: () => {},
+        getSummary: (cid: { id?: number } | number) => {
+          const wanted = Number((cid as { id?: number })?.id ?? cid);
+          for (const list of world.notifications.values()) {
+            const hit = list.find((n) => n.id === wanted);
+            if (hit) return hit.name;
+          }
+          return "";
+        },
         getMessage: () => "",
       },
     },
@@ -336,7 +405,7 @@ function buildGlobals(world: FakeWorld): Record<string, unknown> {
       ProgressionTreeNodes: {
         lookup: (h: number) => {
           for (const n of ["NODE_TECH_501", "NODE_TECH_502", "NODE_TECH_601"]) {
-            if (n.length * -7919 === h) return { ProgressionTreeNodeType: n };
+            if (hashOf(n) === h) return { ProgressionTreeNodeType: n };
           }
           return { ProgressionTreeNodeType: `NODE_TECH_${h}` };
         },
@@ -367,7 +436,10 @@ function buildGlobals(world: FakeWorld): Record<string, unknown> {
             PROJECT_TEST: "KIND_PROJECT",
           };
           const kind = known[name];
-          return kind ? { Kind: kind, Hash: name.length * -7919 } : null;
+          // Distinct per NAME, not per length. The old `name.length * -7919` gave every
+          // 13-character node the same hash, so a chosen tech always read back as the first one
+          // and the "did the choice take?" assertion could not fail.
+          return kind ? { Kind: kind, Hash: hashOf(name) } : null;
         },
       },
     },

@@ -201,3 +201,132 @@ function endTurnBlocker(playerId) {
     return null;
   }
 }
+
+/**
+ * Everything readable on a game object, as plain named values.
+ *
+ * The dump used to carry a hand-picked list of fields per entity — and every audit found more
+ * that a human sees and an agent did not: no combat strength, no build charges, no promotions, no
+ * food-to-grow, no rival yields. Curating the list means the harness decides what matters, which
+ * is the agent's job and the thing being measured.
+ *
+ * So: walk the object and its sub-objects, take every scalar, resolve hashes to names, and write
+ * the lot. Fog is enforced by WHICH objects get described and which sub-objects are read — never
+ * by quietly dropping a field.
+ *
+ * Depth 1 by design. Civ's objects hold their detail one level down (`unit.Combat.meleeStrength`),
+ * and going deeper walks into the whole game graph.
+ */
+const DESCRIBE_SKIP = new Set(["constructor", "id", "location", "owner", "type"]);
+
+function readableKeys(object) {
+  const keys = [];
+  let level = object;
+  while (level && level !== Object.prototype) {
+    for (const key of Object.getOwnPropertyNames(level)) {
+      if (DESCRIBE_SKIP.has(key) || keys.includes(key)) continue;
+      if (key.startsWith("_")) continue;
+      keys.push(key);
+    }
+    level = Object.getPrototypeOf(level);
+  }
+  return keys;
+}
+
+/** A value worth writing down, with hashes resolved. Returns undefined for anything else. */
+function describeValue(value) {
+  if (value === null || value === undefined) return undefined;
+  const kind = typeof value;
+  if (kind === "boolean" || kind === "string") return locText(value);
+  if (kind === "number") {
+    // -1 is Civ's "none" everywhere. A large int is nearly always a hashed type.
+    if (value === -1) return undefined;
+    if (Number.isInteger(value) && Math.abs(value) > 100000) {
+      const name =
+        typeName("Units", value) ?? typeName("Constructibles", value) ?? typeName("Projects", value) ??
+        typeName("Resources", value) ?? typeName("ProgressionTreeNodes", value) ?? typeName("Yields", value);
+      return name ?? undefined; // an unresolvable hash is worse than nothing: never show it
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const items = value.map(describeValue).filter((v) => v !== undefined);
+    return items.length > 0 ? items : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Describe an object and one level of its sub-objects.
+ *
+ * `skip` names sub-objects that must not be read — the fog rule, applied structurally.
+ */
+function describeAll(object, skip = []) {
+  const out = {};
+  if (!object) return out;
+  for (const key of readableKeys(object)) {
+    if (skip.includes(key)) continue;
+    let value;
+    try { value = object[key]; } catch { continue; }
+    if (typeof value === "function") continue;
+
+    const direct = describeValue(value);
+    if (direct !== undefined) {
+      out[key] = direct;
+      continue;
+    }
+    // A sub-object such as Combat, Movement, Experience: flatten it as Combat_meleeStrength.
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const inner of readableKeys(value)) {
+        let sub;
+        try { sub = value[inner]; } catch { continue; }
+        if (typeof sub === "function") continue;
+        const described = describeValue(sub);
+        if (described !== undefined) out[`${key}_${inner}`] = described;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Short, stable names for the fields read every turn.
+ *
+ * describeAll() returns the game's own names, so a moves count arrives as
+ * `Movement_movementMovesRemaining`. Completeness is the point, but so is being able to grep
+ * `moves=0` without knowing Civ's internal spelling. Applied once, in the extractor, so the text
+ * dump and the JSONL twin share one vocabulary.
+ */
+const FIELD_ALIAS = {
+  Movement_movementMovesRemaining: "movesRemaining",
+  Movement_maxMoves: "maxMoves",
+  Movement_canMove: "canMove",
+  Movement_hasMoved: "hasMoved",
+  Health_damage: "damage",
+  Health_maxDamage: "maxDamage",
+  Experience_experiencePoints: "experience",
+  Experience_experienceToNextLevel: "experienceToNextLevel",
+  Combat_meleeStrength: "melee",
+  Combat_rangedStrength: "ranged",
+  Combat_bombardStrength: "bombard",
+  Combat_attackRange: "attackRange",
+  isCommanderUnit: "isCommander",
+};
+
+function withAliases(record) {
+  const out = {};
+  for (const [key, value] of Object.entries(record)) out[FIELD_ALIAS[key] ?? key] = value;
+  return out;
+}
+
+/**
+ * The arguments the game itself uses when asking "is this action possible at all?".
+ *
+ * From unit-actions.ts, with its own comment: "ask for canStart on an invalid plot - GameCore
+ * gives the correct answers then." An invalid plot makes the engine answer about the ACTION
+ * rather than about one particular target square.
+ *
+ * We probed with `{}`, which asks a different question, so the legal set an agent reads could
+ * differ from what a human is offered — and the briefing now tells agents to trust that list.
+ */
+const PROBE_ARGS = { X: -9999, Y: -9999, UnitAbilityType: -1 };

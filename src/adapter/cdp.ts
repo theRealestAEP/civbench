@@ -65,9 +65,31 @@ export class CdpBridge implements Bridge {
   #nextId = 1;
   #pending = new Map<number, Pending>();
 
+  /** Set once the socket is gone, so later calls fail immediately instead of waiting 30s. */
+  #dead: string | null = null;
+
   private constructor(ws: WebSocket) {
     this.#ws = ws;
     ws.addEventListener("message", (ev) => this.#onMessage(String(ev.data)));
+    // A dropped socket used to leave every in-flight request hanging for its full 30s timeout,
+    // and every later call hung for 30s too because nothing knew the socket had gone. That is
+    // what "CDP Runtime.evaluate timed out after 30000ms", repeated, actually was.
+    ws.addEventListener("close", () => this.#die("the game closed the debug connection"));
+    ws.addEventListener("error", () => this.#die("the debug connection failed"));
+  }
+
+  #die(reason: string): void {
+    if (this.#dead) return;
+    this.#dead = reason;
+    for (const [id, pending] of this.#pending) {
+      this.#pending.delete(id);
+      pending.reject(new BridgeError(reason));
+    }
+  }
+
+  /** Whether this bridge can still be used. Callers can reconnect rather than retry into a wall. */
+  get alive(): boolean {
+    return this.#dead === null;
   }
 
   static async connect(webSocketDebuggerUrl: string, timeoutMs = 5000): Promise<CdpBridge> {
@@ -102,6 +124,8 @@ export class CdpBridge implements Bridge {
   }
 
   #send<T>(method: string, params: Record<string, unknown>, timeoutMs = 30_000): Promise<T> {
+    // Fail now rather than in 30 seconds. A caller that reconnects can only do so if it is told.
+    if (this.#dead) return Promise.reject(new BridgeError(this.#dead));
     const id = this.#nextId++;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -142,6 +166,7 @@ export class CdpBridge implements Bridge {
   }
 
   async close(): Promise<void> {
+    this.#die("this bridge was closed");
     this.#ws.close();
   }
 }

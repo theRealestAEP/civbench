@@ -119,7 +119,13 @@ const DECISIONS = {
     api: () => Game.PlayerOperations,
     args: (value) => {
       const target = pendingStoryId();
-      return target ? { TargetType: value, Target: target, Action: ACTIVATE } : null;
+      if (!target) return null;
+      // Check the answer against the story's own links, the way `civ build` checks a name against
+      // GameInfo.Types. Without this any string was accepted and sent to the engine, which then
+      // refused it with no reason — the exact loop these commands exist to prevent.
+      const answers = storyChoices().map((c) => c.name);
+      if (!answers.includes(value)) return null;
+      return { TargetType: value, Target: target, Action: ACTIVATE };
     },
     list: () => storyChoices(),
     current: () => storyName(),
@@ -257,12 +263,8 @@ if (!result.ok) {
   return result;
 }
 
-// Report what the game says, but only when it has caught up.
-//
-// The engine applies these asynchronously. Reading straight back reported "the game still says
-// nothing" for a research choice that had in fact been set — telling an agent its choice failed
-// when it worked is worse than telling it nothing. So say the new value when it is already
-// visible, and otherwise just confirm the request; `civ <what>` shows the truth a moment later.
-const after = decision.current?.() ?? null;
-result.note = after ? `${WHAT} is now ${after}` : `${WHAT} set to ${THING}`;
+// No state claim: see act.js. Reading back on this line gives the state BEFORE the engine applied
+// the request, and reporting it has misled agents in three separate ways already. `civ <what>`
+// with no value reads the truth a moment later, and so do the files under /current.
+result.note = `${WHAT} set to ${THING}`;
 return result;

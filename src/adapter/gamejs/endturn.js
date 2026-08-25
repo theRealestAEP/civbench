@@ -17,8 +17,17 @@ function idleUnits() {
   const idle = [];
   for (const cid of player?.Units?.getUnitIds?.() ?? []) {
     const unit = Units.get(cid);
-    const moves = unit?.Movement?.movementMovesRemaining ?? 0;
-    if (moves > 0) idle.push({ id: String(cid.id ?? cid), moves });
+    if (!unit) continue;
+    // The game's own rule, from panel-action.ts showRemainingMovesState():
+    //   return unit != null && unit.canMove && !unit.hasMoved;
+    // It blocks on a unit that has NOT MOVED AT ALL, not on any unit with moves left. We used the
+    // stricter test, so a scout that moved one tile of three blocked our end-turn while a human's
+    // would have ended — costing a wasted `civ skip` per partially-moved unit, every turn.
+    const canMove = unit.Movement?.canMove ?? (unit.Movement?.movementMovesRemaining ?? 0) > 0;
+    const hasMoved = unit.Movement?.hasMoved ?? unit.hasMoved ?? false;
+    if (canMove && !hasMoved) {
+      idle.push({ id: String(cid.id ?? cid), moves: unit.Movement?.movementMovesRemaining ?? 0 });
+    }
   }
   return idle;
 }
@@ -64,7 +73,7 @@ if (FORCED !== true && (blocking || idle.length > 0)) {
     // Name a command that exists. The previous wording said "deal with the notification" while
     // the harness had no way to deal with one, and an agent burned a whole turn hunting for it.
     hint: blocking
-      ? "run `civ dismiss` to clear it, or `civ open " + "` with its id from /current/pending.txt"
+      ? "run `civ dismiss` to clear it, or `civ open <id>` with an id from /current/pending.txt"
       : "give every unit an order — `civ move`, `civ skip`, or fortify — then end your turn",
     blocking,
     idle,

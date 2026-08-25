@@ -34,8 +34,24 @@ function rawFor(playerId: number, revealed: Array<[number, number, 1 | 2]>): Raw
         ...(vis === 2 ? { owner: playerId, cityId: null } : {}),
       })),
     },
-    units: { own: [], foreign: [] },
-    settlements: { own: [], foreign: [] },
+    // The canaries go IN, on a plot the player has never revealed.
+    //
+    // They used to be absent from the input entirely, so this test asserted that a string which
+    // never entered the pipeline did not come out of it. Replacing writeSnapshot with a function
+    // that dumped every field it received would still have passed. The flagship leak guard, and
+    // the contract the whole benchmark rests on, was checking nothing at all.
+    units: {
+      own: [],
+      foreign: [
+        { id: CANARY_UNIT, owner: 9, type: "warrior", x: 9, y: 9, hp: 100 } as never,
+      ],
+    },
+    settlements: {
+      own: [],
+      foreign: [
+        { id: CANARY_CITY, owner: 9, name: CANARY_CITY, x: 9, y: 9, kind: "city" } as never,
+      ],
+    },
     players: { me: playerId, known: [] },
     pending: { blockingType: null, items: [] },
   } as unknown as RawSnapshot;
@@ -49,8 +65,7 @@ function readTurnDir(dir: string): string {
 
 test("a unit hidden from the player appears nowhere in their dump", () => {
   const agentDir = mkdtempSync(join(tmpdir(), "civbench-leak-"));
-  // The extractor only ever emits foreign units on plots that are VISIBLE, so a canary sitting
-  // in unrevealed territory must never reach the snapshot. This asserts the contract end to end.
+  // The player reveals 1,1 and 1,2 only. The canaries sit at 9,9, which they have never seen.
   const raw = rawFor(0, [[1, 1, 2], [1, 2, 1]]);
   const { dir } = writeSnapshot(agentDir, raw, emptyMemory());
   const dump = readTurnDir(dir);

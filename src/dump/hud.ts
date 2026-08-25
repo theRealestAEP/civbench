@@ -81,10 +81,23 @@ export function renderHud(
       : `age=${header.age}`;
 
   const y = header.yields;
+  // Scores with the number they are measured against. "military 3" alone hid the target from an
+  // agent whose whole instruction is to win the Age.
   const legacy =
     header.legacy.length > 0
-      ? header.legacy.map((l) => `${l.type.replace(/^LEGACY_PATH_/, "").toLowerCase()} ${num(l.score, 0)}`).join("  ")
+      ? header.legacy
+          .map((l) => {
+            const name = l.type.replace(/^LEGACY_PATH_/, "").toLowerCase();
+            return `${name} ${num(l.score, 0)}${l.target ? `/${num(l.target, 0)}` : ""}`;
+          })
+          .join("  ")
       : "none";
+  // A human has both of these permanently on screen. Without them an agent spent a command every
+  // turn asking what it was already researching.
+  const studying = [
+    header.researching ? `researching ${header.researching.node}` : null,
+    header.adopting ? `civic ${header.adopting.node}` : null,
+  ].filter(Boolean).join("  ");
 
   const s = header.settlements;
   // The harness turn limit, not Game.maxTurns: the engine reports no limit for these matches, so
@@ -109,6 +122,7 @@ export function renderHud(
     `you: p${header.playerId} ${header.civ ?? "?"} / ${header.leader ?? "?"}`,
     `gold ${num(header.gold, 0)} (${signed(y.gold)})  sci ${signed(y.science)}  cult ${signed(y.culture)}  food ${signed(y.food)}  prod ${signed(y.production)}  happiness ${signed(header.happiness.net)}`,
     `legacy: ${legacy}`,
+    ...(studying ? [studying] : []),
     `settlements ${num(s.total, 0)} (${num(s.cities, 0)} cities, ${num(s.towns, 0)} towns, cap ${num(s.cap, 0)})  pop ${num(s.population, 0)}  units ${header.unitCount}`,
     `pending: ${pending.items.length} items${pending.blockingType ? ` (blocking: ${pending.blockingType})` : ""} -> pending.txt`,
     `messages: ${messageCount} new -> messages.txt`,

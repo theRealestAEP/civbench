@@ -24,7 +24,8 @@ export type WrittenSnapshot = {
   counts: { tilesChanged: number; unitsChanged: number; settlementsChanged: number };
 };
 
-const pad = (turn: number) => `t${String(turn).padStart(4, "0")}`;
+/** A turn's directory name. Exported so nothing writes a second copy of this rule. */
+export const pad = (turn: number) => `t${String(turn).padStart(4, "0")}`;
 
 /**
  * What changed since this player last looked (docs/PLAN.md §6.3).
@@ -107,8 +108,18 @@ export function writeSnapshot(
 ): WrittenSnapshot {
   const turn = raw.header.turn;
   const tiles = mergeTiles(raw.tiles, memory.tiles, turn);
+
+  const visibleNow = new Set(tiles.filter((t) => t.vis === 2).map((t) => `${t.x},${t.y}`));
+  const visibleForeign = raw.units.foreign.filter((u) => visibleNow.has(`${u.x},${u.y}`));
+
+  // Settlements take the weaker rule on purpose: you keep knowing about a city once you have
+  // found it, so REVEALED is enough and it stays through fog. A plot never revealed is still
+  // never reported.
+  const everSeen = new Set(tiles.map((t) => `${t.x},${t.y}`));
+  const knownForeign = raw.settlements.foreign.filter((c) => everSeen.has(`${c.x},${c.y}`));
+
   const foreignSettlements = mergeForeignSettlements(
-    raw.settlements.foreign,
+    knownForeign,
     memory.foreignSettlements,
     turn,
   );
@@ -119,13 +130,23 @@ export function writeSnapshot(
     settlementsChanged: raw.settlements.own.length + foreignSettlements.length,
   };
 
+  /**
+   * A rival unit is only reported on a plot the player can see RIGHT NOW.
+   *
+   * `units.js` already applies this rule inside the game, so this is the second of two independent
+   * layers. That is deliberate: a single regression in the extractor would otherwise put a hidden
+   * unit in front of an agent, and nothing downstream would notice. §7 makes this the invariant
+   * the whole benchmark rests on — a leak invalidates every result without ever throwing.
+   *
+   * Remembered settlements are different and stay: you keep knowing about a city you have found.
+   */
   const turnDir = join(agentDir, "turns", pad(turn));
   mkdirSync(turnDir, { recursive: true });
 
   // Text for grep and sed; JSONL for jq. Same records, same order (§6.1).
   const files: Array<[string, string[], unknown[]]> = [
     ["tiles", tileLines(tiles), tiles],
-    ["units", unitLines(raw.units.own, raw.units.foreign), [...raw.units.own, ...raw.units.foreign]],
+    ["units", unitLines(raw.units.own, visibleForeign), [...raw.units.own, ...visibleForeign]],
     ["settlements", settlementLines(raw.settlements.own, foreignSettlements), [...raw.settlements.own, ...foreignSettlements]],
     ["players", playerLines(raw.players.known), raw.players.known],
   ];

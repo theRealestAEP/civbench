@@ -1,7 +1,7 @@
 // A whole multi-turn match against the fake game (docs/PLAN.md §14).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GameAdapter } from "../src/adapter/game.ts";
@@ -113,4 +113,125 @@ test("autosave can be turned off", async () => {
     stallStrikes: 3,
   });
   assert.equal(world.saves.length, 0);
+});
+
+// `echo "then civ end-turn" >> /notes/notes.md` used to end the agent's turn. The detector
+// matched the phrase anywhere in the line, and echo exits 0 — so writing next turn's plan
+// aborted this one without ending it. notes.md is exactly where a plan gets written.
+test("writing about end-turn in a note does not end the turn", async () => {
+  const { endsTurn } = await import("../src/agent/pi-brain.ts");
+  assert.equal(endsTurn("civ end-turn"), true);
+  assert.equal(endsTurn("civ skip 10; civ end-turn"), true);
+  assert.equal(endsTurn("echo 'then civ end-turn' >> /notes/notes.md"), false);
+  assert.equal(endsTurn("echo civ end-turn > /notes/plan.md"), false);
+  assert.equal(endsTurn("grep 'civ end-turn' /notes/notes.md"), false);
+});
+
+// Three tools each assembled a match by hand and each forgot something different: run-match.ts
+// and live-session.ts never exported the ruleset, so /run/rules/ — which the briefing tells
+// agents to look operation names up in — did not exist on those paths. They also skipped
+// MatchFacts, so the "match: N turns total" line the briefing describes never appeared.
+test("assembling a match gives it the ruleset, the match facts, and autosave", async () => {
+  const { startMatch, seatsFrom } = await import("../src/server/bootstrap.ts");
+  const { loadMatchConfig } = await import("../src/config/load.ts");
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-assemble-"));
+  const { config } = loadMatchConfig("configs/duel-scripted.yaml");
+  const { agents } = seatsFrom(config);
+
+  const { server, rules } = await startMatch(
+    new GameAdapter(new FakeBridge(makeWorld({ seats: agents.length }))),
+    runDir,
+    config,
+    agents,
+    { turnLimit: 7 },
+  );
+
+  assert.ok(rules.tables > 0, "the ruleset must be exported: the briefing tells agents to read it");
+  assert.equal(server.autosave, config.harness.autosaveEveryTurn, "autosave must follow the config");
+
+  const hud = await server.beginTurn(agents[0]!.playerId);
+  assert.match(hud, /match: 7 turns total/, "the match facts line the briefing describes must appear");
+  assert.ok(
+    existsSync(join(runDir, "agents", agents[0]!.name, "rules")),
+    "/run/rules must exist for the agent",
+  );
+});
+
+// resolveModel used to hand ANTHROPIC_API_KEY and Anthropic's cache_control format to anything
+// pi's registry knew, including OpenAI and Google models. That either sends a valid Anthropic key
+// to a third-party base URL, or fails mid-match with a 400 from a provider that has never heard
+// of cache_control.
+test("an undeclared third-party model is refused, not stamped with Anthropic's key", async () => {
+  const { resolveModel } = await import("../src/agent/models.ts");
+  // Declared models still resolve, with their own key and reasoning flag.
+  const luna = resolveModel("openai/gpt-5.6-luna");
+  assert.equal(luna.apiKeyEnv, "OPEN_ROUTER_API_KEY");
+  assert.equal(resolveModel("claude-sonnet-5").apiKeyEnv, "ANTHROPIC_API_KEY");
+
+  assert.throws(() => resolveModel("totally-made-up-model"), /unknown model/);
+});
+
+// The regression that ended every live match, reproduced end to end.
+//
+// No live run has ever passed turn 6. Each died at the round barrier because a notification
+// blocked the end of a turn and the harness could neither see it nor clear it. These drive the
+// real loop — run.ts, match.ts, the gamejs scripts — against the fake, with a blocking
+// notification arriving every turn.
+function blockedMatch(brain: Brain, world = makeWorld()) {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-blocked-"));
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 20, secondsPerTurn: 10 },
+  ]);
+  const seats: Seat[] = [
+    { config: { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 20, secondsPerTurn: 10 }, brain },
+  ];
+  return { runDir, server, seats, world };
+}
+
+/** A notification of the kind dismissal cannot clear: a decision, not a notice. */
+const blocker = () => [
+  { id: 900, name: "NOTIFICATION_LEGACY_COMPLETED", typeHash: 442844772, blocking: true, dismissible: true },
+];
+
+test("an agent that clears its blocker plays every turn it is given", async () => {
+  const world = makeWorld();
+  class Playing implements Brain {
+    readonly name = "playing";
+    async playTurn(ctx: { exec: (c: string) => Promise<{ exitCode: number }> }) {
+      world.notifications.set(0, blocker());
+      // What a real agent now does: clear the blocker, park the unit, end the turn.
+      await ctx.exec("civ dismiss");
+      await ctx.exec("civ skip 10");
+      await ctx.exec("civ end-turn");
+      return { commands: 3 };
+    }
+  }
+  const { runDir, server, seats } = blockedMatch(new Playing(), world);
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 10, stallStrikes: 3 });
+
+  const alpha = outcomes[0]!;
+  assert.ok(alpha.turnsPlayed > 6, `must get past turn 6, reached ${alpha.turnsPlayed}`);
+  assert.equal(alpha.turnsPlayed, 10, "and play every turn it was asked for");
+  assert.equal(alpha.forfeited, false);
+  assert.equal(alpha.forcedEndTurns, 0, "it ends its own turns, so nothing is forced");
+});
+
+test("an agent that never clears its blocker forfeits rather than hanging the match", async () => {
+  const world = makeWorld();
+  class Stuck implements Brain {
+    readonly name = "stuck";
+    async playTurn(ctx: { exec: (c: string) => Promise<{ exitCode: number }> }) {
+      world.notifications.set(0, blocker());
+      await ctx.exec("civ end-turn"); // refused: the blocker is still there
+      return { commands: 1 };
+    }
+  }
+  const { runDir, server, seats } = blockedMatch(new Stuck(), world);
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 10, stallStrikes: 3 });
+
+  const alpha = outcomes[0]!;
+  // The seat gives up, but the MATCH does not hang: forced end-turn still advanced the game each
+  // time, which is the behaviour whose absence left a seat active and the round waiting forever.
+  assert.equal(alpha.forfeited, true, "a seat that never plays should forfeit");
+  assert.ok(alpha.forcedEndTurns > 0, "and the harness must have ended its turns for it");
 });

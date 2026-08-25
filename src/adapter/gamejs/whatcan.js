@@ -10,7 +10,9 @@
 const unit = findOwnUnit(Number(UNIT_OWNER), UNIT_ID);
 if (!unit) return { error: "no such unit" };
 
-const args = TARGET ? { X: TARGET.x, Y: TARGET.y } : {};
+// A named target asks "can I do this THERE"; no target asks "is this possible at all", which the
+// engine answers correctly only for an invalid plot. See PROBE_ARGS in _prelude.js.
+const args = TARGET ? { X: TARGET.x, Y: TARGET.y, UnitAbilityType: -1 } : PROBE_ARGS;
 
 const reasons = (result) => {
   const ids = result?.FailureReasons ?? [];

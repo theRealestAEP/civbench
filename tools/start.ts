@@ -22,7 +22,7 @@ import { findGamePids } from "../src/adapter/discover.ts";
 import { GameAdapter } from "../src/adapter/game.ts";
 import { MatchServer } from "../src/server/match.ts";
 import { runMatch } from "../src/server/run.ts";
-import { seatsFrom, writeManifest, connect } from "../src/server/bootstrap.ts";
+import { seatsFrom, writeManifest, connect, startMatch } from "../src/server/bootstrap.ts";
 import { renderReport } from "../src/server/report.ts";
 import { collectRun } from "../src/replay/build.ts";
 import { renderReplayPage } from "../src/replay/page.ts";
@@ -306,45 +306,14 @@ writeManifest(runDir, config, runId, { bridge: null as never, kind: useFake ? "f
 const { seats, agents } = seatsFrom(config);
 // Rival counts come from the loaded game, not from the config: the config asked for no filler AI
 // and got three anyway, and the HUD must never tell an agent something the game contradicts.
+// One assembly path for every tool: MatchFacts, autosave, and the exported ruleset together.
+// Rival counts come from the loaded game, because the config asked for no filler AI and got three.
 const majors = await adapter.majorPlayerCount().catch(() => config.agents.length);
-const server = new MatchServer(adapter, runDir, agents, {
+const { server, rules } = await startMatch(adapter, runDir, config, agents, {
   turnLimit: turns,
-  speed: config.game.gameSpeed ?? null,
-  singleAge: config.game.singleAge !== false,
-  agentRivals: config.agents.length - 1,
-  aiRivals: Math.max(0, majors - config.agents.length),
+  majorPlayers: majors,
 });
-// The config field existed and was parsed and then ignored. It now does what it says.
-server.autosave = config.harness.autosaveEveryTurn;
 if (server.autosave) console.log("   autosaving each turn (resume with --resume <name>)");
-
-// Self-check the operation catalogue before anyone spends a token.
-//
-// This has shipped broken twice: both times the catalogue held short enum keys instead of the
-// full names the engine accepts, so the validator rejected CORRECT actions and agents burned
-// entire turns guessing. These three names are passed verbatim by the shipped game UI, so if the
-// catalogue lacks them it is being read from the wrong place.
-const catalogue = await server.operationTypes().catch(() => ({}) as Record<string, string[]>);
-const required: Array<[string, string]> = [
-  ["unit_operation", "UNITOPERATION_FOUND_CITY"],
-  ["unit_operation", "UNITOPERATION_MOVE_TO"],
-];
-const missing = required.filter(([kind, name]) => !catalogue[kind]?.includes(name));
-if (missing.length > 0) {
-  throw new Error(
-    `operation catalogue is wrong — missing ${missing.map(([k, n]) => `${k}:${n}`).join(", ")}.\n` +
-      `unit_operation has ${catalogue.unit_operation?.length ?? 0} entries: ` +
-      `${(catalogue.unit_operation ?? []).slice(0, 5).join(", ")}\n` +
-      `Refusing to start: agents would be told correct actions are invalid.`,
-  );
-}
-console.log(
-  `   catalogue ok: ${Object.entries(catalogue).map(([k, v]) => `${k} ${v.length}`).join(", ")}`,
-);
-
-// Export the ruleset before anyone plays: it is the one thing every agent needs and nothing
-// wrote it until now.
-const rules = await server.exportRules().catch(() => ({ tables: 0, rows: 0 }));
 console.log(`   rules exported: ${rules.tables} tables, ${rules.rows} rows`);
 
 console.log(`5. playing ${turns} turns\n`);

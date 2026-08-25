@@ -5,7 +5,7 @@ import { loadMatchConfig, nextRunDir } from "../src/config/load.ts";
 import { MatchServer } from "../src/server/match.ts";
 import { runMatch } from "../src/server/run.ts";
 import { GameAdapter } from "../src/adapter/game.ts";
-import { connect, seatsFrom, writeManifest } from "../src/server/bootstrap.ts";
+import { connect, seatsFrom, writeManifest , startMatch} from "../src/server/bootstrap.ts";
 import { renderReport } from "../src/server/report.ts";
 import { collectRun } from "../src/replay/build.ts";
 import { renderReplayPage } from "../src/replay/page.ts";
@@ -35,7 +35,10 @@ mkdirSync(runDir, { recursive: true });
 writeManifest(runDir, config, runId, transport);
 
 const { seats, agents } = seatsFrom(config);
-const server = new MatchServer(new GameAdapter(transport.bridge), runDir, agents);
+const { server, rules } = await startMatch(new GameAdapter(transport.bridge), runDir, config, agents, {
+  turnLimit: config.game.turnLimit,
+});
+if (rules.tables > 0) console.log(`   rules exported: ${rules.tables} tables, ${rules.rows} rows`);
 
 console.log(`run ${runId}: ${agents.length} seats, up to ${turnLimit} turns\n`);
 const outcomes = await runMatch(

@@ -23,6 +23,20 @@ export type TurnUsage = {
 
 export type MemoryMode = "persistent" | "fresh";
 
+/**
+ * Does this command line actually end the turn?
+ *
+ * Anchored to the START of a command, and never when the part redirects to a file.
+ * `echo "then civ end-turn" >> /notes/notes.md` used to match: echo exits 0, so the turn was
+ * aborted without ever being ended — and notes.md is exactly where an agent writes next turn's
+ * plan. Exported so its test drives this rule rather than a copy of it.
+ */
+export function endsTurn(command: string): boolean {
+  return command
+    .split(/[;&|]+/)
+    .some((part) => /^\s*civ\s+end-turn\b/.test(part) && !/[<>]/.test(part));
+}
+
 export class PiBrain implements Brain {
   readonly name: string;
   #modelId: string;
@@ -75,7 +89,7 @@ export class PiBrain implements Brain {
         // Ending the turn ends the agent's work. Without this the model gets "ok", carries on
         // reasoning, and calls end-turn again and again until it hits the timeout — while the
         // game has already moved to the next seat.
-        if (/\bciv\s+end-turn\b/.test(params.command) && result.exitCode === 0) {
+        if (endsTurn(params.command) && result.exitCode === 0) {
           endedTurn = true;
           queueMicrotask(() => agent.abort());
         }

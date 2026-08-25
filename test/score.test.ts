@@ -1,7 +1,7 @@
 // Metrics and Elo (docs/PLAN.md §13).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { scoreRun } from "../src/score/metrics.ts";
@@ -25,7 +25,7 @@ async function makeRun(): Promise<string> {
   });
   return runDir;
 }
-import { updateRatings, leaderboard, ANCHOR, START_RATING } from "../src/score/elo.ts";
+import { updateRatings, leaderboard, ANCHOR, START_RATING, K_FACTOR } from "../src/score/elo.ts";
 
 test("scoring reads a real run and separates outcome from hygiene", async () => {
   const metrics = scoreRun(await makeRun());
@@ -86,4 +86,92 @@ test("an inadmissible match changes nothing", () => {
     ranking: [{ name: "a", rank: 2 }, { name: "b", rank: 1 }],
   });
   assert.deepEqual(after, before, "a degraded match must not move the board");
+});
+
+// Elo across more than two seats. Neither reviewer read this file, and its behaviour decides the
+// leaderboard, so the rules it relies on are pinned here.
+test("every pair in a match counts, and expectations use pre-match ratings", () => {
+  const ratings = updateRatings(
+    { alpha: { rating: 1600, matches: 4 }, beta: { rating: 1400, matches: 4 }, gamma: { rating: 1500, matches: 4 } },
+    {
+      ranking: [
+        { name: "gamma", rank: 1 },
+        { name: "alpha", rank: 2 },
+        { name: "beta", rank: 3 },
+      ],
+      admissible: true,
+    },
+  );
+  // gamma beat a higher-rated player, so it must gain more than alpha loses to it alone.
+  assert.ok(ratings.gamma!.rating > 1500, "the winner gains");
+  assert.ok(ratings.alpha!.rating < 1600, "the favourite that came second sheds");
+  assert.ok(ratings.beta!.rating < 1400, "last place sheds");
+  // Ratings must move by a bounded amount: a single match cannot swing more than K.
+  for (const name of ["alpha", "beta", "gamma"]) {
+    const before = { alpha: 1600, beta: 1400, gamma: 1500 }[name]!;
+    assert.ok(Math.abs(ratings[name]!.rating - before) <= K_FACTOR, `${name} moved more than K`);
+  }
+});
+
+test("a tie splits the difference rather than picking a winner", () => {
+  const tied = updateRatings(
+    { alpha: { rating: 1500, matches: 0 }, beta: { rating: 1500, matches: 0 } },
+    { ranking: [{ name: "alpha", rank: 1 }, { name: "beta", rank: 1 }], admissible: true },
+  );
+  assert.equal(Math.round(tied.alpha!.rating), 1500, "equal players who tie do not move");
+  assert.equal(Math.round(tied.beta!.rating), 1500);
+});
+
+test("the anchor plays matches without ever moving", () => {
+  let ratings = { [ANCHOR]: { rating: START_RATING, matches: 0 } };
+  for (let i = 0; i < 5; i++) {
+    ratings = updateRatings(ratings, {
+      ranking: [{ name: "challenger", rank: 1 }, { name: ANCHOR, rank: 2 }],
+      admissible: true,
+    });
+  }
+  assert.equal(ratings[ANCHOR]!.rating, START_RATING, "the yardstick must not drift");
+  assert.equal(ratings[ANCHOR]!.matches, 5, "but its matches are still counted");
+  assert.ok(ratings.challenger!.rating > START_RATING, "beating the anchor must be worth something");
+});
+
+// The replay renders event fields into innerHTML, and actionType is typed by the agent — `civ do`
+// takes a free-form operation name. Unescaped, an agent naming an operation `<img onerror=...>`
+// runs script in the browser of whoever opens the replay.
+test("the replay escapes agent-controlled text", async () => {
+  const { renderReplayPage } = await import("../src/replay/page.ts");
+  const html = renderReplayPage({
+    width: 4,
+    height: 4,
+    agents: [{ name: "alpha", turns: [] }],
+    events: [
+      {
+        turn: 1,
+        player: 0,
+        kind: "action",
+        request: { actionType: "<img src=x onerror=alert(1)>" },
+        result: { ok: false, code: "</script><script>alert(2)</script>" },
+      },
+    ],
+  } as never);
+  // The payload may appear as DATA — it is a record of what the agent did. What it must never do
+  // is escape its context: no raw closing script tag, and no unescaped `<` in the data blob.
+  assert.ok(!html.includes("</script><script>"), "an agent must not break out of the data block");
+  assert.ok(html.includes("\\u003c"), "`<` in agent text must be escaped inside the script tag");
+  // And at render time the event list escapes before touching innerHTML.
+  assert.match(html, /replace\(\/\[&<>"'\]\/g/, "the event renderer must escape before innerHTML");
+});
+
+// A killed run leaves a half-written last line in events.jsonl. The replay is the tool for
+// working out why a run died, so it has to survive the artifacts of one.
+test("the replay builds from a run that was killed mid-write", async () => {
+  const { collectRun } = await import("../src/replay/build.ts");
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-truncated-"));
+  mkdirSync(join(runDir, "agents", "alpha", "turns", "t0001"), { recursive: true });
+  writeFileSync(
+    join(runDir, "events.jsonl"),
+    '{"turn":1,"kind":"turn_begin"}\n{"turn":1,"kind":"action"}\n{"turn":1,"kind":"acti',
+  );
+  const data = collectRun(runDir);
+  assert.equal(data.events.length, 2, "every complete line before the truncation must survive");
 });

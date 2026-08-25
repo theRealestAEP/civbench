@@ -15,6 +15,10 @@ export type RawTile = {
   mountain: boolean;
   continent: number;
   elevation: number;
+  /** What the plot produces for this player, by yield name. */
+  yields: Record<string, number> | null;
+  /** Buildings and improvements standing here. Only ever set on a VISIBLE plot. */
+  built?: string[] | null;
   /** Present only when vis === 2. Reading these while fogged would leak. */
   owner?: number;
   cityId?: string | null;
@@ -57,7 +61,9 @@ export type HeaderSnapshot = {
     population: number | null;
   };
   unitCount: number;
-  legacy: Array<{ type: string; score: number | null }>;
+  legacy: Array<{ type: string; score: number | null; target?: number | null }>;
+  researching?: { node: string; progress: number | null } | null;
+  adopting?: { node: string; progress: number | null } | null;
   government: string | number | null;
 };
 
@@ -93,6 +99,13 @@ export type OwnSettlement = {
   projectType: number | string | null;
   productionTurnsLeft: number | null;
   productionHash: number | string | null;
+  /** What the city is building, by name. The hash above is never shown to an agent. */
+  building: string | null;
+  foodToGrow: number | null;
+  foodPerTurn: number | null;
+  turnsToGrow: number | null;
+  urbanPopulation: number | null;
+  ruralPopulation: number | null;
   queueEmpty: boolean | null;
   happiness: number | null;
   hasUnrest: boolean | null;

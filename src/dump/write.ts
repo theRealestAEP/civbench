@@ -39,6 +39,9 @@ export function tileLines(tiles: MergedTile[]): string[] {
         ["river", t.river],
         ["mountain", t.mountain],
         ["continent", t.continent as unknown as Scalar],
+        // Yields as one field, so a line stays greppable: `yield=food2,production1`.
+        ["yield", t.yields ? Object.entries(t.yields).map(([k, v]) => `${k}${v}`).join(",") : null],
+        ["built", t.built && t.built.length > 0 ? t.built.join(",") : null],
         ["owner", t.owner === null ? null : `p${t.owner}`],
         ["city", t.cityId],
         ["vis", t.vis === 2 ? "visible" : "fogged"],
@@ -47,33 +50,78 @@ export function tileLines(tiles: MergedTile[]): string[] {
     );
 }
 
+/**
+ * A unit line carries every field the extractor sent.
+ *
+ * The old version listed ten fields by hand, so anything the game knew and this list omitted was
+ * invisible to the agent no matter what the extractor collected. The lead fields stay first
+ * because they are what an agent scans for; everything else follows in a stable order, so the
+ * lines stay greppable and diffable.
+ */
+const UNIT_LEAD = ["owner", "type", "at", "hp", "moves"] as const;
+
+function entityLine(kind: string, record: Record<string, Scalar | null | undefined>, id: string): string {
+  const lead: Array<[string, Scalar | null]> = [];
+  for (const key of UNIT_LEAD) {
+    if (key in record) lead.push([key, record[key] ?? null]);
+  }
+  const rest = Object.keys(record)
+    .filter((k) => !UNIT_LEAD.includes(k as (typeof UNIT_LEAD)[number]) && k !== "id")
+    .sort()
+    .map((k): [string, Scalar | null] => [k, record[k] ?? null]);
+  return line(kind, id, [...lead, ...rest]);
+}
+
+/**
+ * Display names for the text dump.
+ *
+ * The JSONL twin keeps the code names, because jq filters are written against those. The text file
+ * uses the short snake_case an agent greps for — `moves=0`, not `movesRemaining=0`. Anything not
+ * listed keeps the name the extractor sent, so a new field appears without being renamed by hand.
+ */
+const DISPLAY: Record<string, string> = {
+  movesRemaining: "moves",
+  maxMoves: "max_moves",
+  canMove: "can_move",
+  hasMoved: "has_moved",
+  isCommander: "commander",
+  armyId: "army",
+  experience: "xp",
+  experienceToNextLevel: "xp_to_level",
+  attackRange: "range",
+};
+
+/** Flatten what the extractor sent into printable fields, dropping only what cannot render. */
+function unitRecord(u: OwnUnit | ForeignUnit): Record<string, Scalar | null> {
+  const out: Record<string, Scalar | null> = {};
+  for (const [key, value] of Object.entries(u as Record<string, unknown>)) {
+    if (value === undefined || value === null) continue;
+    if (key === "id" || key === "x" || key === "y") continue;
+    if (key === "damage" || key === "maxDamage") continue;
+    if (Array.isArray(value)) {
+      out[key] = value.join(",");
+    } else if (typeof value === "object") {
+      continue;
+    } else {
+      out[DISPLAY[key] ?? key] = value as Scalar;
+    }
+  }
+  const u2 = u as { x?: number | null; y?: number | null; damage?: number | null; maxDamage?: number | null };
+  out.at = u2.x === null || u2.x === undefined ? null : `${u2.x},${u2.y}`;
+  out.owner = `p${(u as { owner: number }).owner}`;
+  if (u2.maxDamage !== null && u2.maxDamage !== undefined) {
+    out.hp = (u2.maxDamage ?? 0) - (u2.damage ?? 0);
+  }
+  return out;
+}
+
 export function unitLines(own: OwnUnit[], foreign: ForeignUnit[]): string[] {
   const ownLines = [...own]
-    .sort((a, b) => a.id.localeCompare(b.id))
-    .map((u) =>
-      line("unit", u.id, [
-        ["owner", `p${u.owner}`],
-        ["type", u.type as unknown as Scalar],
-        ["at", u.x === null ? null : `${u.x},${u.y}`],
-        ["hp", u.maxDamage === null ? null : (u.maxDamage ?? 0) - (u.damage ?? 0)],
-        ["moves", u.movesRemaining],
-        ["can_move", u.canMove],
-        ["commander", u.isCommander],
-        ["army", u.armyId],
-        ["xp", u.experience],
-        ["name", u.name],
-      ]),
-    );
+    .sort((a, b) => Number(a.id) - Number(b.id))
+    .map((u) => entityLine("unit", unitRecord(u), u.id));
   const foreignLines = [...foreign]
-    .sort((a, b) => a.id.localeCompare(b.id))
-    .map((u) =>
-      line("enemy_unit", u.id, [
-        ["owner", `p${u.owner}`],
-        ["type", u.type as unknown as Scalar],
-        ["at", u.x === null ? null : `${u.x},${u.y}`],
-        ["hp", u.maxDamage === null ? null : (u.maxDamage ?? 0) - (u.damage ?? 0)],
-      ]),
-    );
+    .sort((a, b) => Number(a.id) - Number(b.id))
+    .map((u) => entityLine("enemy_unit", unitRecord(u), u.id));
   return [...ownLines, ...foreignLines];
 }
 
@@ -89,6 +137,12 @@ export function settlementLines(own: OwnSettlement[], foreign: MergedSettlement[
         ["pop", s.population],
         ["capital", s.isCapital],
         ["food", s.currentFood],
+        ["food_to_grow", s.foodToGrow],
+        ["food_per_turn", s.foodPerTurn],
+        ["turns_to_grow", s.turnsToGrow],
+        ["urban", s.urbanPopulation],
+        ["rural", s.ruralPopulation],
+        ["building", s.building],
         ["prod_turns_left", s.productionTurnsLeft],
         ["queue_empty", s.queueEmpty],
         ["happiness", s.happiness],
@@ -122,6 +176,14 @@ export function playerLines(known: KnownPlayer[]): string[] {
         ["leader", p.leader],
         ["major", p.isMajor],
         ["at_war", p.atWar],
+        ["relationship", p.relationship],
+        // How they are doing. A human reads this off the diplomacy ribbon every turn.
+        ["gold", p.gold],
+        ["sci", p.science],
+        ["cult", p.culture],
+        ["happy", p.happiness],
+        ["diplo", p.diplomacy],
+        ["settlements", p.settlements === null ? null : `${p.settlements}/${p.settlementCap ?? "?"}`],
         ["suzerain", p.suzerain === null ? null : `p${p.suzerain}`],
       ]),
     );

@@ -8,7 +8,7 @@
 import { existsSync } from "node:fs";
 import { loadEnv } from "../src/config/env.ts";
 import { readTurns, type CompleteTurn } from "../src/commentary/brief.ts";
-import { commentateTurn, hasCommentary, writeCommentary } from "../src/commentary/commentate.ts";
+import { commentateTurn, hasCommentary, newMemory, writeCommentary } from "../src/commentary/commentate.ts";
 import { modelSpeaker } from "../src/commentary/speak.ts";
 
 loadEnv();
@@ -24,12 +24,14 @@ if (!given || !existsSync(given)) {
 const runDir = given;
 
 const speak = modelSpeaker();
+// Held across turns so the caster can say what has changed rather than re-describing each turn.
+const memory = newMemory();
 const POLL_MS = 5000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function say(turn: CompleteTurn) {
   const started = Date.now();
-  const lines = await commentateTurn(turn, speak);
+  const lines = await commentateTurn(turn, speak, memory);
   writeCommentary(runDir, turn.turn, lines);
   console.log(`\n== turn ${turn.turn}  (${((Date.now() - started) / 1000).toFixed(1)}s)`);
   for (const line of lines) console.log(`  ${line.seat} — ${line.text}`);

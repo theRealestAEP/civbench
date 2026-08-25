@@ -24,6 +24,9 @@ const estimateTokens = (messages: AgentMessage[]): number =>
 /** Compact once the transcript passes this, so the cached prefix stays stable most turns. */
 export const COMPACT_ABOVE_TOKENS = 120_000;
 
+/** How many messages stay intact when turn markers are unavailable. */
+const FALLBACK_RECENT_MESSAGES = 20;
+
 export type CompactionStats = { before: number; after: number; dropped: number };
 
 /**
@@ -41,7 +44,12 @@ export function compactTranscript(
   }
 
   // Everything before this index is old enough to lose its tool output.
-  const cutoff = turnMarkers.at(-KEEP_TOOL_RESULTS_FOR_TURNS) ?? 0;
+  //
+  // The fallback matters. `?? 0` meant "everything is recent" when markers were missing, so an
+  // over-threshold transcript compacted nothing at all and the context grew until the API refused
+  // it — failing open in the one direction that breaks a long match. Without markers, keep the
+  // last few messages instead and compact the rest.
+  const cutoff = turnMarkers.at(-KEEP_TOOL_RESULTS_FOR_TURNS) ?? Math.max(0, messages.length - FALLBACK_RECENT_MESSAGES);
   let dropped = 0;
 
   const compacted = messages.map((message, index) => {

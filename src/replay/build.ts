@@ -24,12 +24,25 @@ export type ReplayData = {
   height: number;
 };
 
+/**
+ * Read a JSONL file, skipping any line that will not parse.
+ *
+ * A killed run leaves a half-written last line, and this used to throw on it — so the replay, the
+ * tool for working out why a run died, could not be built for a run that died. Every complete line
+ * before the truncation is still good evidence.
+ */
 function readJsonl(path: string): Array<Record<string, unknown>> {
   if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8")
-    .split("\n")
-    .filter((l) => l.trim().length > 0)
-    .map((l) => JSON.parse(l) as Record<string, unknown>);
+  const out: Array<Record<string, unknown>> = [];
+  for (const raw of readFileSync(path, "utf8").split("\n")) {
+    if (raw.trim().length === 0) continue;
+    try {
+      out.push(JSON.parse(raw) as Record<string, unknown>);
+    } catch {
+      // A truncated tail is expected on a killed run. Earlier lines are still usable.
+    }
+  }
+  return out;
 }
 
 export function collectRun(runDir: string): ReplayData {
