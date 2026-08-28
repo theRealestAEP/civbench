@@ -2,10 +2,12 @@
 // No network, no build step: open the file and scrub.
 import type { ReplayData } from "./build.ts";
 
-const TERRAIN_COLORS: Record<string, string> = {
+// Indexed by whatever terrain name the game produced, so a Map rather than a dictionary type:
+// the keys are open by nature and `satisfies` would only pin the ones we happened to list.
+const TERRAIN_COLORS = new Map<string, string>(Object.entries({
   grassland: "#5c8a3a", plains: "#a89a4e", desert: "#d6c187", tundra: "#9aa89a",
   snow: "#e6ecef", ocean: "#2b5d78", coast: "#3c7fa0", mountain: "#6b6459", hills: "#7d8f4a",
-};
+}));
 
 /**
  * JSON safe to embed inside a script tag.
@@ -15,7 +17,7 @@ const TERRAIN_COLORS: Record<string, string> = {
  * operation names, so this is reachable. Escaping `<` as \\u003c keeps the JSON identical to a
  * parser and inert to the HTML tokeniser.
  */
-function safeJson(value: unknown): string {
+function safeJson(value: ReplayData): string {
   return JSON.stringify(value).replace(/</g, "\\u003c");
 }
 
@@ -60,7 +62,7 @@ export function renderReplayPage(data: ReplayData, title: string): string {
 </div>
 <script>
 const DATA = ${safeJson(data)};
-const COLORS = ${JSON.stringify(TERRAIN_COLORS)};
+const COLORS = ${JSON.stringify(Object.fromEntries(TERRAIN_COLORS))};
 const agentSel = document.getElementById("agent");
 const turnEl = document.getElementById("turn");
 DATA.agents.forEach((a,i)=>agentSel.add(new Option(a.name,String(i))));

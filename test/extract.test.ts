@@ -28,7 +28,7 @@ test("tiles: mutable fields are withheld while fogged", async () => {
 test("tiles: hashes are resolved to names, never leaked as numbers", async () => {
   const result = await adapterFor().tiles(0);
   assert.equal(typeof result.tiles[0]!.terrain, "string");
-  assert.equal(result.tiles[0]!.terrain as unknown as string, "1");
+  assert.equal(result.tiles[0]!.terrain, "1");
 });
 
 test("units: a rival unit on an unrevealed plot is invisible", async () => {
@@ -65,7 +65,7 @@ test("a met civ shows what the ribbon shows, and nothing a screen never shows", 
   world.met[0] = [1];
   const result = await adapterFor(world).players(0);
   assert.equal(result.known.length, 1);
-  const known = result.known[0]! as Record<string, unknown>;
+  const known = result.known[0]!;
 
   for (const shown of ["gold", "science", "culture", "settlements", "atWar"]) {
     assert.ok(shown in known, `the ribbon shows rival ${shown}; withholding it handicaps the agent`);

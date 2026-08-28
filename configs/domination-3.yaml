@@ -1,0 +1,51 @@
+# Three agents, domination or nothing.
+#
+# Civ VII has no per-victory toggle — the setup config exposes no victory parameters at all
+# (docs/FINDINGS.md). So "domination only" is arranged structurally: a SINGLE Antiquity Age at
+# quick speed. A single-age game ends in a victory instead of transitioning, and
+# VICTORY_DOMINATION exists in every Age — so conquest is the only outcome reachable inside the
+# turn budget. This is the closest the game allows to "military only".
+seed: 8891234
+
+game:
+  build: "1.4.2"
+  start_age: antiquity       # domination is available in every Age
+  single_age: true           # one age, no transitions — the match ends in a victory
+  game_speed: GAMESPEED_QUICK
+  # map_size stays at the platform default: MAPSIZE_TINY is rejected on macOS with
+  # "MAP SIZE UNSUPPORTED", and the refusal only appears as an in-game dialog.
+  map_size: default
+  # A backstop, not the expected length. The match ends at the real finish: a domination victory
+  # (realistically turns 60-150 between three seats) or the Age's own progress bar filling
+  # (~100-150 turns at quick speed) — the run loop detects both. 400 only matters in a total
+  # stalemate; Ctrl-C loses nothing if one develops, since every turn is autosaved.
+  turn_limit: 400
+  filler_ai: none            # agents only — no Firaxis AI in the mix
+  crises: true
+  game_modes: []
+
+# Hotseat, not direct: a single-player game gives exactly ONE human seat no matter how many
+# slots are marked taken. Hotseat is the mode built for several humans on one machine.
+control_mode: hotseat
+
+agents:
+  - slot: 0
+    player_id: 0
+    name: Ada
+    brain: { model: openai/gpt-5.6-luna }
+    budget: { actions_per_turn: 500, seconds_per_turn: 480 }
+  - slot: 1
+    player_id: 1
+    name: Bruno
+    brain: { model: openai/gpt-5.6-luna }
+    budget: { actions_per_turn: 500, seconds_per_turn: 480 }
+  - slot: 2
+    player_id: 2
+    name: Cleo
+    brain: { model: openai/gpt-5.6-luna }
+    budget: { actions_per_turn: 500, seconds_per_turn: 480 }
+
+harness:
+  hud_fields: default
+  autosave_every_turn: true
+  memory_mode: persistent

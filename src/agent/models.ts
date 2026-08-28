@@ -102,8 +102,14 @@ const openrouter = (
   apiKeyEnv: "OPEN_ROUTER_API_KEY",
 });
 
-/** Prices are $/1M tokens. */
-export const MODELS: Record<string, ModelDescriptor> = {
+/**
+ * Prices are $/1M tokens.
+ *
+ * `satisfies` rather than an annotation, so each entry is still checked against ModelDescriptor
+ * while the key literals survive — `resolveModel` looks up by an arbitrary string, so the lookup
+ * below reads through a Map built from these.
+ */
+export const MODELS = {
   "claude-opus-5": anthropic("claude-opus-5", "Claude Opus 5", 5, 25),
   "claude-sonnet-5": anthropic("claude-sonnet-5", "Claude Sonnet 5", 2, 10),
   "claude-haiku-4-5": anthropic("claude-haiku-4-5", "Claude Haiku 4.5", 1, 5, 200_000),
@@ -121,12 +127,43 @@ export const MODELS: Record<string, ModelDescriptor> = {
   "z-ai/glm-5.2": openrouter("z-ai/glm-5.2", "GLM 5.2", 0.966, 3.036, 0.1932, 1_048_576, true),
   "z-ai/glm-5.3": openrouter("z-ai/glm-5.3", "GLM 5.3", 1.4, 4.4, 0.26, 1_048_576, true),
   "moonshotai/kimi-k3": openrouter("moonshotai/kimi-k3", "Kimi K3", 3, 15, 0.3, 262_144, true),
-};
+} satisfies Record<string, ModelDescriptor>;
+
+/**
+ * Ask pi's registry for a model, by the provider and id it is filed under.
+ *
+ * pi types getModel against its own literal union of known providers and ids, which a string
+ * pair cannot satisfy. The lookup is a runtime one either way — an unknown pair throws — so this
+ * is the one place that boundary is crossed, and it is crossed once, in the open.
+ */
+function lookupInPi(provider: string, modelId: string): ModelDescriptor | undefined {
+  try {
+    // SAFETY: getModel's parameter types are literal unions over pi's built-in registry; the
+    // values here come from a user-supplied id string and are validated by the call itself,
+    // which throws for a pair it does not know.
+    // SAFETY: getModel's parameters are literal unions over pi's built-in registry, which a pair
+    // of plain strings cannot satisfy nominally. The lookup is a runtime one — an unknown pair
+    // throws, and the catch below turns that into `undefined`. What it returns is pi's own model
+    // record, which is ModelDescriptor-shaped.
+    const lookup = piGetModel as unknown as (p: string, m: string) => ModelDescriptor | undefined;
+    return lookup(provider, modelId) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export function resolveModel(id: string): ModelDescriptor {
-  const known = MODELS[id];
+  // SAFETY: guarded by hasOwn, so the key is one of MODELS' own. The cast only tells the compiler
+  // what the guard already established; `satisfies` above keeps every entry checked.
+  const known: ModelDescriptor | undefined = Object.hasOwn(MODELS, id)
+    ? MODELS[id as keyof typeof MODELS]
+    : undefined;
   if (known) return known;
-  const fromPi = piGetModel(id) as ModelDescriptor | undefined;
+  // pi's registry is keyed by PROVIDER AND MODEL, not by one string. This was called with the id
+  // alone, so the fallback never resolved anything: every model outside MODELS reached the
+  // "unknown model" throw regardless of whether pi knew it. Split the id the way pi stores it.
+  const slash = id.indexOf("/");
+  const fromPi = slash > 0 ? lookupInPi(id.slice(0, slash), id.slice(slash + 1)) : undefined;
   // Only an Anthropic model may be stamped with Anthropic's key and cache format.
   //
   // This used to accept anything pi's registry knew — OpenAI and Google models included — and

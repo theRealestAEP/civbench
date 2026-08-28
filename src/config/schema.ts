@@ -35,7 +35,6 @@ export type MatchConfig = {
   harness: {
     hudFields: string;
     autosaveEveryTurn: boolean;
-    stallStrikes: number;
     /** "persistent" keeps each agent's transcript across turns and compacts it (§8). */
     memoryMode: "persistent" | "fresh";
   };
@@ -46,6 +45,8 @@ export type MatchConfig = {
  * unsupported game mode produces a corrupt benchmark, which is worse than an error.
  */
 export const SUPPORTED = {
+  // SAFETY: an empty literal infers never[], which would refuse every later push. The element
+  // type is the declaration, not a claim about a value.
   gameModes: [] as string[],
   startAges: ["antiquity", "exploration", "modern"],
   controlModes: ["direct", "hotseat"],

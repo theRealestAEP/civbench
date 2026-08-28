@@ -7,6 +7,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readTurns } from "../src/commentary/brief.ts";
+import type { CompleteTurn } from "../src/commentary/brief.ts";
 import {
   commentateTurn, hasCommentary, promptFor, writeCommentary, newMemory, MEMORY_TURNS } from "../src/commentary/commentate.ts";
 import type { Speak } from "../src/commentary/speak.ts";
@@ -77,7 +78,7 @@ test("a build says what is being built", () => {
   assert.match(readTurns(runDir)[0]!.seats[0]!.did[0]!, /UNIT_SCOUT/);
 });
 
-test("a failed action is kept, with the reason the game gave", () => {
+test("a failed action is kept, with its code but not the harness error text", () => {
   const runDir = makeRun([
     begin(1, "Ada"),
     action(1, "Ada", { actionType: "SET_TECH_TREE_NODE" }, false, { code: "ILLEGAL_ACTION", message: "the game refused this action" }),
@@ -86,6 +87,7 @@ test("a failed action is kept, with the reason the game gave", () => {
   const line = readTurns(runDir)[0]!.seats[0]!.did[0]!;
   assert.match(line, /^FAILED SET_TECH_TREE_NODE/);
   assert.match(line, /ILLEGAL_ACTION/);
+  assert.doesNotMatch(line, /refused this action/, "error prose pulled the caster toward narrating plumbing");
 });
 
 test("a turn the loop had to end is flagged", () => {
@@ -203,4 +205,110 @@ test("memory is a sliding window, so a long match does not grow the prompt forev
   const last = prompts.at(-1)!;
   assert.doesNotMatch(last, /\bline 1\b/, "the oldest line must have fallen out of the window");
   assert.match(last, new RegExp(`line ${prompts.length - 1}`), "the newest must still be in it");
+});
+
+// ---- the strategy-and-standings layer -------------------------------------------------------
+
+function writeHeader(runDir: string, seat: string, turn: number, gold: number, legacy = 0): void {
+  const dir = join(runDir, "agents", seat, "turns", `t${String(turn).padStart(4, "0")}`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "header.json"),
+    JSON.stringify({
+      turn, age: "antiquity", gold,
+      yields: { science: 4, culture: 2 },
+      settlements: { total: 1 },
+      unitCount: 3,
+      legacy: [{ type: "LEGACY_PATH_ANTIQUITY_SCIENCE", score: legacy }],
+    }),
+  );
+}
+
+function writeNotes(runDir: string, seat: string, lines: string[]): void {
+  const dir = join(runDir, "notes", seat);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "notes.md"), "# notes\n\nheader text\n" + lines.join("\n") + "\n");
+}
+
+// The caster could describe actions but never the race: nothing read header.json, so gold,
+// yields and legacy progress — the numbers a viewer watches for — were invisible to it.
+test("a seat's standing reaches the prompt", () => {
+  const runDir = makeRun([begin(4, "Ada"), end(4, "Ada")]);
+  writeHeader(runDir, "Ada", 4, 147, 3);
+  const brief = readTurns(runDir)[0]!.seats[0]!;
+  const prompt = promptFor(brief);
+  assert.match(prompt, /Where it stands/);
+  assert.match(prompt, /gold 147/);
+  assert.match(prompt, /antiquity_science 3/, "legacy progress is the win condition — it must be visible");
+});
+
+// The journal is where agents distil their plan — one dated line per turn. It beats the
+// transcript opening, which is usually "let me read delta.md".
+test("the seat's journal reaches the prompt, tail only", () => {
+  const runDir = makeRun([begin(4, "Ada"), end(4, "Ada")]);
+  writeNotes(runDir, "Ada", [
+    ...Array.from({ length: 12 }, (_, i) => `- t${i + 1}: filler turn ${i + 1}`),
+    "- t13: chose Writing; queued settler for second city",
+  ]);
+  const brief = readTurns(runDir)[0]!.seats[0]!;
+  const prompt = promptFor(brief);
+  assert.match(prompt, /its own journal/i);
+  assert.match(prompt, /queued settler/);
+  assert.doesNotMatch(prompt, /filler turn 1\b/, "only the tail is carried, or a long match grows the prompt");
+  assert.doesNotMatch(prompt, /header text/, "the file's boilerplate header is not journal content");
+});
+
+// The per-seat lines never compare seats. Every few turns the caster steps back and calls the
+// race — that is the segment a viewer actually wants.
+test("a standings call happens on the cadence, and only with numbers to stand on", async () => {
+  const speak = stub("Ada leads on science.");
+  const seatsFor = (turn: number, stats: boolean): CompleteTurn => {
+    const runDir = makeRun([begin(turn, "Ada"), end(turn, "Ada"), begin(turn, "Bruno"), end(turn, "Bruno")]);
+    if (stats) {
+      writeHeader(runDir, "Ada", turn, 100, 5);
+      writeHeader(runDir, "Bruno", turn, 40);
+    }
+    return readTurns(runDir)[0]!;
+  };
+
+  const offCadence = await commentateTurn(seatsFor(4, true), speak);
+  assert.deepEqual(offCadence.map((l) => l.seat), ["Ada", "Bruno"], "turn 4 is not a standings turn");
+
+  const onCadence = await commentateTurn(seatsFor(5, true), speak);
+  assert.deepEqual(onCadence.map((l) => l.seat), ["Ada", "Bruno", "standings"]);
+  const standingsPrompt = speak.prompts.at(-1)!;
+  assert.match(standingsPrompt, /Ada:.*gold 100/, "the standings call must see every seat side by side");
+  assert.match(standingsPrompt, /Bruno:.*gold 40/);
+
+  const noNumbers = await commentateTurn(seatsFor(10, false), speak);
+  assert.deepEqual(noNumbers.map((l) => l.seat), ["Ada", "Bruno"], "no numbers, no standings call");
+});
+
+// The follow loop drops whole turns when it falls behind — right for pacing, but the dropped
+// turn might be the one where war broke out. The big beats survive the drop.
+test("milestones survive a dropped turn and are told once", async () => {
+  const { milestonesOf } = await import("../src/commentary/brief.ts");
+  const runDir = makeRun([
+    begin(7, "Ada"),
+    action(7, "Ada", { actionType: "DIPLOMACY_ACTION_DECLARE_WAR", targetId: "2" }),
+    action(7, "Ada", { actionType: "UNITOPERATION_MOVE_TO", targetId: "131072" }),
+    end(7, "Ada"),
+    begin(7, "Bruno"), end(7, "Bruno"),
+  ]);
+  const dropped = readTurns(runDir)[0]!;
+  const milestones = milestonesOf(dropped);
+  assert.equal(milestones.length, 1, "a routine move is not a milestone");
+  assert.match(milestones[0]!, /DECLARE_WAR/);
+
+  const speak = stub("War came while we were away.");
+  const next: CompleteTurn = {
+    turn: 8,
+    seats: [
+      { seat: "Ada", turn: 8, did: [], endedByLoop: false, reasoning: "" },
+      { seat: "Bruno", turn: 8, did: [], endedByLoop: false, reasoning: "" },
+    ],
+  };
+  await commentateTurn(next, speak, newMemory(), milestones);
+  assert.match(speak.prompts[0]!, /DECLARE_WAR/, "the first seat's prompt carries the missed beats");
+  assert.doesNotMatch(speak.prompts[1]!, /DECLARE_WAR/, "told once, not once per seat");
 });

@@ -30,5 +30,5 @@ const seats: Seat[] = [
 ];
 
 console.log(`run dir: ${runDir}\nplaying ${turns} turns...\n`);
-const outcomes = await runMatch(server, runDir, seats, { turnLimit: turns, stallStrikes: 3 });
+const outcomes = await runMatch(server, runDir, seats, { turnLimit: turns});
 console.log(renderReport(outcomes, runDir));

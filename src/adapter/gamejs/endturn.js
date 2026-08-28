@@ -1,82 +1,246 @@
 // Runs inside Civ 7. Ends PLAYER_ID's turn, and says why when it cannot.
 //
 // GameContext.sendTurnComplete() is SILENTLY IGNORED when the game would not let a human end
-// their turn. It returns nothing and throws nothing, so the old version called it, reported ok,
-// and left the seat active forever — the match then waited for a turn that never advanced.
+// their turn. It returns nothing and throws nothing, so a version that just calls it reports ok,
+// leaves the seat active forever, and the match waits for a turn that never advances.
 //
 // The game's own panel-action.ts gates the same call behind canEndTurn(), which is false when:
 //   1. a notification blocks the end of turn, or
-//   2. any unit still has moves left (showRemainingMovesState).
+//   2. showRemainingMovesState() says a unit still needs orders.
 //
-// Rule 2 is the one that caught us: a scout whose AUTOMATE_EXPLORE was refused kept 2 moves, and
-// nothing anywhere said that this was what held the turn open.
+// Rule 2 is ported from panel-action.ts rather than reinvented. The version that scanned every
+// unit for `canMove && !hasMoved` was STRICTER THAN THE GAME: it reported three units blocking a
+// turn the engine was perfectly willing to end, refused the agent's end-turn on that basis, and
+// then tried to skip units the engine would not let anyone skip. A seat sat on turn 10 for hours
+// with nothing actually wrong with it.
 const player = Players.get(PLAYER_ID);
 
-/** Units that still have moves. The game will not end a turn while any of these exist. */
-function idleUnits() {
-  const idle = [];
+/**
+ * Does a unit still need orders? panel-action.ts showRemainingMovesState(), ported.
+ *
+ * getFirstReadyUnit() is the engine's own answer, and it answers for the LOCAL player, so this is
+ * only meaningful for the seat currently holding the game. A unit having moves left is NOT the
+ * same as being ready: a unit told to sleep, fortify or wait has moves and blocks nothing.
+ */
+/**
+ * EVERY unit the engine still wants orders for, not just the first.
+ *
+ * getFirstReadyUnit answers one at a time, and we passed that straight through — so a turn with
+ * eight unordered units took eight end-turn attempts to discover them, one per round trip. Every
+ * transcript reader found this independently. The engine will not enumerate them, but SKIP_TURN's
+ * own legality mask will: it is legal exactly for a unit that is ready.
+ */
+function allReadyUnits() {
+  const out = [];
   for (const cid of player?.Units?.getUnitIds?.() ?? []) {
+    let can = null;
+    try { can = Game.UnitOperations.canStart(cid, UnitOperationTypes.SKIP_TURN, {}, false); }
+    catch { continue; }
+    // SKIP_TURN is legal exactly for a unit that is ready, which is what we want — a unit part
+    // way through a multi-turn operation is busy, not waiting, and naming it would send the agent
+    // after something it cannot give an order to.
+    if (!can?.Success) continue;
     const unit = Units.get(cid);
-    if (!unit) continue;
-    // The game's own rule, from panel-action.ts showRemainingMovesState():
-    //   return unit != null && unit.canMove && !unit.hasMoved;
-    // It blocks on a unit that has NOT MOVED AT ALL, not on any unit with moves left. We used the
-    // stricter test, so a scout that moved one tile of three blocked our end-turn while a human's
-    // would have ended — costing a wasted `civ skip` per partially-moved unit, every turn.
-    const canMove = unit.Movement?.canMove ?? (unit.Movement?.movementMovesRemaining ?? 0) > 0;
-    const hasMoved = unit.Movement?.hasMoved ?? unit.hasMoved ?? false;
-    if (canMove && !hasMoved) {
-      idle.push({ id: String(cid.id ?? cid), moves: unit.Movement?.movementMovesRemaining ?? 0 });
-    }
+    out.push({
+      id: String(cid.id ?? cid),
+      type: unit?.type !== undefined ? typeName("Units", unit.type) : null,
+    });
   }
-  return idle;
+  return out;
 }
 
-let blocking = endTurnBlocker(PLAYER_ID)?.name ?? null;
-let idle = idleUnits();
+function readyUnit() {
+  if (Game.UnitOperations.canStartAny(PLAYER_ID) === false) return null;
+  const first = typeof UI !== "undefined" ? UI?.Player?.getFirstReadyUnit?.() ?? null : null;
+  if (!first) return null;
+  // isUnitCycle_RemainingMoves is a user setting. With it off — the default — only a unit that has
+  // not moved AT ALL blocks the turn. With it on, any ready unit does.
+  if (Configuration.getUser().isUnitCycle_RemainingMoves) return first;
+  const unit = Units.get(first);
+  return unit && unit.canMove && !unit.hasMoved ? first : null;
+}
 
-// A forced end-turn means "end it anyway", so clear both things the game gates on.
+/** A ready unit as something an agent can act on: its id and what it is. */
+function describeReady(cid) {
+  if (!cid) return null;
+  const unit = Units.get(cid);
+  // Whether `civ skip` will actually work. getFirstReadyUnit can name a unit whose SKIP_TURN
+  // canStart fails — recommending the skip anyway is how one agent learned a 17-turn
+  // superstition, so the hint below only names skip when the engine will take it.
+  let skippable = false;
+  try {
+    skippable = Game.UnitOperations.canStart(cid, UnitOperationTypes.SKIP_TURN, {}, false)?.Success === true;
+  } catch { skippable = false; }
+  return {
+    id: String(cid.id ?? cid),
+    type: unit?.type !== undefined ? typeName("Units", unit.type) : null,
+    moves: unit?.Movement?.movementMovesRemaining ?? null,
+    skippable,
+    busy: unit?.hasPendingOperations === true,
+  };
+}
+
+/** The unit holding an unspent promotion, when a promotion blocker names no unit. */
+function promotableUnit() {
+  for (const cid of player?.Units?.getUnitIds?.() ?? []) {
+    const unit = Units.get(cid);
+    const xp = unit?.Experience;
+    if (!xp) continue;
+    let can = false;
+    try { can = xp.canPromote === true || (xp.getStoredPromotionPoints?.() ?? 0) > 0; }
+    catch { can = false; }
+    if (can) return { id: String(cid.id ?? cid), type: unit?.type !== undefined ? typeName("Units", unit.type) : null };
+  }
+  return null;
+}
+
+const blocking = endTurnBlocker(PLAYER_ID)?.name ?? null;
+const ready = describeReady(readyUnit());
+
+/**
+ * A settlement with nothing in its build queue.
+ *
+ * NOTIFICATION_CHOOSE_CITY_PRODUCTION blocked eighteen turns, and we answered with the
+ * notification's name. With more than one settlement an agent cannot tell which one is idle, and
+ * the same guessing that cost ninety-two turns on COMMAND_UNITS applies here.
+ */
+function idleSettlement() {
+  for (const cid of player?.Cities?.getCityIds?.() ?? []) {
+    const city = Cities.get(cid);
+    const queue = city?.BuildQueue;
+    if (!queue) continue;
+    let empty = false;
+    try { empty = queue.isEmpty === true || (queue.getQueue?.() ?? []).length === 0; }
+    catch { empty = false; }
+    if (empty) return { id: String(cid.id ?? cid), name: locText(city.name ?? null) };
+  }
+  return null;
+}
+
+// Clearing and sending are SEPARATE CALLS, and the gap between them is the point.
 //
-// Skipping idle units was not enough: a seat sat blocked on NOTIFICATION_DISCOVER_NATURAL_WONDER
-// with every unit already parked, and the round waited on a turn that nothing was going to end.
-if (FORCED === true) {
-  for (const unit of idle) {
-    const found = findOwnUnit(PLAYER_ID, unit.id);
-    if (!found) continue;
-    try { Game.UnitOperations.sendRequest(found.id, UnitOperationTypes.SKIP_TURN, {}); } catch { /* keep going */ }
+// The engine applies a request asynchronously. Skipping units and then calling sendTurnComplete in
+// the same pass sends it while they still hold their orders, so the game refuses without a word
+// and the seat stays active. match.ts clears, waits, then sends.
+if (CLEAR_ONLY === true) {
+  // canStart is the mask. SKIP_TURN is legal only for a unit the engine considers ready, so
+  // asking it is both the test and the filter — the version that sent SKIP_TURN to every unit and
+  // swallowed the result was refused every time and could not tell.
+  let skipped = 0;
+  for (const cid of player?.Units?.getUnitIds?.() ?? []) {
+    let can = null;
+    try { can = Game.UnitOperations.canStart(cid, UnitOperationTypes.SKIP_TURN, {}, false); }
+    catch { continue; }
+    if (!can?.Success) continue;
+    try { Game.UnitOperations.sendRequest(cid, UnitOperationTypes.SKIP_TURN, {}); skipped++; }
+    catch { /* the caller reads the blocker back */ }
   }
-  idle = idleUnits();
-
-  // Dismiss whatever is holding the turn. Bounded, and NOT gated on re-reading the blocker:
-  // dismissal is applied asynchronously, so the blocking name is unchanged immediately after and
-  // a loop that trusts it stops on its first pass. Dismiss what the game names, then move on and
-  // let sendTurnComplete be the judge.
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const blocker = endTurnBlocker(PLAYER_ID);
-    if (!blocker?.id) break;
-    try { Game.Notifications.dismiss(blocker.id); } catch { break; }
+  // Dismiss the blocker only if it is the sort you CAN dismiss. A decision notification
+  // (traditions, a tech to pick) ignores dismiss, so match.ts answers those through choose.js
+  // instead. Dismissing eight times and hoping is what stalled the marathon run at turn 4.
+  const blocker = endTurnBlocker(PLAYER_ID);
+  if (blocker?.id) {
+    try { Game.Notifications.dismiss(blocker.id); } catch { /* the caller reads the blocker back */ }
   }
+  return { ok: true, cleared: true, skipped, blocking, ready };
 }
 
 // A forced end-turn does not report "cannot": it clears what it can and tries anyway. Only an
 // agent's own end-turn gets told why it is blocked, because only an agent can act on the reason.
-if (FORCED !== true && (blocking || idle.length > 0)) {
+if (FORCED !== true && (blocking || ready)) {
+  // Name the UNIT, not the notification.
+  //
+  // NOTIFICATION_COMMAND_UNITS means "a unit needs orders", and we answered with the
+  // notification's name plus a hint reading `civ move <unit> <x,y>` — a literal placeholder. The
+  // agent could not tell WHICH unit, so it moved all of them, was refused, moved them again,
+  // tried WAIT_FOR, and was refused again: four rounds of correct commands against a requirement
+  // it was never told the subject of. The engine knows the unit; ask it.
+  const unitBlocker = blocking !== null && /COMMAND_UNITS|MOVE_A_UNIT/.test(blocking);
+  const waiting = unitBlocker || !blocking ? allReadyUnits() : [];
+  const productionBlocker = blocking !== null && /CITY_PRODUCTION|CHOOSE_PRODUCTION/.test(blocking);
+  const idle = productionBlocker ? idleSettlement() : null;
 
-  const why = blocking
-    ? `the game is waiting on ${blocking}`
-    : `${idle.length} unit${idle.length === 1 ? "" : "s"} still ${idle.length === 1 ? "has" : "have"} moves: ` +
-      idle.map((u) => `${u.id} (${u.moves})`).join(", ");
+  // A citizen waiting to be placed. Name the settlement AND the plots, because the agent's next
+  // move is to guess a coordinate: three of the ten failures in a clean run were a guessed expand
+  // target, and the legal list was one call away the whole time.
+  const growthBlocker = blocking !== null && /NEW_POPULATION|POPULATION_GROWTH/.test(blocking);
+  let growing = null;
+  if (growthBlocker) {
+    for (const cid of player?.Cities?.getCityIds?.() ?? []) {
+      const city = Cities.get(cid);
+      const at = city?.location;
+      if (!at) continue;
+      const plots = [];
+      for (let dx = -3; dx <= 3; dx++) {
+        for (let dy = -3; dy <= 3; dy++) {
+          const x = wrapX(at.x + dx);
+          const y = at.y + dy;
+          if (y < 0) continue;
+          try {
+            if (Game.CityCommands.canStart(cid, CityCommandTypes.EXPAND, { X: x, Y: y }, false)?.Success === true) {
+              plots.push(`${x},${y}`);
+            }
+          } catch { /* not this plot */ }
+        }
+      }
+      if (plots.length > 0) {
+        growing = { id: String(cid.id ?? cid), name: locText(city.name ?? null), plots };
+        break;
+      }
+    }
+  }
+  const promotionBlocker = blocking !== null && /UNIT_PROMOTION|PROMOTION_AVAILABLE/.test(blocking);
+  const promotable = promotionBlocker ? promotableUnit() : null;
+
+  const named = waiting.length > 1
+    ? `${waiting.length} units still need orders: ` +
+      waiting.map((u) => `${u.id}${u.type ? ` (${u.type})` : ""}`).join(", ")
+    : ready
+      ? `unit ${ready.id}${ready.type ? ` (${ready.type})` : ""} still needs orders`
+      : null;
+  const why =
+    (growing && `${growing.name || `settlement ${growing.id}`} has a citizen to place`) ||
+    (promotable && `unit ${promotable.id}${promotable.type ? ` (${promotable.type})` : ""} has an unspent promotion`) ||
+    (unitBlocker && named) ||
+    (idle && `${idle.name || `settlement ${idle.id}`} has nothing in its build queue`) ||
+    (!blocking && named) ||
+    `the game is waiting on ${blocking}`;
+  // What to actually do about one stuck unit. Only name `civ skip` when the engine will take it
+  // — recommending a skip the engine refuses with no reason is worse than saying nothing.
+  const orderHint = (unit) =>
+    unit.busy
+      ? `unit ${unit.id} is busy with an operation — it should not be blocking; ` +
+        `\`civ do unit-cmd ${unit.id} UNITCOMMAND_CANCEL\` cancels what it is doing`
+      : unit.skippable
+        ? `give unit ${unit.id} an order: \`civ skip ${unit.id}\` finishes it, or \`civ move ${unit.id} <x,y>\`. ` +
+          `Moving is not enough on its own — a unit that has not moved at all still waits for orders.`
+        : `give unit ${unit.id} an order — \`civ move ${unit.id} <x,y>\`, or fortify it. ` +
+          `The engine will not accept a plain skip for this unit right now; \`civ what-can ${unit.id}\` lists what it will take.`;
   return {
     ok: false,
     code: "CANNOT_END_TURN",
     message: `your turn cannot end yet: ${why}`,
-    // Name a command that exists. The previous wording said "deal with the notification" while
-    // the harness had no way to deal with one, and an agent burned a whole turn hunting for it.
-    hint: blocking
-      ? "run `civ dismiss` to clear it, or `civ open <id>` with an id from /current/pending.txt"
-      : "give every unit an order — `civ move`, `civ skip`, or fortify — then end your turn",
+    // Name a command that exists, against the thing it applies to. Wording that said "deal with
+    // the notification" while the harness had no way to deal with one cost an agent a whole turn.
+    hint: growing
+      ? `put it on one of these: ${growing.plots.slice(0, 10).map((p) => `\`civ expand ${growing.id} ${p}\``).join(", ")}`
+      : promotable
+      ? `take one: \`civ promote ${promotable.id}\` lists what it has earned`
+      : idle
+      ? `pick something for it: \`civ build ${idle.id}\` lists what it can make`
+      : waiting.length > 1
+        ? `finish them all at once: \`${waiting.map((u) => `civ skip ${u.id}`).join("; ")}\``
+        : unitBlocker && ready
+      ? orderHint(ready)
+      : blocking
+        ? `the harness has no specific answer for ${blocking} yet. Try \`civ dismiss\`; if that ` +
+          `does not clear it, \`civ open <id>\` with its id from /current/pending.txt`
+        : ready
+          ? orderHint(ready)
+          : "check /current/pending.txt for what the game is waiting on",
     blocking,
-    idle,
+    ready,
+    waiting,
   };
 }
 

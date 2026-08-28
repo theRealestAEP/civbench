@@ -12,7 +12,19 @@ import { tilesNear } from "./near.ts";
 export type CommandOutput = { stdout: string; stderr: string; exitCode: number };
 
 const ok = (stdout: string): CommandOutput => ({ stdout, stderr: "", exitCode: 0 });
-const fail = (stderr: string, code = 1): CommandOutput => ({ stdout: "", stderr, exitCode: code });
+
+/**
+ * A refusal, on STDOUT.
+ *
+ * Failures used to go to stderr. A shell prints one stream after the other, so an agent running
+ * `civ a; civ b; civ c` saw every success first and every failure afterwards — results no longer
+ * lined up with the commands that produced them. Six of the seven transcript readers found this
+ * independently: "output tells the agent the second command succeeded before the first failed",
+ * "the agent cannot map result to command". One stream keeps the order.
+ *
+ * The exit code is unchanged, so `&&` still short-circuits.
+ */
+const fail = (text: string, code = 1): CommandOutput => ({ stdout: text, stderr: "", exitCode: code });
 
 const USAGE = `civ — act on the game. Reading is done with the shell; this is the only way to act.
 
@@ -26,6 +38,8 @@ const USAGE = `civ — act on the game. Reading is done with the shell; this is 
   civ attack <unit> <x,y>                  macro for a move with the attack modifier
   civ combat-preview <unit> <x,y>          what would happen if you attacked that plot
   civ skip <unit>                          macro for UNITOPERATION_SKIP_TURN
+  civ promote <unit> [PROMOTION]           promotions this unit can take, or take one
+  civ note <text>                          append a line to your journal (cannot overwrite it)
   civ do unit-op <unit> <TYPE> [k=v ...]   any unit operation
   civ do unit-cmd <unit> <TYPE> [k=v ...]  any unit command
   civ do city-op <city> <TYPE> [k=v ...]   any settlement operation
@@ -39,12 +53,20 @@ const USAGE = `civ — act on the game. Reading is done with the shell; this is 
   civ civic [NODE]                         your civics: what you can adopt, or adopt one
   civ government [TYPE]                    your government: what you can adopt, or adopt one
   civ story [ANSWER]                       the narrative event waiting on you, or answer it
+  civ tradition [TYPE]                     the social policies you can adopt, or adopt one
+  civ age finish                           tell the game you are done with the Age transition
+  civ celebration [TYPE]                   pick what a Celebration gives you
+  civ pantheon [BELIEF]                    found a pantheon
+  civ attribute [NODE]                     spend an attribute point
   civ diplomacy [player] [ACTION]          who you have met, what you can do to them, or do it
   civ deal items <player>                  what each side could put on the table
   civ deal offer <player> <KIND> [AMOUNT]  put one thing on the table
   civ deal send <player>                   propose the deal you have built
   civ deal clear <player>                  start the deal over
   civ deal pending <player>                deals awaiting a response
+  civ deal incoming <player>               what a deal sent TO you contains
+  civ deal accept <player>                 accept the deal they sent you
+  civ deal reject <player>                 turn it down
   civ dismiss [id]                         clear a notification; with no id, the one blocking you
   civ open <id>                            open a notification that wants a decision
   civ end-turn                             end your turn
@@ -58,9 +80,16 @@ function parsePlot(text: string | undefined): { X: number; Y: number } | null {
   return m ? { X: Number(m[1]), Y: Number(m[2]) } : null;
 }
 
-/** `k=v k=v` -> {k: v}, numbers coerced. Unknown keys pass through to the engine untouched. */
-function parseArgs(parts: string[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+/**
+ * `k=v k=v` -> {k: v}, numbers coerced. Unknown keys pass through to the engine untouched.
+ *
+ * The values really are open: `civ do` lets an agent name any operation, and each operation wants
+ * a differently shaped argument. Naming the type says what that openness is for.
+ */
+export type EngineArgs = Record<string, string | number>;
+
+function parseArgs(parts: string[]): EngineArgs {
+  const out: EngineArgs = {};
   for (const part of parts) {
     const eq = part.indexOf("=");
     if (eq < 0) continue;
@@ -78,15 +107,47 @@ function parseId(text: string | undefined): string | null {
   return m ? m[1]! : null;
 }
 
+/**
+ * A unit argument: a handle like `scout-1`, or the raw ComponentID.
+ *
+ * Agents were inventing ids by adding 65536 to the last one they saw, and ordering whatever came
+ * back. Handles are what the dump leads with now, so they are what commands must accept.
+ */
+function parseUnit(server: MatchServer, playerId: number, text: string | undefined): string | null {
+  if (!text) return null;
+  const direct = parseId(text);
+  if (direct) return direct;
+  const resolved = server.resolveHandle(playerId, text);
+  return parseId(resolved);
+}
+
+/** Pull the "What changed" section out of the turn-start HUD, which is the one part that keeps. */
+function deltaOf(hud: string): string {
+  const start = hud.indexOf("## What changed");
+  if (start < 0) return "";
+  const rest = hud.slice(start + "## What changed".length);
+  const end = rest.indexOf("\n## ");
+  return (end < 0 ? rest : rest.slice(0, end)).trim();
+}
+
 function renderResult(result: ActionResult): CommandOutput {
-  if (result.ok) return ok(result.note ? `ok — ${result.note}\n` : "ok\n");
+  // A success can still carry something the agent must read — "your turn is already over" rode
+  // on `message`, which this printed only for failures, so the agent saw a bare "ok".
+  if (result.ok) {
+    const said = result.note ?? result.message;
+    return ok(said ? `ok — ${said}\n` : "ok\n");
+  }
   // Failure messages are part of the benchmark surface (§10): always a reason, and a remedy
   // when the engine gave us one.
   const lines = [`failed: ${result.code ?? "ERROR"}`, result.message ?? "no reason given"];
+  // The facts the engine gave us about the subject. These were being collected and then thrown
+  // away here, so a refusal that knew the unit had no moves left still printed "no reason".
+  if (result.state) lines.push(`state: ${JSON.stringify(result.state)}`);
   if (result.hint) lines.push(`hint: ${result.hint}`);
   return fail(lines.join("\n") + "\n");
 }
 
+// eslint-disable-next-line complexity -- a CLI dispatcher: one switch case per command, each flat. Splitting it per-case would satisfy the metric without helping the reader.
 export async function runCivCommand(
   server: MatchServer,
   playerId: number,
@@ -103,7 +164,8 @@ export async function runCivCommand(
       return ok(USAGE + "\n");
 
     case "hud":
-      return ok(lastHud() + "\n");
+      // Re-read, do not replay. The turn-start string is out of date the moment you act.
+      return ok((await server.currentHud(playerId, deltaOf(lastHud()))) + "\n");
 
     case "list-ops": {
       const kinds = await server.operationTypes();
@@ -125,19 +187,14 @@ export async function runCivCommand(
       // because only units were discoverable.
       const first = rest[0] ?? "";
       if (first === "player") {
-        const result = (await server.catalogue(playerId, "player")) as {
-          legal?: Array<{ short: string; type: string }>;
-        };
+        const result = await server.catalogue(playerId, "player");
         const legal = (result.legal ?? []).map((a) => `  ${a.short}  (${a.type})`).join("\n");
         return ok(`legal player actions:\n${legal || "  (none)"}\n`);
       }
       if (/^(city|settlement):/i.test(first)) {
         const id = parseId(first);
         if (!id) return fail("usage: civ what-can city:<id>\n");
-        const result = (await server.catalogue(playerId, "city", id)) as {
-          error?: string;
-          legal?: Array<{ short: string; type: string }>;
-        };
+        const result = await server.catalogue(playerId, "city", id);
         if (result.error) return fail(result.error + "\n");
         // BUILD is listed here, and reaching it through `civ do city-op` means guessing an
         // argument key. Send the agent to the command that already knows it.
@@ -151,24 +208,26 @@ export async function runCivCommand(
         return ok(`legal actions for settlement ${id}:\n${legal || "  (none)"}\n`);
       }
 
-      const unit = parseId(rest[0]);
+      const unit = parseUnit(server, playerId, rest[0]);
       if (!unit) return fail("usage: civ what-can <unit|city:id|player> [x,y]\n");
       const plot = parsePlot(rest[1]);
-      const result = (await server.whatCan(
-        playerId,
-        unit,
-        plot ? { x: plot.X, y: plot.Y } : undefined,
-      )) as { legal?: Array<{ short: string; type: string }>; illegal?: Array<{ short: string; reasons: string[] }> };
+      const result = await server.whatCan(playerId, unit, plot ? { x: plot.X, y: plot.Y } : undefined);
       const legal = (result.legal ?? []).map((a) => `  ${a.short}  (${a.type})`).join("\n");
       const illegal = (result.illegal ?? [])
-        .filter((a) => a.reasons.length > 0)
-        .map((a) => `  ${a.short}: ${a.reasons.join("; ")}`)
+        .filter((a) => a.why)
+        .map((a) => `  ${a.short}: ${a.why}`)
         .join("\n");
-      return ok(`legal:\n${legal || "  (none)"}\n\nunavailable:\n${illegal || "  (none)"}\n`);
+      // A busy unit refuses everything with no reasons; the fact explains the whole listing.
+      const busy = result.busy
+        ? "NOTE: this unit is busy with an operation it has not finished. It will refuse new\n" +
+          `orders and it does not block your turn. \`civ do unit-cmd ${unit} UNITCOMMAND_CANCEL\` cancels it.\n\n`
+        : "";
+      return ok(`${busy}legal:\n${legal || "  (none)"}\n\nunavailable:\n${illegal || "  (none)"}\n`);
     }
 
     case "near": {
-      const radius = Math.min(6, Math.max(1, Number(rest[1] ?? 3) || 3));
+      const asked = Number(rest[1] ?? 3) || 3;
+      const radius = Math.min(6, Math.max(1, asked));
       const plot = parsePlot(rest[0]);
       let cx: number;
       let cy: number;
@@ -177,7 +236,7 @@ export async function runCivCommand(
         cy = plot.Y;
       } else {
         // Centring on a unit is the common case — that is where the agent is standing.
-        const unit = parseId(rest[0]);
+        const unit = parseUnit(server, playerId, rest[0]);
         if (!unit) return fail("usage: civ near <unit|x,y> [radius]\n");
         const at = server.unitLocation(playerId, unit);
         if (!at) return fail(`you have no unit ${unit}\n`);
@@ -187,19 +246,15 @@ export async function runCivCommand(
       const tiles = server.currentTilesText(playerId);
       if (tiles === null) return fail("no tile data for this turn yet\n");
       const lines = tilesNear(tiles, cx, cy, radius);
-      if (lines.length === 0) return ok(`nothing revealed within ${radius} of ${cx},${cy}\n`);
-      return ok(`${lines.length} tiles within ${radius} of ${cx},${cy}:\n${lines.join("\n")}\n`);
+      const capped = asked > 6 ? ` (radius capped at 6)` : "";
+      if (lines.length === 0) return ok(`nothing revealed within ${radius} of ${cx},${cy}${capped}\n`);
+      return ok(`${lines.length} tiles within ${radius} of ${cx},${cy}${capped}:\n${lines.join("\n")}\n`);
     }
 
     case "diplomacy": {
       const other = rest[0] === undefined ? undefined : Number(String(rest[0]).replace(/^p/i, ""));
       if (rest[0] !== undefined && Number.isNaN(other)) return fail("usage: civ diplomacy [player] [ACTION]\n");
-      const r = (await server.diplomacy(playerId, other, rest[1])) as ActionResult & {
-        listing?: boolean;
-        players?: Array<{ player: string; civ: string | null; atWar: boolean }>;
-        target?: string;
-        offers?: Array<{ operation: string; action: string }>;
-      };
+      const r = await server.diplomacy(playerId, other, rest[1]);
       if (!r.listing) return renderResult(r);
       if (r.players) {
         if (r.players.length === 0) return ok("you have met nobody yet\n");
@@ -221,10 +276,10 @@ export async function runCivCommand(
     }
 
     case "combat-preview": {
-      const unit = parseId(rest[0]);
+      const unit = parseUnit(server, playerId, rest[0]);
       const plot = parsePlot(rest[1]);
       if (!unit || !plot) return fail("usage: civ combat-preview <unit> <x,y>\n");
-      const preview = (await server.combatPreview(playerId, unit, plot.X, plot.Y)) as Record<string, unknown>;
+      const preview = await server.combatPreview(playerId, unit, plot.X, plot.Y);
       if (preview.error) return fail(String(preview.error) + "\n");
       if (preview.possible === false) {
         return ok(`no attack possible: ${preview.reason ?? "not a valid target"}\n`);
@@ -234,44 +289,88 @@ export async function runCivCommand(
 
     case "move":
     case "attack": {
-      const unit = parseId(rest[0]);
+      const unit = parseUnit(server, playerId, rest[0]);
       const plot = parsePlot(rest[1]);
       if (!unit || !plot) return fail(`usage: civ ${command} <unit> <x,y>\n`);
-      const args: Record<string, unknown> = { ...plot };
+      const args: EngineArgs = { ...plot };
       // An attack in Civ 7 is a MOVE_TO carrying the attack modifier, not a separate operation.
       if (command === "attack") args.Modifiers = "ATTACK";
-      return renderResult(
-        await server.act(playerId, {
-          kind: "unit_operation",
-          targetId: unit,
-          actionType: "UNITOPERATION_MOVE_TO",
-          args,
-        }),
-      );
+      // Where it was, so we can tell whether it actually went anywhere.
+      //
+      // The engine ACCEPTS a move order it cannot carry out — an unreachable plot, a blocked
+      // path, a target outside this turn's range — and simply does nothing. We reported `ok`
+      // followed by the unit's ORIGIN, which reads exactly like a successful move to somewhere.
+      //
+      // The check WAITS for the engine to apply the order before judging (waitForMove). The
+      // first version read the position on the next line, which is the pre-move state about as
+      // often as not — so working moves were confidently reported as "unreachable", the inverse
+      // of the lie it was built to stop.
+      const before = await server.unitAt(playerId, unit);
+      const beforeMoves = await server.unitMoves(playerId, unit);
+      const moved = await server.act(playerId, {
+        kind: "unit_operation",
+        targetId: unit,
+        actionType: "UNITOPERATION_MOVE_TO",
+        args,
+      });
+      if (moved.ok) {
+        const asked = `${plot.X},${plot.Y}`;
+        const { changed, state } = await server.waitForMove(playerId, unit, {
+          at: before,
+          moves: beforeMoves,
+        });
+        if (!changed && state && state.at === before && state.at !== asked) {
+          server.logCorrection(playerId, "DID_NOT_MOVE", `unit ${unit} still at ${before ?? "?"}`);
+          return fail(
+            `failed: DID_NOT_MOVE\n` +
+              `unit ${unit} is still at ${before} with its movement unspent — the engine accepted ` +
+              `the order and moved nothing. ${asked} is probably unreachable this turn.\n` +
+              `hint: \`civ near ${unit} 2\` lists the plots around it, with their move cost\n`,
+          );
+        }
+        // A move order spends the movement the unit has and then stops, so a distant target ends
+        // the turn short of it and continues next turn. Say where it ended up.
+        const where = await server.unitReport(playerId, unit);
+        if (where) {
+          const at = state?.at ?? null;
+          moved.note = at !== null && at !== asked ? `${where} (short of ${asked})` : where;
+        }
+      }
+      return renderResult(moved);
+    }
+
+    case "note": {
+      const text = rest.join(" ");
+      if (!text) return fail("usage: civ note <text>\n");
+      return renderResult(await server.note(playerId, text));
     }
 
     case "skip": {
-      const unit = parseId(rest[0]);
+      const unit = parseUnit(server, playerId, rest[0]);
       if (!unit) return fail("usage: civ skip <unit>\n");
-      return renderResult(
-        await server.act(playerId, {
-          kind: "unit_operation",
-          targetId: unit,
-          actionType: "UNITOPERATION_SKIP_TURN",
-        }),
-      );
+      const skipped = await server.act(playerId, {
+        kind: "unit_operation",
+        targetId: unit,
+        actionType: "UNITOPERATION_SKIP_TURN",
+      });
+      // "Already finished" is turned into a success in act.js, so the event log records what the
+      // agent actually saw rather than a failure it never experienced.
+      return renderResult(skipped);
     }
 
     case "do": {
       const [form, ...tail] = rest;
-      const kinds: Record<string, ActionRequest["kind"]> = {
+      // `satisfies` keeps each value checked against ActionRequest["kind"] while the key
+      // literals survive, so the lookup below narrows instead of widening to string.
+      const kinds = {
         "unit-op": "unit_operation",
         "unit-cmd": "unit_command",
         "city-op": "city_operation",
         "city-cmd": "city_command",
         "player-op": "player_operation",
-      };
-      const kind = kinds[form ?? ""];
+      } satisfies Record<string, ActionRequest["kind"]>;
+      // SAFETY: guarded by hasOwn, so `form` is one of the table's own keys.
+      const kind = Object.hasOwn(kinds, form ?? "") ? kinds[form as keyof typeof kinds] : undefined;
       if (!kind) return fail(`unknown action form: ${form ?? "(none)"}\n\n${USAGE}\n`);
 
       if (kind === "player_operation") {
@@ -313,27 +412,75 @@ export async function runCivCommand(
     case "tech":
     case "civic":
     case "story":
+    case "promote":
+    case "tradition":
+    case "age":
+    case "celebration":
+    case "pantheon":
+    case "attribute":
     case "government": {
       const what = command;
-      const isCity = what === "build" || what === "expand";
-      const targetId = isCity ? parseId(rest[0]) ?? undefined : undefined;
-      if (isCity && !targetId) return fail(`usage: civ ${command} <city> [value]\n`);
+      const isCity = what === "build" || what === "expand" || what === "promote";
+      const targetId = isCity ? parseUnit(server, playerId, rest[0]) ?? undefined : undefined;
+      if (isCity && !targetId) {
+        return fail(`usage: civ ${command} <${command === "promote" ? "unit" : "city"}> [value]\n`);
+      }
       const value = rest[isCity ? 1 : 0];
-      const r = (await server.choose(playerId, what, value, targetId)) as ActionResult & {
-        listing?: boolean;
-        current?: string | null;
-        options?: Array<{ name: string; turns?: number | null; available?: boolean; why?: string | null }>;
-      };
-      if (!r.listing) return renderResult(r);
+      const r = await server.choose(playerId, what, value, targetId);
+      if (!r.listing) {
+        // A build joins a queue rather than replacing what is in progress, so say what the queue
+        // holds now. Without this an agent sees "ok", looks, still sees the previous item at the
+        // front, and reasonably concludes the order was ignored.
+        // Verify it is actually there. An `ok` is not evidence.
+        //
+        // The engine accepts CITYOPERATION_BUILD with the wrong argument encoding and queues
+        // nothing. A live turn printed "BUILDING_GRANARY added to the build queue" and then
+        // "Pārsa has nothing in its build queue" — both true statements from this harness, in the
+        // same turn. Read the queue back and refuse to claim anything that is not in it.
+        if (r.ok && what === "build" && targetId && value) {
+          // waitForQueued polls until the engine has applied the order: judging from an immediate
+          // read produced false NOT_QUEUED verdicts for orders that had worked, and comparing
+          // against only the queue HEAD failed every order that queued behind one.
+          const queue = await server.waitForQueued(playerId, targetId, value);
+          if (queue && !queue.includes(value)) {
+            server.logCorrection(playerId, "NOT_QUEUED", `${value} missing from queue: ${queue}`);
+            return fail(
+              `failed: NOT_QUEUED\n` +
+                `the engine accepted the order and queued nothing. ${queue}\n` +
+                `hint: run \`civ build ${targetId}\` to see what this settlement can actually make\n`,
+            );
+          }
+          if (!queue) {
+            server.logCorrection(playerId, "NOT_QUEUED", `${value} — queue still empty`);
+            return fail(
+              `failed: NOT_QUEUED\n` +
+                `the engine accepted the order but the build queue is still empty.\n` +
+                `hint: run \`civ build ${targetId}\` to see what this settlement can actually make\n`,
+            );
+          }
+          r.note = r.note ? `${r.note}; ${queue}` : queue;
+        }
+        return renderResult(r);
+      }
       // Every line is the command that picks it. A list an agent must still translate into
       // arguments is what cost 25 failed guesses in one turn.
       const prefix = `civ ${command}${isCity ? ` ${targetId}` : ""}`;
       const lines = [`${what} now: ${r.current ?? "nothing"}`];
       const open = (r.options ?? []).filter((o) => o.available !== false);
       const shut = (r.options ?? []).filter((o) => o.available === false);
+      // What the option IS, beside the command that picks it. A bare id list forced agents to
+      // cross-reference by hand — one expanded onto the wrong tile that way.
+      const describe = (o: { turns?: number | null; title?: string | null; does?: string | null }): string => {
+        const parts = [
+          o.turns ? `${o.turns} turns` : null,
+          o.title ?? null,
+          o.does ? String(o.does).slice(0, 100) : null,
+        ].filter(Boolean);
+        return parts.length > 0 ? `    # ${parts.join(" — ")}` : "";
+      };
       if (open.length > 0) {
         lines.push("", "you can pick:");
-        for (const o of open) lines.push(`  ${prefix} ${o.name}${o.turns ? `    # ${o.turns} turns` : ""}`);
+        for (const o of open) lines.push(`  ${prefix} ${o.name}${describe(o)}`);
       } else {
         lines.push("", "nothing is available right now");
       }
@@ -347,23 +494,32 @@ export async function runCivCommand(
     case "deal": {
       const mode = rest[0];
       const other = Number(String(rest[1] ?? "").replace(/^p/, ""));
-      const modes = ["items", "pending", "offer", "send", "clear"];
+      const modes = ["items", "pending", "incoming", "offer", "send", "accept", "reject", "clear"];
       if (!mode || !modes.includes(mode) || Number.isNaN(other)) {
-        return fail(`usage: civ deal <${modes.join("|")}> <player> [KIND] [AMOUNT]\n`);
+        return fail(`usage: civ deal <${modes.join("|")}> <player> [KIND] [AMOUNT|SUBJECT]\n`);
       }
       // `offer` puts one item on the table; the rest read or act on the working deal.
       const extra = mode === "offer" ? { kind: rest[2], amount: Number(rest[3]) || undefined, subject: rest[3] } : undefined;
-      const result = (await server.deal(playerId, mode, other, extra)) as {
-        error?: string;
-        hint?: string;
-        offerable?: Array<{ from: string; kind: string; amount: number | null; city: string | null; resource: string | null }>;
-      };
+      const result = await server.deal(playerId, mode, other, extra);
       if (result?.error) return fail(`failed: ${result.error}\n${result.hint ? `hint: ${result.hint}\n` : ""}`);
+      if (result.incoming) {
+        if (result.incoming.length === 0) return ok(`no deal from p${other} is waiting on you\n`);
+        const lines = result.incoming.map(
+          (i) => `  ${i.from} offers ${i.kind}${i.of ? ` ${i.of}` : ""}${i.amount ? ` x${i.amount}` : ""}${i.turns ? ` for ${i.turns} turns` : ""}`,
+        );
+        return ok(
+          `deal from p${other}:\n${lines.join("\n")}\n` +
+            `answer it: \`civ deal accept ${other}\` or \`civ deal reject ${other}\`\n`,
+        );
+      }
       if (result.offerable) {
         if (result.offerable.length === 0) return ok(`nothing either side can offer p${other} right now\n`);
         // Every line is the command that puts it on the table.
+        // `of` names what the item IS — the resource, the agreement. The old renderer read
+        // `city` and `resource`, neither of which a deal item has ever carried.
         const lines = result.offerable.map(
-          (i) => `  ${i.from} ${i.kind}${i.amount ? ` up to ${i.amount}` : ""}${i.city ? ` city ${i.city}` : ""}${i.resource ? ` ${i.resource}` : ""}` +
+          (i) => `  ${i.from} ${i.kind}${i.of ? ` ${i.of}` : ""}${i.amount ? ` up to ${i.amount}` : ""}` +
+            (i.valid === false ? "  (not valid right now)" : "") +
             (i.from === `p${playerId}` ? `   -> civ deal offer ${other} ${i.kind}${i.amount ? " <amount>" : ""}` : ""),
         );
         return ok(`what can go on the table with p${other}:\n${lines.join("\n")}\n`);
@@ -375,10 +531,7 @@ export async function runCivCommand(
     case "open": {
       const id = rest[0] ? (parseId(rest[0]) ?? rest[0]) : undefined;
       if (command === "open" && !id) return fail("usage: civ open <id>\n");
-      const r = (await server.notify(playerId, command === "open" ? "activate" : "dismiss", id)) as
-        ActionResult & { note?: string };
-      if (!r.ok) return renderResult(r);
-      return ok(`ok — ${r.note}\n`);
+      return renderResult(await server.notify(playerId, command === "open" ? "activate" : "dismiss", id));
     }
 
     case "end-turn":

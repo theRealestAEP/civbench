@@ -24,6 +24,7 @@ export class ScriptedBrain implements Brain {
     };
 
     const units = await run("cat /current/units.jsonl");
+    // SAFETY: units.jsonl is written by this harness's own dump writer, one unit per line.
     const own = units.stdout
       .split("\n")
       .filter((line) => line.trim().length > 0)

@@ -29,22 +29,37 @@ const ageProgress = (() => {
  * every milestone on that path.
  */
 const legacy = (() => {
+  // Iterate GameInfo.LegacyPaths, the way the game's own victory manager does.
+  //
+  // This used to rely on getEnabledLegacyPaths(), which returns an empty list here — so the HUD
+  // printed "legacy: none" on every turn of every run, in a benchmark whose stated goal is
+  // winning the Age. Two further faults were hidden behind that: the target was matched by
+  // comparing a milestone's LegacyPathType (a STRING) against a hash, so it could never resolve;
+  // and it summed age-progression points rather than the milestone's own RequiredPathPoints.
+  //
+  // victory-manager.ts: score with `player.LegacyPaths.getScore(d.LegacyPathType)` — the STRING —
+  // and take the target from the FinalMilestone's RequiredPathPoints.
+  const out = [];
   try {
-    const paths = p.LegacyPaths?.getEnabledLegacyPaths?.() ?? [];
-    return paths.map((path) => {
-      const type = path.legacyPath ?? path.LegacyPathType ?? String(path);
+    for (const path of GameInfo.LegacyPaths ?? []) {
+      const type = path.LegacyPathType;
+      if (!type) continue;
+      if (path.EnabledByDefault === false) continue;
+      let score = null;
+      try { score = p.LegacyPaths?.getScore?.(type) ?? null; } catch { score = null; }
       let target = null;
       try {
-        let total = 0;
         for (const milestone of GameInfo.AgeProgressionMilestones ?? []) {
           if (milestone.LegacyPathType !== type) continue;
-          total += Game.AgeProgressManager?.getMilestoneProgressionPoints?.(milestone.AgeProgressionMilestoneType) ?? 0;
+          if (!milestone.FinalMilestone) continue;
+          target = milestone.RequiredPathPoints ?? null;
+          break;
         }
-        target = total > 0 ? total : null;
       } catch { target = null; }
-      return { type, score: p.LegacyPaths?.getScore?.(path.legacyPath ?? path) ?? null, target };
-    });
+      out.push({ type: shortName(type), score, target });
+    }
   } catch { return []; }
+  return out;
 })();
 
 /** What this player is researching and adopting, by name. A human has both permanently on screen. */
@@ -78,10 +93,13 @@ return {
     happiness: yieldOf("YIELD_HAPPINESS"),
     diplomacy: yieldOf("YIELD_DIPLOMACY"),
   },
+  // A PLAYER has no Happiness component — that is a city thing. The player's figure is a yield,
+  // and it was sitting in the same object the whole time: the HUD printed "happiness ?" on every
+  // turn of every run while `yields.happiness` held the number.
   happiness: {
-    net: p.Happiness?.netHappinessPerTurn ?? null,
-    hasUnrest: p.Happiness?.hasUnrest ?? null,
-    turnsOfUnrest: p.Happiness?.turnsOfUnrest ?? null,
+    net: yieldOf("YIELD_HAPPINESS"),
+    hasUnrest: p.Stats?.hasUnrest ?? null,
+    turnsOfUnrest: p.Stats?.turnsOfUnrest ?? null,
   },
   settlements: {
     cities: p.Stats?.numCities ?? null,
@@ -92,5 +110,6 @@ return {
   },
   unitCount: (p.Units?.getUnitIds?.() ?? []).length,
   legacy,
-  government: p.Culture?.getGovernmentType?.() ?? null,
+  // The name. getGovernmentType returns a hash, and it was reaching header.json unresolved.
+  government: typeName("Governments", p.Culture?.getGovernmentType?.()) ?? null,
 };

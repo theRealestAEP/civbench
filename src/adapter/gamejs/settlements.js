@@ -2,6 +2,14 @@
 // Own settlements get full detail. Foreign ones are limited to what the map reveals.
 const VISIBLE = RevealedStates.VISIBLE;
 
+/** One of a city's net per-turn yields, the same call the city panel makes. */
+function cityYield(city, name) {
+  try {
+    const type = YieldTypes?.[name];
+    return type === undefined ? null : city.Yields?.getNetYield?.(type) ?? null;
+  } catch { return null; }
+}
+
 const own = [];
 const player = Players.get(PLAYER_ID);
 for (const id of player?.Cities?.getCityIds?.() ?? []) {
@@ -16,10 +24,12 @@ for (const id of player?.Cities?.getCityIds?.() ?? []) {
     x: loc.x ?? null,
     y: loc.y ?? null,
     population: city.population ?? null,
-    growthType: city.Growth?.growthType ?? null,
+    // The NAME, not the hash. A raw type hash in an agent-readable file is the one thing this
+    // codebase forbids, and this one was surviving into settlements.jsonl on every line.
+    growthType: typeName("Types", city.Growth?.growthType) ?? null,
     currentFood: city.Growth?.currentFood ?? null,
-    projectType: city.Growth?.projectType ?? null,
-    productionTurnsLeft: city.BuildQueue?.getTurnsLeft?.() ?? null,
+    projectType: typeName("Projects", city.Growth?.projectType) ?? null,
+
     // The NAME, resolved here. The raw hash used to be all the dump carried, and it survived only
     // into the JSONL — the one thing this codebase forbids showing an agent. So `prod_turns_left=3`
     // told a player its city would finish something in three turns without saying what.
@@ -29,11 +39,25 @@ for (const id of player?.Cities?.getCityIds?.() ?? []) {
       return typeName("Units", h) ?? typeName("Constructibles", h) ?? typeName("Projects", h) ?? null;
     })(),
     // Growth, as the city panel shows it: how much food, how much is needed, how long.
+    //
+    // foodPerTurn and the population split were read off components that do not exist, so they
+    // were null on every settlement line of every run — leaving a line that says how much food is
+    // needed to grow and never how much arrives. The game reads food from Yields
+    // (model-city-details.ts) and the population split off the CITY, not a Population component.
     foodToGrow: city.Growth?.getNextGrowthFoodThreshold?.()?.value ?? null,
-    foodPerTurn: city.Growth?.foodPerTurn ?? null,
+    foodPerTurn: cityYield(city, "YIELD_FOOD"),
     turnsToGrow: city.Growth?.turnsUntilGrowth ?? null,
-    urbanPopulation: city.Population?.urbanPopulation ?? null,
-    ruralPopulation: city.Population?.ruralPopulation ?? null,
+    urbanPopulation: city.urbanPopulation ?? null,
+    ruralPopulation: city.ruralPopulation ?? null,
+    // What this settlement actually produces per turn. Nothing in the dump carried it, so an
+    // agent could not compare two of its own cities, or tell whether a build was affordable.
+    production: cityYield(city, "YIELD_PRODUCTION"),
+    gold: cityYield(city, "YIELD_GOLD"),
+    science: cityYield(city, "YIELD_SCIENCE"),
+    culture: cityYield(city, "YIELD_CULTURE"),
+    // How long what it is building will take. getTurnsLeft() with NO argument returns -1, which
+    // the writer then dropped as a sentinel — so the field simply vanished from every line.
+    productionTurns: city.BuildQueue?.currentTurnsLeft ?? null,
     queueEmpty: city.BuildQueue?.isEmpty ?? null,
     happiness: city.Happiness?.netHappinessPerTurn ?? null,
     hasUnrest: city.Happiness?.hasUnrest ?? null,

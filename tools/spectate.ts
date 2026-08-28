@@ -42,15 +42,21 @@ let adapter: GameAdapter | null = null;
 let lastSeat = -1;
 let lastTurn = -1;
 
-async function connect(): Promise<boolean> {
+/**
+ * Open a bridge to the game, or null if it is not answering.
+ *
+ * Returns the connection rather than assigning the module-level ones from in here. Assigning from
+ * inside a function hides it from the caller's control flow: at the catch below, `bridge` was
+ * still narrowed to its `null` initializer, and `bridge?.close()` typed as unreachable.
+ */
+async function connect(): Promise<{ bridge: CdpBridge; adapter: GameAdapter } | null> {
   try {
     const target = (await listTargets(9444, 4000)).find((t) => t.url.includes("root-game"));
-    if (!target) return false;
-    bridge = await CdpBridge.connect(target.webSocketDebuggerUrl);
-    adapter = new GameAdapter(bridge);
-    return true;
+    if (!target) return null;
+    const opened = await CdpBridge.connect(target.webSocketDebuggerUrl);
+    return { bridge: opened, adapter: new GameAdapter(opened) };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -59,9 +65,14 @@ for (;;) {
     console.log("the match that started me has exited — stopping");
     process.exit(0);
   }
-  if (!adapter && !(await connect())) {
-    await sleep(3000);
-    continue;
+  if (!adapter) {
+    const opened = await connect();
+    if (!opened) {
+      await sleep(3000);
+      continue;
+    }
+    bridge = opened.bridge;
+    adapter = opened.adapter;
   }
   try {
     const state = await adapter!.run<{ clicked: number; removed: number; turn: number; localPlayer: number }>(

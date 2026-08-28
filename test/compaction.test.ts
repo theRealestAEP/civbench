@@ -14,6 +14,8 @@ import {
 } from "../src/agent/compaction.ts";
 
 const say = (role: string, text: string): AgentMessage =>
+  // SAFETY: a minimal message fixture. pi's AgentMessage is a union whose arms carry more than
+  // this, but compaction only reads `role` and `content`.
   ({ role, content: [{ type: "text", text }] }) as unknown as AgentMessage;
 
 /** A transcript big enough to trigger compaction, with turn markers where each turn began. */
@@ -67,7 +69,7 @@ test("a dropped result says where the content went", () => {
   const { messages, markers } = longTranscript(40, 20_000);
   const result = compactTranscript(messages, markers);
   const stub = JSON.stringify(result.messages[1]);
-  assert.match(stub, /still on disk/, "the stub must tell the agent it can re-read the file");
+  assert.match(stub, /re-read the file/, "the stub must tell the agent it can re-read the file");
 });
 
 test("compaction never loses a message", () => {

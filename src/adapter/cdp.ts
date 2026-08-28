@@ -4,6 +4,7 @@
 // DevTools frontend. Each Gameface "view" is a separate CDP target, so the game's UI context
 // and any other views appear as distinct targets in /json/list.
 import { type Bridge, BridgeError, unwrap, wrapExpression } from "./bridge.ts";
+import type { Json } from "../dump/types.ts";
 
 export type CdpTarget = { id: string; title: string; url: string; webSocketDebuggerUrl: string };
 
@@ -24,6 +25,9 @@ export async function listTargets(port: number, timeoutMs = 3000): Promise<CdpTa
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new BridgeError(`/json/list returned ${res.status}`);
+  // SAFETY: /json/list is Chrome DevTools Protocol's own endpoint and its response shape is part
+  // of that protocol. A malformed entry surfaces as a missing webSocketDebuggerUrl, which the
+  // callers already filter on.
   const targets = (await res.json()) as CdpTarget[];
   return targets.map((t) => ({
     ...t,
@@ -58,7 +62,8 @@ export async function discover(
   return [];
 }
 
-type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
+/** A CDP request awaiting its reply. The result is whatever that method returns, as JSON. */
+type Pending = { resolve: (v: Json) => void; reject: (e: Error) => void };
 
 export class CdpBridge implements Bridge {
   #ws: WebSocket;
@@ -109,7 +114,7 @@ export class CdpBridge implements Bridge {
   }
 
   #onMessage(data: string): void {
-    let msg: { id?: number; result?: unknown; error?: { message: string } };
+    let msg: { id?: number; result?: Json; error?: { message: string } };
     try {
       msg = JSON.parse(data);
     } catch {
@@ -120,10 +125,10 @@ export class CdpBridge implements Bridge {
     if (!pending) return;
     this.#pending.delete(msg.id);
     if (msg.error) pending.reject(new BridgeError(`CDP error: ${msg.error.message}`));
-    else pending.resolve(msg.result);
+    else pending.resolve(msg.result ?? null);
   }
 
-  #send<T>(method: string, params: Record<string, unknown>, timeoutMs = 30_000): Promise<T> {
+  #send<T>(method: string, params: Record<string, Json>, timeoutMs = 30_000): Promise<T> {
     // Fail now rather than in 30 seconds. A caller that reconnects can only do so if it is told.
     if (this.#dead) return Promise.reject(new BridgeError(this.#dead));
     const id = this.#nextId++;
@@ -135,6 +140,8 @@ export class CdpBridge implements Bridge {
       this.#pending.set(id, {
         resolve: (v) => {
           clearTimeout(timer);
+          // SAFETY: the pending map is keyed by request id, and T is the result type the caller
+          // named for that exact CDP method. Nothing else can resolve this entry.
           resolve(v as T);
         },
         reject: (e) => {

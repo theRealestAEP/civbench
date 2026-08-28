@@ -8,15 +8,40 @@
 //
 // This is the answer to "what can I do", asked of the engine itself, once a turn, for free.
 // canStart() IS the validator the game uses, so this cannot drift from the truth.
+// Deduped by WORLD STATE, like whatcan.js and for the same reason: this sweep is canStart ×
+// every operation × every unit — ~1,400 probes for a modest empire — and it re-ran on every
+// post-action refresh, inside the window of all four identical engine SIGSEGVs. SEQ is the
+// server's count of this player's applied mutations: same turn + same SEQ, same world, same
+// answer. Never time-based — a wall-clock cache here served a stale actions.txt after a real
+// move, and the consistency test caught it. No SEQ (an older server) means no caching.
+const actionsKey = typeof SEQ === "undefined" ? null : `${PLAYER_ID}:${Game.turn}:${SEQ}`;
+if (!globalThis.__civbenchActions) globalThis.__civbenchActions = { key: null, result: null };
+const actionsStash = globalThis.__civbenchActions;
+if (actionsKey !== null && actionsStash.key === actionsKey && actionsStash.result) {
+  return actionsStash.result;
+}
+
 const player = Players.get(PLAYER_ID);
 const out = { units: [], settlements: [], player: [] };
+
+/**
+ * Operations the `civ` layer executes with EMPTY args. These must be probed with `{}` too:
+ * canStart answers differently for `{}` and for PROBE_ARGS, so probing them with PROBE_ARGS
+ * listed `civ skip <id>` as ready-to-run for units whose skip the engine then refused with no
+ * reason. Mirrors NO_ARGUMENT_OPS + SKIP_TURN in src/dump/actions.ts — keep the two in step.
+ */
+const EMPTY_ARG_OPS =
+  /^(UNITOPERATION_(SKIP_TURN|FOUND_CITY|SLEEP|FORTIFY|ALERT|WAIT_FOR|HEAL|REST_UNTIL_HEALED|AUTOMATE_EXPLORE)|UNITCOMMAND_(WAKE|CANCEL))$/;
 
 /** Ask the engine, and keep only what it accepts. */
 function legalFor(api, kind, names, id, args) {
   const legal = [];
   for (const name of names) {
+    // Engine internals with no UI button: a human is never offered them, so neither is an agent.
+    if (ENGINE_INTERNAL_OPS.test(name)) continue;
+    const probe = args ?? (EMPTY_ARG_OPS.test(name) ? {} : PROBE_ARGS);
     try {
-      if (api.canStart(id, operationValue(kind, name), args ?? PROBE_ARGS, false)?.Success === true) {
+      if (api.canStart(id, operationValue(kind, name), probe, false)?.Success === true) {
         legal.push(name);
       }
     } catch { /* an operation that throws is not available; the catalogue below still lists it */ }
@@ -24,8 +49,8 @@ function legalFor(api, kind, names, id, args) {
   return legal;
 }
 
-const unitOperationNames = (GameInfo.UnitOperations ?? []).map((o) => o.OperationType);
-const unitCommandNames = (GameInfo.UnitCommands ?? []).map((c) => c.CommandType);
+const unitOperationNames = tableRows(GameInfo.UnitOperations).map((o) => o.OperationType);
+const unitCommandNames = tableRows(GameInfo.UnitCommands).map((c) => c.CommandType);
 
 for (const cid of player?.Units?.getUnitIds?.() ?? []) {
   const unit = Units.get(cid);
@@ -56,4 +81,8 @@ for (const cid of player?.Cities?.getCityIds?.() ?? []) {
 
 out.player = legalFor(Game.PlayerOperations, "player_operation", operationNames("player_operation"), PLAYER_ID);
 
+if (actionsKey !== null) {
+  actionsStash.key = actionsKey;
+  actionsStash.result = out;
+}
 return out;

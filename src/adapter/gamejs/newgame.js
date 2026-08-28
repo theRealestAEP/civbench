@@ -6,6 +6,12 @@
 // human, then host. Doing it through the UI would be unrepeatable and unscriptable.
 //
 // Expects: SETUP = { mapScript, mapSize, seed, startAge, maxTurns, humanSlots, players }
+// Tutorials OFF, before anything else. TutorialLevel 4 (the install default) runs the FTUE
+// flow: an advisor-selection popup the agents cannot see — it is a UI screen, not an engine
+// notification — plus advisor-warning notifications that blocked a whole live turn. A benchmark
+// player plays with the assists off; 0 is the options screen's own "no tutorials" value.
+try { Configuration.getUser()?.setTutorialLevel?.(0); } catch { /* older build without the setter */ }
+
 const game = Configuration.editGame();
 const map = Configuration.editMap();
 if (!game || !map) return { ok: false, error: "configuration is not editable here" };

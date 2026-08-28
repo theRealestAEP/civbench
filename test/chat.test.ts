@@ -90,3 +90,42 @@ test("what another civ said reaches the HUD, not just the counter", async () => 
   assert.match(hud, /messages: 1 new/, "the counter must see it");
   assert.match(hud, /the river valley is mine/, "and so must the pushed section");
 });
+
+// `civ say @p2` used to return ok and deliver to NOBODY: delivery matched config seat names,
+// the dump names rivals p0/p1/p2, and nothing validated the recipient.
+test("a seat can be addressed by number, and an unknown recipient is refused", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-address-"));
+  const world = makeWorld({ seats: 2 });
+  world.met[0] = [1];
+  world.met[1] = [0];
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+    { slot: 1, playerId: 1, name: "beta", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(1);
+  const sent = await server.say(1, "p0", "meet me at the river");
+  assert.equal(sent.ok, true, sent.message ?? "send failed");
+  const hud = await server.beginTurn(0);
+  assert.match(hud, /meet me at the river/, "@p0 must reach seat 0");
+
+  const unknown = await server.say(1, "p9", "hello?");
+  assert.equal(unknown.ok, false, "an unknown seat must be refused, not blackholed");
+});
+
+// The briefing says "tell every civ you have met" — and until the send actually checked, unmet
+// rivals heard everything, and a seat that had met nobody was told ok while speaking to no one.
+test("talk only reaches civilizations the sender has met", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-met-gate-"));
+  const world = makeWorld({ seats: 2 });
+  world.met[0] = [];
+  world.met[1] = [];
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+    { slot: 1, playerId: 1, name: "beta", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(1);
+  const shout = await server.say(1, null, "anyone there?");
+  assert.equal(shout.ok, false, "met nobody -> no one can hear; saying ok would be a lie");
+  const dm = await server.say(1, "p0", "psst");
+  assert.equal(dm.ok, false, "a private message to an unmet civ must be refused");
+});

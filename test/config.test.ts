@@ -96,3 +96,20 @@ test("the catalogue lists the names the engine accepts, not the enum keys", asyn
   );
   assert.ok(!kinds.unit_operation.includes("FOUND_CITY"), "the bare key must not be offered");
 });
+
+// The config was read through `Record<string, any>`, so a misspelled enum value was assigned
+// straight through and surfaced hours later inside the game setup as a nonsense age.
+test("a config with a bad enum value is refused at read time, by name", async () => {
+  const { loadMatchConfig, ConfigError } = await import("../src/config/load.ts");
+  const dir = mkdtempSync(join(tmpdir(), "civbench-config-"));
+  const path = join(dir, "bad.yaml");
+  writeFileSync(path, "seed: 1\ngame:\n  start_age: antiquty\nagents: []\n");
+  assert.throws(
+    () => loadMatchConfig(path),
+    (err: unknown) =>
+      err instanceof ConfigError &&
+      /start_age/.test(err.message) &&
+      /antiquity/.test(err.message),
+    "it must name the field and what was allowed",
+  );
+});

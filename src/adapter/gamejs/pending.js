@@ -42,4 +42,25 @@ for (const id of ids) {
     message: text((n) => Game.Notifications.getMessage(n), id),
   });
 }
+
+// Screens the game has pushed OVER the map. A human is looking at these; agents were not.
+//
+// ContextManager mounts every pushed screen and popup under `.fxs-popups` (its own fallback
+// root), so the DOM is the honest inventory of what is on screen — an advisor-selection popup
+// sat there invisible to every agent because it is UI, not an engine notification. Anything
+// found here reaches pending.txt as SCREEN_<name>, so an agent can at least see it and decide.
+try {
+  const root = typeof document !== "undefined" ? document.querySelector(".fxs-popups") : null;
+  for (const el of root?.children ?? []) {
+    const tag = String(el.tagName ?? "").toLowerCase();
+    if (!tag || tag === "mouse-guard") continue;
+    items.push({
+      id: `screen:${tag}`,
+      type: `SCREEN_${tag.toUpperCase().replace(/-/g, "_")}`,
+      summary: `the game has a screen open on top of the map: ${tag}`,
+      message: null,
+    });
+  }
+} catch { /* a context with no DOM (the fake game) has no screens */ }
+
 return { blockingType, items };

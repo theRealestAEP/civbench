@@ -7,6 +7,7 @@
 // own intermediate score, so partial results are graded without inventing a metric.
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import type { Event } from "../server/events.ts";
 import type { HeaderSnapshot } from "../dump/types.ts";
 
 export type TurnPoint = {
@@ -42,6 +43,8 @@ export type AgentMetrics = {
 function readHeaders(agentDir: string): HeaderSnapshot[] {
   const turnsDir = join(agentDir, "turns");
   if (!existsSync(turnsDir)) return [];
+  // SAFETY: header.json is written by this harness's own snapshot writer, one HeaderSnapshot per
+  // turn directory. Nothing else writes that path.
   return readdirSync(turnsDir)
     .sort()
     .map((t) => join(turnsDir, t, "header.json"))
@@ -60,7 +63,7 @@ const MIN_TURNS = 50;
 export function scoreAgent(
   runDir: string,
   name: string,
-  events: Array<Record<string, any>>,
+  events: Event[],
 ): AgentMetrics {
   const headers = readHeaders(join(runDir, "agents", name));
   const trajectory: TurnPoint[] = headers.map((h) => ({
@@ -91,7 +94,13 @@ export function scoreAgent(
   const actions = mine.filter((e) => e.kind === "action");
   const illegal = actions.filter((e) => e.result?.ok === false);
   const refused = mine.filter((e) => e.kind === "action_refused");
-  const forced = mine.filter((e) => e.kind === "turn_end_forced");
+  // Only forced ends that TOOK, and at most one per game turn: a refused forced attempt is
+  // logged with ok:false, and the stamp-recovery path can retry several times in one turn —
+  // counting every event disqualified seats for a single stuck turn three times over.
+  const forcedTurns = new Set(
+    mine.filter((e) => e.kind === "turn_end_forced" && e.ok !== false).map((e) => e.turn),
+  );
+  const forced = [...forcedTurns];
   // The game refused to advance the round.
   //
   // This is a MATCH fact, not a seat's fault: it is logged at the round barrier once every seat
@@ -132,11 +141,12 @@ export function scoreAgent(
 
 export function scoreRun(runDir: string): AgentMetrics[] {
   const eventsPath = join(runDir, "events.jsonl");
+  // SAFETY: events.jsonl is this harness's own append-only log, one Event per line.
   const events = existsSync(eventsPath)
     ? readFileSync(eventsPath, "utf8")
         .split("\n")
         .filter((l) => l.trim())
-        .map((l) => JSON.parse(l) as Record<string, any>)
+        .map((l) => JSON.parse(l) as Event)
     : [];
   const agentsDir = join(runDir, "agents");
   const names = existsSync(agentsDir) ? readdirSync(agentsDir) : [];

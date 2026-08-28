@@ -21,8 +21,20 @@ export const KEEP_TOOL_RESULTS_FOR_TURNS = 2;
 const estimateTokens = (messages: AgentMessage[]): number =>
   Math.round(JSON.stringify(messages).length / 3.7);
 
-/** Compact once the transcript passes this, so the cached prefix stays stable most turns. */
-export const COMPACT_ABOVE_TOKENS = 120_000;
+/**
+ * Compact once the transcript passes this.
+ *
+ * Was 120_000, which never fired. Measured on a real 50-turn run: input per model call was ~40k by
+ * turn 10 and climbing about 4k a turn, so compaction would not have engaged until turn 25 or so —
+ * by which point the run was tracking to $20 and eleven hours, against $0.85 and one hour at the
+ * turn-1 rate. Cost here is (tokens per call) x (calls per turn), and both grow, so the curve is
+ * quadratic if nothing trims it.
+ *
+ * 50k engages around turn 12 and holds the per-call context roughly flat after that. Nothing is
+ * lost that cannot be re-read: the policy drops old TOOL OUTPUT, which is the dump files, and
+ * keeps every word of the agent's own reasoning.
+ */
+export const COMPACT_ABOVE_TOKENS = 50_000;
 
 /** How many messages stay intact when turn markers are unavailable. */
 const FALLBACK_RECENT_MESSAGES = 20;
@@ -34,10 +46,13 @@ export type CompactionStats = { before: number; after: number; dropped: number }
  *
  * `turnMarkers` holds the index in `messages` at which each turn began, most recent last.
  */
+/** A compacted transcript, and what it cost to get there. */
+export type CompactionResult = { messages: AgentMessage[]; stats: CompactionStats };
+
 export function compactTranscript(
   messages: AgentMessage[],
   turnMarkers: number[],
-): { messages: AgentMessage[]; stats: CompactionStats } {
+): CompactionResult {
   const before = estimateTokens(messages);
   if (before < COMPACT_ABOVE_TOKENS) {
     return { messages, stats: { before, after: before, dropped: 0 } };
@@ -54,18 +69,23 @@ export function compactTranscript(
 
   const compacted = messages.map((message, index) => {
     if (index >= cutoff) return message;
+    // SAFETY: pi's AgentMessage is a union whose arms vary by message kind. Both fields read here
+    // are optional, so an arm without them simply fails the toolResult check below.
     const m = message as { role?: string; content?: unknown };
     if (m.role !== "toolResult") return message;
 
     const text = JSON.stringify(m.content ?? "");
     if (text.length < 200) return message; // not worth stubbing
     dropped++;
+    // SAFETY: the original message is spread through unchanged apart from `content`, which is
+    // replaced with a single text block — the shape every AgentMessage arm accepts. Narrowed
+    // above to role "toolResult", so this is a toolResult with its payload stubbed out.
     return {
       ...message,
       content: [
         {
           type: "text",
-          text: "[earlier tool output dropped to save context — the files are still on disk, re-read them if you need them]",
+          text: "[earlier tool output dropped to save context — re-read the file, or re-run the command that produced it, if you need it again]",
         },
       ],
     } as AgentMessage;

@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Bridge } from "./bridge.ts";
+import type { Json } from "../dump/types.ts";
 import type {
   HeaderSnapshot,
   PendingSnapshot,
@@ -15,6 +16,12 @@ import type {
 
 const GAMEJS_DIR = join(dirname(fileURLToPath(import.meta.url)), "gamejs");
 const scriptCache = new Map<string, string>();
+
+/** Scripts that change game state. Never auto-replayed across a reconnect (see run()). */
+const MUTATING_SCRIPTS = new Set([
+  "act", "choose", "diplomacy", "notify", "deal", "endturn", "save", "chat",
+  "newgame", "startlobby", "loadsave", "handoff",
+]);
 
 function readGameJs(name: string): string {
   return readFileSync(join(GAMEJS_DIR, `${name}.js`), "utf8");
@@ -32,9 +39,12 @@ function loadScript(name: string): string {
 
 export class GameAdapter {
   #bridge: Bridge;
+  /** How to get a fresh bridge when this one dies. Absent for the fake, which cannot die. */
+  #reconnect?: () => Promise<Bridge>;
 
-  constructor(bridge: Bridge) {
+  constructor(bridge: Bridge, reconnect?: () => Promise<Bridge>) {
     this.#bridge = bridge;
+    this.#reconnect = reconnect;
   }
 
   /** Major civilizations alive in this match, agents and built-in AI together. */
@@ -43,12 +53,36 @@ export class GameAdapter {
     return out.majors;
   }
 
-  /** Run one of the gamejs/ scripts for a given player. */
-  async run<T>(script: string, playerId: number, extra: Record<string, unknown> = {}): Promise<T> {
+  /**
+   * Run one of the gamejs/ scripts for a given player.
+   *
+   * A dropped socket is survivable and used not to be. The debug server is serviced on the game
+   * thread and goes quiet while the engine is busy, so the connection does die in a long match.
+   * Nothing reconnected it: every later read failed, the match loop read that as "no seat became
+   * active", and a 50-turn run sat printing that line for an hour with a perfectly healthy game
+   * on screen. Reconnect once and try again — a second failure is a real failure.
+   */
+  async run<T>(script: string, playerId: number, extra: Record<string, Json> = {}): Promise<T> {
     const consts = Object.entries({ PLAYER_ID: playerId, ...extra })
       .map(([k, v]) => `const ${k} = ${JSON.stringify(v)};`)
       .join("\n");
-    return this.#bridge.eval<T>(`${consts}\n${loadScript(script)}`);
+    const js = `${consts}\n${loadScript(script)}`;
+    try {
+      return await this.#bridge.eval<T>(js);
+    } catch (err) {
+      if (!this.#reconnect || this.#bridge.alive !== false) throw err;
+      this.#bridge = await this.#reconnect();
+      // Replaying a MUTATION after a dead socket can execute it twice: sendRequest is
+      // fire-and-forget, so the first eval may have sent the order and only the reply was lost.
+      // Reads are safe to replay; a lost mutation must be re-checked, not re-sent.
+      if (MUTATING_SCRIPTS.has(script)) {
+        throw new Error(
+          `the connection to the game dropped while sending "${script}" — ` +
+            `the outcome is unknown. Re-read the state before retrying.`,
+        );
+      }
+      return this.#bridge.eval<T>(js);
+    }
   }
 
   /** Every GameInfo table in this build. Adapts to DLC instead of hard-coding a list. */
@@ -58,7 +92,7 @@ export class GameAdapter {
 
   /** One static gameplay table, with display names resolved. */
   ruleTable(table: string) {
-    return this.run<{ table: string; count: number; rows: Record<string, unknown>[] } | null>(
+    return this.run<{ table: string; count: number; rows: Record<string, Json>[] } | null>(
       "rules",
       0,
       { TABLE_NAME: table },

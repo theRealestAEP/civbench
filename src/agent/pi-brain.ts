@@ -7,6 +7,7 @@
 // The harness is FIXED across models. Same briefing, same single tool, same sandbox; only the
 // model id changes. Otherwise a comparison measures scaffolding and credits it to the model.
 import { Agent } from "@mariozechner/pi-agent-core";
+import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { Type } from "@mariozechner/pi-ai";
 import { BRIEFING } from "./briefing.ts";
 import { resolveModel } from "./models.ts";
@@ -24,18 +25,27 @@ export type TurnUsage = {
 export type MemoryMode = "persistent" | "fresh";
 
 /**
- * Does this command line actually end the turn?
+ * How hard the model is asked to think.
  *
- * Anchored to the START of a command, and never when the part redirects to a file.
- * `echo "then civ end-turn" >> /notes/notes.md` used to match: echo exits 0, so the turn was
- * aborted without ever being ended — and notes.md is exactly where an agent writes next turn's
- * plan. Exported so its test drives this rule rather than a copy of it.
+ * A named type because a private field cannot be reached through `PiBrain["#thinking"]` — that
+ * indexed access resolves to nothing, so the constructor parameter was silently untyped.
  */
-export function endsTurn(command: string): boolean {
-  return command
-    .split(/[;&|]+/)
-    .some((part) => /^\s*civ\s+end-turn\b/.test(part) && !/[<>]/.test(part));
-}
+export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+/**
+ * The slice of pi's streaming event that this reads.
+ *
+ * pi does not export its AgentEvent union in a form we can name, so the shape we depend on is
+ * written down here rather than re-asserted inline at each use. Every field is optional: an event
+ * of a kind we do not handle simply fails the guards.
+ */
+type PiStreamEvent = {
+  type?: string;
+  message?: {
+    role?: string;
+    content?: Array<{ type: string; text?: string; thinking?: string }>;
+  };
+};
 
 export class PiBrain implements Brain {
   readonly name: string;
@@ -45,7 +55,7 @@ export class PiBrain implements Brain {
   #messages: unknown[] = [];
   /** Index in #messages where each turn started, so compaction knows what is recent. */
   #turnMarkers: number[] = [];
-  #thinking: "minimal" | "low" | "medium" | "high" | "xhigh";
+  #thinking: ThinkingLevel;
   /** Accumulated across the match, so the report can show cache effectiveness. */
   usage: TurnUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
   /** Set when the last turn triggered compaction, for the ticker. */
@@ -55,7 +65,7 @@ export class PiBrain implements Brain {
 
   constructor(
     modelId: string,
-    thinking: PiBrain["#thinking"] = "low",
+    thinking: ThinkingLevel = "low",
     memoryMode: MemoryMode = "persistent",
   ) {
     this.#modelId = modelId;
@@ -79,17 +89,30 @@ export class PiBrain implements Brain {
         commands++;
         report?.({ action: params.command });
         const result = await exec(params.command);
-        const body = [result.stdout, result.stderr].filter((s) => s.length > 0).join("\n");
+        let body = [result.stdout, result.stderr].filter((s) => s.length > 0).join("\n");
         // Keep the exchange verbatim for the transcript: a wrong decision is usually a wrong
         // reading of the dump, and that is only visible with the command and its output side by side.
         transcript.push(
           `--- ran ---\n$ ${params.command}\n${body.length > 1200 ? body.slice(0, 1200) + "\n… (truncated)" : body}`,
         );
+        // One `cat tiles.txt` late-game is a few hundred KB; verbatim it can blow the context in
+        // a single call. The file is still on disk; a smaller read gets the rest.
+        const MAX_TOOL_OUTPUT = 60_000;
+        if (body.length > MAX_TOOL_OUTPUT) {
+          body =
+            body.slice(0, MAX_TOOL_OUTPUT) +
+            `\n… [output cut at ${MAX_TOOL_OUTPUT} characters — the file is still on disk; ` +
+            `read a slice (head, sed -n '1,200p') or grep it instead]`;
+        }
 
         // Ending the turn ends the agent's work. Without this the model gets "ok", carries on
         // reasoning, and calls end-turn again and again until it hits the timeout — while the
         // game has already moved to the next seat.
-        if (endsTurn(params.command) && result.exitCode === 0) {
+        //
+        // `turnEnded` comes from the `civ` command itself. Inferring it from the compound exit
+        // code read `civ end-turn; civ hud` with a REFUSED end-turn as success — the agent was
+        // told "Turn ended" mid-decision — and a trailing failed command hid a real end.
+        if (result.turnEnded || result.turnOver) {
           endedTurn = true;
           queueMicrotask(() => agent.abort());
         }
@@ -131,12 +154,18 @@ export class PiBrain implements Brain {
         // BRIEFING is byte-identical for every seat and turn, which is what makes it cacheable.
         // Everything that varies arrives in the HUD below, after the cache breakpoint.
         systemPrompt: BRIEFING,
+        // SAFETY: pi's Agent is generic over its own model registry type, which a descriptor
+        // built here cannot satisfy nominally. The value is a real ModelDescriptor — resolveModel
+        // throws for anything it does not know — and pi only ever reads its fields.
         model: resolveModel(this.#modelId) as never,
         thinkingLevel: this.#thinking,
+        // SAFETY: same boundary. `bash` is a valid pi tool; the cast is to pi's generic tool type.
         tools: [bash as never],
         // Carry the transcript across turns unless the run asked for a clean slate. Nuking it
         // every turn is cheap to reason about but no real deployment works that way, and it
         // forces the agent to re-derive its own plan from scratch each time.
+        // SAFETY: these are pi's own messages, kept from the previous turn and handed straight
+        // back. The cast is to pi's generic message type, not a change of shape.
         messages: (this.#memoryMode === "persistent" ? this.#messages : []) as never,
       },
     });
@@ -145,13 +174,14 @@ export class PiBrain implements Brain {
     // Reconstructing them from state.messages afterwards proved unreliable — an aborted turn
     // (which is every turn, since end-turn aborts) could leave nothing to read.
     let streamed = "";
-    agent.subscribe((event: unknown) => {
-      // The event carries `message`, not `partial` — pi's AgentEvent union names it that way.
-      const e = event as {
-        type?: string;
-        message?: { role?: string; content?: Array<{ type: string; text?: string; thinking?: string }> };
-      };
-      if (e.type !== "message_update" && e.type !== "message_end") return;
+    agent.subscribe((event: AgentEvent) => {
+      // pi's own event type, so the shape is checked rather than asserted. The two kinds this
+      // cares about both carry `message`; the guards below narrow to them.
+      if (event.type !== "message_update" && event.type !== "message_end") return;
+      // SAFETY: narrowed above to the two kinds that carry a message. PiStreamEvent names the
+      // fields this reads — pi's AgentMessage is a union whose arms differ per custom message
+      // type, and every field here is optional, so an arm we do not expect fails the guards.
+      const e = event as PiStreamEvent;
       // message_end fires for the prompt as well as the reply; only the assistant is thinking.
       if (e.message?.role !== "assistant") return;
       // Take both: `thinking` is the model's reasoning, `text` is what it chose to say. Asking
@@ -181,14 +211,56 @@ export class PiBrain implements Brain {
 
     this.#turnMarkers.push(this.#messages.length);
     await agent.prompt(hud);
-    await agent.waitForIdle();
+
+    // Stop when the TURN ends, not when the agent decides it is finished.
+    //
+    // `agent.abort()` does not reliably interrupt a request already in flight, so an agent that
+    // called `civ end-turn` kept reasoning afterwards — one was observed investigating "what has
+    // been executed" for a turn that was already over — and we sat in waitForIdle until the 480s
+    // budget expired. That is where 600-second rounds came from: the work was done in twenty
+    // seconds and the harness waited out the clock.
+    //
+    // The turn ending is a fact we already know, so wait on that too and take whichever comes
+    // first. A short grace lets the in-flight tool result land before we walk away.
+    await Promise.race([
+      agent.waitForIdle(),
+      new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (!endedTurn) return;
+          clearInterval(check);
+          setTimeout(resolve, 250).unref?.();
+        }, 100);
+        check.unref?.();
+      }),
+    ]);
 
     if (this.#memoryMode === "persistent") {
+      // SAFETY: pi's own messages, kept verbatim to hand back next turn. Nothing here reads
+      // inside them — they are opaque to us by design, which is why the element type is unknown.
       this.#messages = agent.state.messages as unknown[];
     }
 
+    // Two silent failures, made loud.
+    //
+    // Both of these depend on the shape of pi's own event and message objects, which we assert
+    // rather than parse. When that shape last changed, reasoning capture returned nothing and the
+    // run looked healthy for days — the agents appeared to be thinking silently. A cast cannot be
+    // made safe, but its failure can be made visible.
+    if (commands > 0 && transcript.length === 0) {
+      console.warn(
+        `[${this.name}] ran ${commands} commands and captured no reasoning — pi's event shape has ` +
+          `probably changed. See the agent.subscribe handler in pi-brain.ts.`,
+      );
+    }
+
     const turn: TurnUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-    for (const message of agent.state.messages as Array<{ role?: string; usage?: TurnUsage & { cost?: { total?: number } } }>) {
+    // SAFETY: pi records usage on its own assistant messages. Both fields are optional, so an
+    // arm of the union without them contributes nothing to the totals.
+    const messages = agent.state.messages as Array<{
+      role?: string;
+      usage?: TurnUsage & { cost?: { total?: number } };
+    }>;
+    for (const message of messages) {
       const u = message.usage;
       if (message.role !== "assistant" || !u) continue;
       turn.input += u.input ?? 0;
@@ -197,6 +269,13 @@ export class PiBrain implements Brain {
       turn.cacheWrite += u.cacheWrite ?? 0;
       turn.cost += u.cost?.total ?? 0;
     }
+    if (commands > 0 && turn.input === 0 && turn.cacheRead === 0) {
+      console.warn(
+        `[${this.name}] ran ${commands} commands and reported no token usage — pi's usage shape has ` +
+          `probably changed, so every cost figure this run is wrong.`,
+      );
+    }
+
     for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
       this.usage[key] += turn[key];
     }

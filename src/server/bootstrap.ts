@@ -16,7 +16,13 @@ import { ScriptedBrain } from "../agent/scripted-brain.ts";
 import { PiBrain } from "../agent/pi-brain.ts";
 import type { MatchConfig } from "../config/schema.ts";
 
-export type Transport = { bridge: Bridge; kind: "live" | "fake"; detail: string };
+export type Transport = {
+  bridge: Bridge;
+  kind: "live" | "fake";
+  detail: string;
+  /** Opens a fresh bridge to the same game. Absent for the fake, which never drops. */
+  reconnect?: () => Promise<Bridge>;
+};
 
 export async function connect(preferFake = false): Promise<Transport> {
   if (!preferFake) {
@@ -30,10 +36,19 @@ export async function connect(preferFake = false): Promise<Transport> {
     // answer anything the adapter asks.
     const target = targets.find((t) => t.url.includes("root-game"));
     if (target) {
+      // Re-discover rather than reusing the old URL: the debug target gets a new id when the
+      // game reloads its UI context, so a saved URL reconnects to something that is gone.
+      const reconnect = async (): Promise<Bridge> => {
+        const again = (await discover(ports, 10)).flatMap((f) => f.targets);
+        const game = again.find((t) => t.url.includes("root-game") && t.webSocketDebuggerUrl);
+        if (!game) throw new Error("the game's debug bridge did not come back");
+        return CdpBridge.connect(game.webSocketDebuggerUrl);
+      };
       return {
         bridge: await CdpBridge.connect(target.webSocketDebuggerUrl),
         kind: "live",
         detail: `CDP: ${target.title || target.id}`,
+        reconnect,
       };
     }
   }
@@ -49,7 +64,10 @@ export async function connect(preferFake = false): Promise<Transport> {
   return { bridge: new FakeBridge(makeWorld()), kind: "fake", detail: "fake Civ 7 (no game found)" };
 }
 
-export function seatsFrom(config: MatchConfig): { seats: Seat[]; agents: AgentConfig[] } {
+/** The playing seats and their configs, built together so their player ids cannot drift apart. */
+export type MatchSeats = { seats: Seat[]; agents: AgentConfig[] };
+
+export function seatsFrom(config: MatchConfig): MatchSeats {
   const agents: AgentConfig[] = config.agents.map((a) => ({
     slot: a.slot,
     playerId: a.playerId,

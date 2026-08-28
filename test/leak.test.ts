@@ -14,11 +14,21 @@ import type { RawSnapshot } from "../src/dump/types.ts";
 const CANARY_UNIT = "canary-unit-99";
 const CANARY_CITY = "canary-city-99";
 
+/**
+ * Owner fields, which the extractor only ever sets on a VISIBLE plot.
+ *
+ * Its own function rather than a conditional spread of `{}`: an empty spread hides WHICH keys go
+ * missing, and in a fog test the keys that go missing are the whole point.
+ */
+function visibleOwner(vis: 1 | 2, playerId: number): { owner?: number; cityId?: null } {
+  return vis === 2 ? { owner: playerId, cityId: null } : {};
+}
+
 /** What the extractor returns for a player who has revealed only the tiles around (1,1). */
 function rawFor(playerId: number, revealed: Array<[number, number, 1 | 2]>): RawSnapshot {
   return {
     header: {
-      turn: 42, maxTurns: 250, age: "antiquity" as unknown as number,
+      turn: 42, maxTurns: 250, age: "antiquity",
       ageProgress: null, playerId, civ: "EGYPT", leader: "HATSHEPSUT", isHuman: true,
       gold: 100, yields: {}, happiness: { net: 0, hasUnrest: false, turnsOfUnrest: 0 },
       settlements: { cities: 1, towns: 0, total: 1, cap: 3, population: 4 },
@@ -27,11 +37,11 @@ function rawFor(playerId: number, revealed: Array<[number, number, 1 | 2]>): Raw
     tiles: {
       width: 20, height: 20,
       tiles: revealed.map(([x, y, vis]) => ({
-        x, y, vis, terrain: "grassland" as unknown as number,
-        biome: "temperate" as unknown as number, feature: null as unknown as number,
-        resource: null as unknown as number, water: false, river: false, mountain: false,
-        continent: "a" as unknown as number, elevation: 1,
-        ...(vis === 2 ? { owner: playerId, cityId: null } : {}),
+        x, y, vis, terrain: "grassland",
+        biome: "temperate", feature: null,
+        resource: null, water: false, river: false, mountain: false,
+        continent: "a", elevation: 1,
+        ...visibleOwner(vis, playerId),
       })),
     },
     // The canaries go IN, on a plot the player has never revealed.
@@ -43,12 +53,15 @@ function rawFor(playerId: number, revealed: Array<[number, number, 1 | 2]>): Raw
     units: {
       own: [],
       foreign: [
+        // SAFETY: a canary, deliberately shaped like a unit the player must never be shown. It
+        // carries `hp` rather than the real damage fields precisely so it is distinguishable.
         { id: CANARY_UNIT, owner: 9, type: "warrior", x: 9, y: 9, hp: 100 } as never,
       ],
     },
     settlements: {
       own: [],
       foreign: [
+        // SAFETY: the settlement canary, same purpose as the unit one above.
         { id: CANARY_CITY, owner: 9, name: CANARY_CITY, x: 9, y: 9, kind: "city" } as never,
       ],
     },
@@ -105,4 +118,36 @@ test("every tile line carries a visibility marker", () => {
   for (const l of readFileSync(join(dir, "tiles.txt"), "utf8").trim().split("\n")) {
     assert.match(l, /vis=(visible|fogged)/, `tile line without vis: ${l}`);
   }
+});
+
+// The rule this codebase states in types.ts: no raw type hash ever reaches an agent. Two were
+// getting through on every turn — `growthType` in settlements.jsonl and `government` in
+// header.json — because both are resolved nowhere and pass straight from the engine to disk.
+test("no agent-readable file carries a raw type hash", async () => {
+  const { writeSnapshot, emptyMemory } = await import("../src/dump/snapshot.ts");
+  const dir = mkdtempSync(join(tmpdir(), "civbench-hash-"));
+  const written = writeSnapshot(dir, rawFor(0, [[1, 1, 2]]), emptyMemory(), 0);
+  for (const file of readdirSync(written.dir)) {
+    const text = readFileSync(join(written.dir, file), "utf8");
+    // A bare number of seven digits or more, as a field value, is a hash that escaped. `engine_id`
+    // is the one number an agent is meant to see: it is how the engine names a unit.
+    const escaped = text
+      .split("\n")
+      .filter((l) => /(?<!engine_id)(=|":\s*)-?\d{7,}\b/.test(l))
+      .filter((l) => !l.includes("engine_id"));
+    assert.deepEqual(escaped, [], `${file} leaks a raw hash`);
+  }
+});
+
+// A rival's legacy score and war support are on the diplomacy ribbon for every MET civ, so they
+// are inside the fog boundary and belong in the dump. The harness read neither: an agent could
+// see who had the bigger economy but not who was closest to winning, and could not judge a war
+// before starting one — in a benchmark scored on winning the Age.
+test("a met rival shows how close they are to winning, and whether a war is safe", async () => {
+  const { writeSnapshot, emptyMemory } = await import("../src/dump/snapshot.ts");
+  const dir = mkdtempSync(join(tmpdir(), "civbench-ribbon-"));
+  const written = writeSnapshot(dir, rawFor(0, [[1, 1, 2]]), emptyMemory(), 0);
+  const players = readFileSync(join(written.dir, "players.txt"), "utf8");
+  if (!players.trim()) return; // no rivals met in this fixture
+  assert.match(players, /war_support_for_me=/, "a war must be judgeable before it is started");
 });

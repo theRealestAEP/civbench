@@ -8,14 +8,23 @@
 export type ChatMessage = {
   turn: number;
   from: string;
-  /** null = broadcast to everyone who has met the sender. */
+  /** null = broadcast. */
   to: string | null;
+  /**
+   * For a broadcast: the seats that had met the sender when it spoke. The briefing promises
+   * "tell every civ you have met"; without this the gate was a comment, and unmet rivals heard
+   * everything.
+   */
+  audience?: string[];
   text: string;
 };
 
 /** Messages are capped so one agent cannot flood another's context. */
 export const MAX_MESSAGE_CHARS = 500;
 export const MAX_PER_TURN = 5;
+
+/** Whether a message went out, and why not when it did not. */
+export type SendResult = { ok: boolean; reason?: string; truncated?: boolean };
 
 export class ChatChannel {
   #history: ChatMessage[] = [];
@@ -28,17 +37,19 @@ export class ChatChannel {
     this.#sentThisTurn.clear();
   }
 
-  send(message: ChatMessage): { ok: boolean; reason?: string } {
+  send(message: ChatMessage): SendResult {
     const sent = this.#sentThisTurn.get(message.from) ?? 0;
     if (sent >= MAX_PER_TURN) {
       return { ok: false, reason: `you have sent ${MAX_PER_TURN} messages this turn` };
     }
-    const text = message.text.trim().slice(0, MAX_MESSAGE_CHARS);
+    const trimmed = message.text.trim();
+    const text = trimmed.slice(0, MAX_MESSAGE_CHARS);
     if (text.length === 0) return { ok: false, reason: "empty message" };
 
     this.#sentThisTurn.set(message.from, sent + 1);
     this.#history.push({ ...message, text });
-    return { ok: true };
+    // Truncation was silent; the sender believed the whole message went out.
+    return { ok: true, truncated: trimmed.length > MAX_MESSAGE_CHARS };
   }
 
   /** Everything addressed to this seat that it has not been shown yet. */
@@ -48,7 +59,8 @@ export class ChatChannel {
     for (let i = from; i < this.#history.length; i++) {
       const m = this.#history[i]!;
       if (m.from === seat) continue; // never echo a seat its own words
-      if (m.to === null || m.to === seat) unread.push(m);
+      if (m.to === seat) unread.push(m);
+      else if (m.to === null && (!m.audience || m.audience.includes(seat))) unread.push(m);
     }
     return unread;
   }

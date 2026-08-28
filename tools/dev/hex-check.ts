@@ -8,14 +8,15 @@ import { hexDistance } from "../../src/cli/near.ts";
 
 loadEnv();
 
-const targets = await listTargets();
+// listTargets needs the debug port; CdpBridge is built by its static connect(), not by `new`.
+// This tool predates both changes and had not compiled since.
+const targets = await listTargets(9444);
 const game = targets.find((t) => t.url.includes("root-game"));
 if (!game) {
   console.log("no game target — start a match first");
   process.exit(1);
 }
-const bridge = new CdpBridge(game.webSocketDebuggerUrl);
-await bridge.connect();
+const bridge = await CdpBridge.connect(game.webSocketDebuggerUrl);
 
 const pairs: Array<[number, number, number, number]> = [
   [10, 10, 10, 10], [10, 10, 11, 10], [10, 10, 10, 11], [10, 10, 9, 11],

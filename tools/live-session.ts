@@ -185,7 +185,7 @@ const outcomes = await runMatch(
   server,
   runDir,
   seats,
-  { turnLimit, stallStrikes: config.harness.stallStrikes },
+  { turnLimit},
   // Live ticker: one line per seat-turn, so a long match is watchable in the terminal.
   (line) => console.log(line),
 );

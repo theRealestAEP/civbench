@@ -1,4 +1,7 @@
 // Runs inside Civ 7's SHELL context. Loads a saved match so a run can be resumed.
+
+// Tutorials off on the resume path too — see newgame.js for why.
+try { Configuration.getUser()?.setTutorialLevel?.(0); } catch { /* older build without the setter */ }
 const type = (() => {
   try { return GameStateStorage.getGameConfigurationSaveType(); }
   catch { return SaveTypes.SINGLE_PLAYER; }

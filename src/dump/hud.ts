@@ -8,6 +8,7 @@
 // Keep it thin. A rich HUD makes agents stop seeking, which flattens the information-seeking
 // signal (§6.5) and hides the differences between models.
 import type { HeaderSnapshot, PendingSnapshot } from "./types.ts";
+import { requiredLines } from "./required.ts";
 
 export type HudCounts = { tilesChanged: number; unitsChanged: number; settlementsChanged: number };
 
@@ -50,6 +51,10 @@ export type HudExtras = {
   messagesText?: string;
   notesText?: string;
   deltaText?: string;
+  /** Civs met, and how they are doing. Small, and it is what tells a seat whether it is losing. */
+  playersText?: string;
+  /** Every action the engine will accept this turn. Small, and it removes all guessing. */
+  actionsText?: string;
 };
 
 const MAX_SECTION_LINES = 40;
@@ -66,6 +71,7 @@ function section(title: string, body: string | undefined, file: string): string[
   ];
 }
 
+// eslint-disable-next-line complexity -- a renderer: one conditional per HUD field. The layout reads top to bottom exactly like the HUD it prints.
 export function renderHud(
   header: HeaderSnapshot,
   pending: PendingSnapshot,
@@ -83,9 +89,14 @@ export function renderHud(
   const y = header.yields;
   // Scores with the number they are measured against. "military 3" alone hid the target from an
   // agent whose whole instruction is to win the Age.
+  // Only the age being played. Every legacy path in the game is enabled, so all twelve were
+  // listed — eight of them for ages that have not started, scoring 0 with no target. The four
+  // that can be won this age are the ones an agent is deciding between.
+  const thisAge = header.legacy.filter((l) => l.type.toLowerCase().includes(String(header.age).toLowerCase()));
+  const shown = thisAge.length > 0 ? thisAge : header.legacy;
   const legacy =
-    header.legacy.length > 0
-      ? header.legacy
+    shown.length > 0
+      ? shown
           .map((l) => {
             const name = l.type.replace(/^LEGACY_PATH_/, "").toLowerCase();
             return `${name} ${num(l.score, 0)}${l.target ? `/${num(l.target, 0)}` : ""}`;
@@ -126,15 +137,30 @@ export function renderHud(
     `settlements ${num(s.total, 0)} (${num(s.cities, 0)} cities, ${num(s.towns, 0)} towns, cap ${num(s.cap, 0)})  pop ${num(s.population, 0)}  units ${header.unitCount}`,
     `pending: ${pending.items.length} items${pending.blockingType ? ` (blocking: ${pending.blockingType})` : ""} -> pending.txt`,
     `messages: ${messageCount} new -> messages.txt`,
-    `changed: ${counts.tilesChanged} tiles, ${counts.unitsChanged} units, ${counts.settlementsChanged} settlements`,
+    // Honest labels: tilesChanged is a real diff against last turn; the other two are what is in
+    // sight now — the dump keeps no unit-by-unit history to diff against. Labelling totals as
+    // "changed" claimed churn that had not happened.
+    `changed: ${counts.tilesChanged} tiles   in sight: ${counts.unitsChanged} units, ${counts.settlementsChanged} settlements`,
+    // Before everything else. A hard requirement is not one item in a list of three.
+    ...requiredLines(pending.items, pending.blockingType),
     ...section("What changed", extras.deltaText, "/current/delta.md"),
     ...section("The game is waiting on you for", extras.pendingText, "/current/pending.txt"),
+    ...section("Civilizations you have met", extras.playersText, "/current/players.txt"),
     ...section("Your settlements", extras.settlementsText, "/current/settlements.txt"),
     ...section("Your units", extras.unitsText, "/current/units.txt"),
     ...section("Messages", extras.messagesText, "/current/messages.txt"),
+    ...section("What the game will accept from you now", extras.actionsText, "/current/actions.txt"),
     ...section("Your notes", extras.notesText, "/notes/notes.md"),
     "",
-    "The map is in /current/tiles.txt. Rules are in /run/rules/. Ask `civ what-can` before acting.",
+    // The map stays a pull. It is 53 tiles at turn 6 and ~3400 late game — the one file that
+    // cannot live in context. Everything else a human has on screen is pushed above.
+    // The pushed block cannot update itself once the agent starts acting, and an agent that read
+    // it as live wrote "the notification feels stale, so I might need to scout the field again".
+    // It was right. Say which it is, and name the two ways to get current.
+    "This block is your position at the START of the turn. After you act it is out of date:",
+    "the files under /current are rewritten as you go, and `civ hud` re-reads this whole block.",
+    "The map is in /current/tiles.txt — `civ near <unit>` reads the part around a unit.",
+    "The full ruleset is in /run/rules/.",
     "",
     // The last line of the push, because it is the one instruction a turn cannot end without.
     "When you are done, run `civ end-turn`. Nothing else finishes your turn.",

@@ -24,10 +24,36 @@ if (TARGET_ID === null || TARGET_ID === undefined || TARGET_ID === "") {
   // argument AND that NONE is 0 rather than null. This re-implemented it and dropped the NONE
   // check, so with nothing blocking it asked the engine to find a notification of type NONE.
   target = endTurnBlocker(PLAYER_ID)?.id ?? null;
-  if (!target) return { ok: false, code: "NOTHING_BLOCKING", message: "nothing is blocking your turn" };
+  // Not a failure. An agent running `civ dismiss` defensively before ending its turn is playing
+  // carefully, and marking that illegal charged it against the seat's hygiene score — the metric
+  // meant to catch flailing. Answer the question it asked instead.
+  if (!target) return { ok: true, note: "nothing was blocking your turn" };
 } else {
   target = findId(TARGET_ID);
-  if (!target) return { ok: false, code: "NO_SUCH_NOTIFICATION", message: `you have no notification ${TARGET_ID}` };
+  if (!target) {
+    // A dead end used to stop here. Notification ids come and go DURING a turn — dismissing one
+    // renumbers nothing but removes it — so an agent acting on an id it read a moment ago gets
+    // this, and "you have no notification 28" gives it nowhere to go. Say what is pending now.
+    const live = [];
+    for (const cid of Game.Notifications?.getIdsForPlayer?.(PLAYER_ID) ?? []) {
+      const id = String(cid?.id ?? cid);
+      let type = null;
+      try {
+        const n = Game.Notifications.find(cid);
+        type = n ? Game.Notifications.getTypeName(n.Type) : null;
+      } catch { type = null; }
+      live.push(type ? `${id} (${type})` : id);
+    }
+    return {
+      ok: false,
+      code: "NO_SUCH_NOTIFICATION",
+      message: `you have no notification ${TARGET_ID} — it was probably cleared earlier this turn`,
+      pending: live,
+      hint: live.length > 0
+        ? `pending right now: ${live.join(", ")}`
+        : "nothing is pending — you do not need to clear anything",
+    };
+  }
 }
 
 const name = (() => {
@@ -44,10 +70,14 @@ try {
   return { ok: false, code: "NOTIFY_FAILED", message: String(err) };
 }
 
-// Deliberately no "did it clear?" claim here.
-//
-// The engine applies the dismissal asynchronously: an immediate re-read still reported the same
-// notification blocking, a second later it was gone. Reporting that stale read told the agent the
-// dismissal had failed when it had worked. `civ end-turn` gives the accurate answer a moment
-// later, so let it be the one to speak.
-return { ok: true, note: `${MODE === "activate" ? "opened" : "dismissed"} ${name ?? TARGET_ID}` };
+// No "did it clear?" claim from THIS read: the engine applies the dismissal asynchronously, and
+// an immediate re-read reports the old state. The Match Server polls a moment later with the id
+// returned here, and downgrades this ok if the notification is still standing — a decision
+// notification ignores dismissal entirely, and six "ok — dismissed" answers in a row once sent
+// an agent in circles for a whole turn.
+return {
+  ok: true,
+  note: `${MODE === "activate" ? "opened" : "dismissed"} ${name ?? TARGET_ID}`,
+  targetId: String(target?.id ?? target),
+  targetName: name ?? null,
+};

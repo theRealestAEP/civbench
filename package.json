@@ -15,12 +15,14 @@
     "enable-debug": "node tools/enable-debug.ts",
     "match": "node tools/run-match.ts",
     "score": "node tools/score.ts",
+    "commentate": "node tools/commentate.ts",
     "launch": "node tools/launch.ts",
     "live": "node tools/live-session.ts",
     "spectate": "node tools/spectate.ts",
     "start": "node tools/start.ts",
     "agent-log": "node tools/agent-log.ts",
-    "lint": "oxlint"
+    "lint": "oxlint",
+    "typecheck": "tsc"
   },
   "dependencies": {
     "@mariozechner/pi-agent-core": "^0.73.1",
@@ -30,6 +32,7 @@
   },
   "devDependencies": {
     "@oxlint/plugins": "^1.80.0",
-    "oxlint": "^1.80.0"
+    "oxlint": "^1.80.0",
+    "typescript": "^7.0.2"
   }
 }

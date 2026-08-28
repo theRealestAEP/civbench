@@ -6,21 +6,28 @@ import type { SeatOutcome } from "./run.ts";
 import { scoreRun } from "../score/metrics.ts";
 
 export function renderReport(outcomes: SeatOutcome[], runDir: string): string {
+  // Game actions and their refusals come from the event log via scoreRun, so the two columns
+  // share one denominator. "bash" (model tool calls) and "illegal" (refused game actions) used
+  // to sit side by side as "cmds"/"illegal", and a seat could show more illegal than cmds —
+  // one bash call carries many `civ` commands.
+  const metricsByName = new Map(scoreRun(runDir).map((m) => [m.name, m]));
   const rows = outcomes.map((o) => {
-    const clean = o.timeouts === 0 && o.forcedEndTurns === 0 && !o.forfeited;
+    const m = metricsByName.get(o.name);
+    const clean = o.timeouts === 0 && o.forcedEndTurns === 0;
     return [
       o.name,
       String(o.turnsPlayed),
       String(o.commands),
-      String(o.illegalActions),
+      String(m?.hygiene.actions ?? "?"),
+      String(m?.hygiene.illegalActions ?? o.illegalActions),
       String(o.timeouts),
       String(o.forcedEndTurns),
-      o.forfeited ? "FORFEIT" : clean ? "clean" : "degraded",
+      clean ? "clean" : "degraded",
       `${o.inputTokens}/${o.outputTokens}`,
     ];
   });
 
-  const header = ["agent", "turns", "cmds", "illegal", "timeouts", "forced", "status", "tok in/out"];
+  const header = ["agent", "turns", "bash", "actions", "illegal", "timeouts", "forced", "status", "tok in/out"];
   const widths = header.map((h, i) =>
     Math.max(h.length, ...rows.map((r) => r[i]!.length)),
   );
@@ -28,7 +35,7 @@ export function renderReport(outcomes: SeatOutcome[], runDir: string): string {
 
   const lines = [fmt(header), widths.map((w) => "-".repeat(w)).join("  "), ...rows.map(fmt)];
 
-  const degraded = outcomes.filter((o) => o.timeouts > 0 || o.forcedEndTurns > 0 || o.forfeited);
+  const degraded = outcomes.filter((o) => o.timeouts > 0 || o.forcedEndTurns > 0);
   if (degraded.length > 0) {
     lines.push(
       "",
@@ -37,7 +44,7 @@ export function renderReport(outcomes: SeatOutcome[], runDir: string): string {
     );
   }
   // Admissibility decides whether this match may touch the leaderboard at all (§13).
-  const metrics = scoreRun(runDir);
+  const metrics = [...metricsByName.values()];
   if (metrics.length > 0) {
     lines.push("", "admissibility");
     for (const m of metrics) {

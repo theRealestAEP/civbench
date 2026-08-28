@@ -6,6 +6,16 @@
 // Fog is per agent and free, because §7 already computed it.
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import type { MergedTile } from "../dump/types.ts";
+
+/** A row of units.jsonl. Own units carry movement detail; foreign ones do not. */
+type DumpUnit = {
+  id: string | number;
+  x?: number;
+  y?: number;
+  type?: string;
+  movesRemaining?: number;
+};
 
 export type ReplayTile = { x: number; y: number; t: string; v: 1 | 2; o: string | null };
 export type ReplayUnit = { id: string; x: number; y: number; type: string; own: boolean };
@@ -17,9 +27,18 @@ export type ReplayTurn = {
   pending: number;
 };
 export type ReplayAgent = { name: string; turns: ReplayTurn[] };
+
+/** One line of events.jsonl, as the replay page renders it. */
+export type ReplayEvent = {
+  turn?: number;
+  player?: number;
+  kind?: string;
+  request?: { actionType?: string };
+  result?: { ok?: boolean; code?: string };
+};
 export type ReplayData = {
   agents: ReplayAgent[];
-  events: Array<Record<string, unknown>>;
+  events: ReplayEvent[];
   width: number;
   height: number;
 };
@@ -31,13 +50,16 @@ export type ReplayData = {
  * tool for working out why a run died, could not be built for a run that died. Every complete line
  * before the truncation is still good evidence.
  */
-function readJsonl(path: string): Array<Record<string, unknown>> {
+function readJsonl<T>(path: string): T[] {
   if (!existsSync(path)) return [];
-  const out: Array<Record<string, unknown>> = [];
+  const out: T[] = [];
   for (const raw of readFileSync(path, "utf8").split("\n")) {
     if (raw.trim().length === 0) continue;
     try {
-      out.push(JSON.parse(raw) as Record<string, unknown>);
+      // SAFETY: every file read here was written by this same run — tiles.jsonl and units.jsonl
+      // come from toJsonl() in the dump writer, events.jsonl from the event log. The caller names
+      // the record type it wrote. A line that does not parse is skipped above.
+      out.push(JSON.parse(raw) as T);
     } catch {
       // A truncated tail is expected on a killed run. Earlier lines are still usable.
     }
@@ -58,20 +80,22 @@ export function collectRun(runDir: string): ReplayData {
 
     for (const turnName of readdirSync(turnsDir).sort()) {
       const dir = join(turnsDir, turnName);
-      const tileRows = readJsonl(join(dir, "tiles.jsonl"));
-      const unitRows = readJsonl(join(dir, "units.jsonl"));
+      const tileRows = readJsonl<MergedTile>(join(dir, "tiles.jsonl"));
+      const unitRows = readJsonl<DumpUnit>(join(dir, "units.jsonl"));
+      // SAFETY: header.json is written by this harness's snapshot writer; only `turn` is read
+      // here, and the other branch covers the file being absent.
       const header = existsSync(join(dir, "header.json"))
         ? (JSON.parse(readFileSync(join(dir, "header.json"), "utf8")) as { turn: number })
         : { turn: Number(turnName.replace(/\D/g, "")) };
 
       const tiles: ReplayTile[] = tileRows.map((t) => {
-        width = Math.max(width, (t.x as number) + 1);
-        height = Math.max(height, (t.y as number) + 1);
+        width = Math.max(width, t.x + 1);
+        height = Math.max(height, t.y + 1);
         return {
-          x: t.x as number,
-          y: t.y as number,
-          t: String(t.terrain ?? "unknown"),
-          v: (t.vis as 1 | 2) ?? 1,
+          x: t.x,
+          y: t.y,
+          t: t.terrain ?? "unknown",
+          v: t.vis ?? 1,
           o: t.owner === null || t.owner === undefined ? null : `p${t.owner}`,
         };
       });
@@ -82,9 +106,9 @@ export function collectRun(runDir: string): ReplayData {
         tiles,
         units: unitRows.map((u) => ({
           id: String(u.id),
-          x: (u.x as number) ?? 0,
-          y: (u.y as number) ?? 0,
-          type: String(u.type ?? "?"),
+          x: u.x ?? 0,
+          y: u.y ?? 0,
+          type: u.type ?? "?",
           own: u.movesRemaining !== undefined, // only own units carry movement detail
         })),
         pending: 0,
@@ -93,5 +117,5 @@ export function collectRun(runDir: string): ReplayData {
     agents.push({ name, turns });
   }
 
-  return { agents, events: readJsonl(join(runDir, "events.jsonl")), width, height };
+  return { agents, events: readJsonl<ReplayEvent>(join(runDir, "events.jsonl")), width, height };
 }

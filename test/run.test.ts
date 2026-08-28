@@ -25,11 +25,10 @@ function makeMatch(brains: Brain[]) {
 
 test("the scripted baseline plays several turns unattended", async () => {
   const { runDir, server, seats } = makeMatch([new ScriptedBrain()]);
-  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 3, stallStrikes: 3 });
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 3 });
   const alpha = outcomes[0]!;
   assert.equal(alpha.turnsPlayed, 3);
   assert.ok(alpha.commands > 0, "the baseline must actually drive the sandbox");
-  assert.equal(alpha.forfeited, false);
   assert.equal(alpha.forcedEndTurns, 0, "it ends its own turns");
 });
 
@@ -42,12 +41,12 @@ test("a brain that hangs is timed out and its turn is forced", async () => {
   }
   const { runDir, server, seats } = makeMatch([new Hanging()]);
   seats[0]!.config.secondsPerTurn = 0.05;
-  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 2, stallStrikes: 5 });
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 2 });
   assert.ok(outcomes[0]!.timeouts >= 1, "the watchdog must fire");
   assert.ok(outcomes[0]!.forcedEndTurns >= 1, "and the turn must be ended for it");
 });
 
-test("a brain that throws does not crash the match", async () => {
+test("a brain that throws does not crash the match, and the seat keeps playing", async () => {
   class Broken implements Brain {
     readonly name = "broken";
     async playTurn(): Promise<TurnReport> {
@@ -55,9 +54,12 @@ test("a brain that throws does not crash the match", async () => {
     }
   }
   const { runDir, server, seats } = makeMatch([new Broken()]);
-  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 4, stallStrikes: 2 });
-  assert.equal(outcomes[0]!.forfeited, true, "repeated stalls forfeit the seat");
-  assert.ok(outcomes[0]!.turnsPlayed >= 2);
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 4 });
+  // Every turn, not two. A seat is never removed from the match: Civ has no such rule, and the
+  // version that ejected one after N bad turns deadlocked a live run — the game went on offering
+  // that seat turns nobody would end.
+  assert.equal(outcomes[0]!.turnsPlayed, 4, "a broken seat still gets every turn");
+  assert.equal(outcomes[0]!.forcedEndTurns, 4, "and the harness ends each one for it");
 });
 
 test("a seat that never ends its turn is stopped by the action budget", async () => {
@@ -69,7 +71,7 @@ test("a seat that never ends its turn is stopped by the action budget", async ()
     }
   }
   const { runDir, server, seats } = makeMatch([new Spammer()]);
-  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 1, stallStrikes: 3 });
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 1 });
   assert.equal(outcomes[0]!.forcedEndTurns, 1, "it never ended its turn, so we did");
   const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
   assert.match(events, /ACTION_BUDGET_SPENT/, "the budget must bite and be logged");
@@ -78,8 +80,9 @@ test("a seat that never ends its turn is stopped by the action budget", async ()
 
 test("the event log records every action and its result", async () => {
   const { runDir, server, seats } = makeMatch([new ScriptedBrain()]);
-  await runMatch(server, runDir, seats, { turnLimit: 1, stallStrikes: 3 });
+  await runMatch(server, runDir, seats, { turnLimit: 1 });
   const lines = readFileSync(join(runDir, "events.jsonl"), "utf8").trim().split("\n");
+  // SAFETY: events.jsonl is written by the match server under test, one Event per line.
   const kinds = lines.map((l) => (JSON.parse(l) as { kind: string }).kind);
   assert.ok(kinds.includes("turn_begin"));
   assert.ok(kinds.includes("action"));
@@ -94,12 +97,10 @@ test("autosave writes a save each round when the config asks for it", async () =
   const cfg = { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 20, secondsPerTurn: 10 };
   const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [cfg]);
   server.autosave = true;
-  await runMatch(server, runDir, [{ config: cfg, brain: new ScriptedBrain() }], {
-    turnLimit: 2,
-    stallStrikes: 3,
-  });
+  await runMatch(server, runDir, [{ config: cfg, brain: new ScriptedBrain() }], { turnLimit: 2 });
   assert.ok(world.saves.length >= 2, `expected a save per round, got ${world.saves.length}`);
-  assert.match(world.saves[0]!, /^civbench-t\d{4}$/);
+  // The label carries the run's name so a second match cannot overwrite the first's save trail.
+  assert.match(world.saves[0]!, /^civbench-.+-t\d{4}$/);
 });
 
 test("autosave can be turned off", async () => {
@@ -108,24 +109,15 @@ test("autosave can be turned off", async () => {
   const cfg = { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 20, secondsPerTurn: 10 };
   const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [cfg]);
   server.autosave = false;
-  await runMatch(server, runDir, [{ config: cfg, brain: new ScriptedBrain() }], {
-    turnLimit: 2,
-    stallStrikes: 3,
-  });
+  await runMatch(server, runDir, [{ config: cfg, brain: new ScriptedBrain() }], { turnLimit: 2 });
   assert.equal(world.saves.length, 0);
 });
 
-// `echo "then civ end-turn" >> /notes/notes.md` used to end the agent's turn. The detector
-// matched the phrase anywhere in the line, and echo exits 0 — so writing next turn's plan
-// aborted this one without ending it. notes.md is exactly where a plan gets written.
-test("writing about end-turn in a note does not end the turn", async () => {
-  const { endsTurn } = await import("../src/agent/pi-brain.ts");
-  assert.equal(endsTurn("civ end-turn"), true);
-  assert.equal(endsTurn("civ skip 10; civ end-turn"), true);
-  assert.equal(endsTurn("echo 'then civ end-turn' >> /notes/notes.md"), false);
-  assert.equal(endsTurn("echo civ end-turn > /notes/plan.md"), false);
-  assert.equal(endsTurn("grep 'civ end-turn' /notes/notes.md"), false);
-});
+// `echo "then civ end-turn" >> /notes/notes.md` used to end the agent's turn: the brain inferred
+// the end from the command TEXT and the compound exit code. The signal now comes from the `civ`
+// command itself (ExecResult.turnEnded), so text that merely mentions end-turn cannot fire it —
+// the sandbox e2e test "writing about end-turn in a note does not end the turn" covers the
+// mechanism end to end.
 
 // Three tools each assembled a match by hand and each forgot something different: run-match.ts
 // and live-session.ts never exported the ruleset, so /run/rules/ — which the briefing tells
@@ -207,16 +199,19 @@ test("an agent that clears its blocker plays every turn it is given", async () =
     }
   }
   const { runDir, server, seats } = blockedMatch(new Playing(), world);
-  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 10, stallStrikes: 3 });
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 10 });
 
   const alpha = outcomes[0]!;
   assert.ok(alpha.turnsPlayed > 6, `must get past turn 6, reached ${alpha.turnsPlayed}`);
   assert.equal(alpha.turnsPlayed, 10, "and play every turn it was asked for");
-  assert.equal(alpha.forfeited, false);
   assert.equal(alpha.forcedEndTurns, 0, "it ends its own turns, so nothing is forced");
 });
 
-test("an agent that never clears its blocker forfeits rather than hanging the match", async () => {
+// A seat that never clears its blocker keeps playing. Civ has no forfeit: a player who cannot
+// finish just has their turn ended and gets the next one. The version that ejected a seat after
+// N such turns deadlocked a live run at turn 7 — the game went on offering that seat turns, and
+// the harness had stopped listening.
+test("an agent that never clears its blocker keeps its seat, and the match keeps moving", async () => {
   const world = makeWorld();
   class Stuck implements Brain {
     readonly name = "stuck";
@@ -227,11 +222,21 @@ test("an agent that never clears its blocker forfeits rather than hanging the ma
     }
   }
   const { runDir, server, seats } = blockedMatch(new Stuck(), world);
-  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 10, stallStrikes: 3 });
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 10 });
 
   const alpha = outcomes[0]!;
-  // The seat gives up, but the MATCH does not hang: forced end-turn still advanced the game each
-  // time, which is the behaviour whose absence left a seat active and the round waiting forever.
-  assert.equal(alpha.forfeited, true, "a seat that never plays should forfeit");
-  assert.ok(alpha.forcedEndTurns > 0, "and the harness must have ended its turns for it");
+  assert.equal(alpha.turnsPlayed, 10, "it keeps its seat for every turn");
+  assert.ok(alpha.forcedEndTurns > 0, "and the harness ends each turn it could not finish");
+});
+
+// The deadlock that stopped a 40-turn run at turn 7.
+//
+// The harness had a strike count that ejected a seat after N "stalled" turns, and a stall
+// included any turn the harness had to end — which is most turns, since an agent's own end-turn
+// is refused whenever a decision is pending. Civ has no such rule. A player who runs out of time
+// has their turn ended and plays the next one.
+test("the match has no forfeit rule", async () => {
+  const source = readFileSync(new URL("../src/server/run.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /forfeit/i, "a seat is never removed from the match");
+  assert.doesNotMatch(source, /strikes/i, "and nothing counts strikes against it");
 });

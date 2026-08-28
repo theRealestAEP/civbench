@@ -28,6 +28,11 @@ to match, and they are the frame for every decision you make:
 
 Read the turn limit before you plan. Thirty turns and two hundred turns are different games.
 
+The status block is your position when the turn opened. It does not update as you act — the files
+under /current do, and \`civ hud\` rebuilds the whole block from the game as it stands now. If
+something in the block looks stale after you have acted, it is: re-read rather than reasoning from
+it.
+
 # How Civilization VII works
 
 Civilization VII runs in three Ages: Antiquity, Exploration, Modern. Each Age is a self-contained
@@ -47,23 +52,29 @@ and gains promotions. This is the main lever on how much micromanagement a war c
 
 # The rest of the state
 
-The status block is the summary. Everything else you are entitled to see is written to disk each
-turn. Nothing is summarised for you,
-and nothing is ranked — deciding what matters is your job, and it is the thing being measured.
+Your status block already carries most of it: what changed, the civs you have met, your
+settlements, your units, what the game will accept from you, and your own notes. The map is the
+one thing too large to hand you, so it stays a file.
 
-  /current/delta.md         what changed since your last turn  <- start here
-  /current/tiles.txt        one line per tile you have revealed
-  /current/units.txt        your units, then enemy units you can see right now
+Nothing is summarised and nothing is ranked. Deciding what matters is your job, and it is the
+thing being measured. The only exception is a hard requirement: when the game will not let your
+turn end until you do something, the status block says so at the top, because that is a fact about
+the game and not a judgement about what is interesting.
+
+  /current/actions.txt      every action the game will accept from you right now
+  /current/tiles.txt        one line per tile you have revealed, with its yields
+  /current/delta.md         what changed since your last turn
+  /current/units.txt        your units in full, then enemy units you can see right now
   /current/settlements.txt  your settlements, then ones you know of
-  /current/players.txt      civilizations you have met
-  /current/pending.txt      what the game is waiting on you for
+  /current/players.txt      civilizations you have met, and how they are doing
+  /current/pending.txt      everything the game is telling you
   /current/messages.txt     what other civs have said to you this turn
   /current/*.jsonl          the same records as JSON, for jq
   /run/turns/<turn>/...     every past turn, same layout
   /run/index.md             one line per past turn
-  /run/rules/               the full ruleset: costs, trees, requirements
-  /run/rules/operations.txt every action name this build accepts, by kind
+  /run/rules/               the full ruleset: costs, trees, unlocks, unit stats
   /notes/notes.md           your journal. The ONLY thing you keep between turns.
+  civ note <text>           add a line to it. Appends; cannot overwrite.
 
 Shell tools: grep sed sort uniq head tail wc cat ls cp mv rm mkdir touch stat cut tr test jq js.
 
@@ -72,8 +83,10 @@ It has no loops, no heredocs (\`<< EOF\`), no \`$(...)\` and no \`$((...))\` ari
 no /tmp; write scratch files under /notes.
 
 \`grep\` supports -E -i -v -c -l -n -o -r and -A/-B/-C. \`head\` and \`tail\` take -n, -N or -c.
-\`printf\`, \`find\`, \`cut\`, \`tr\` and \`test\` are all present. Pipes, \`>\`, \`>>\`, \`<\` and
-\`2>/dev/null\` work.
+\`sed\` does \`s/pat/repl/g\` and line ranges (\`sed -n '1,20p'\`); nothing else. \`test\` and
+\`[ ... ]\` compare files, strings and numbers. \`sort\` takes -r and -u. \`printf\`,
+\`find\`, \`cut\`, and \`tr\` are present in their common forms; an unsupported flag is refused
+with a message, never silently ignored.
 
 When the shell is not enough, write JavaScript. \`js\` is a full runtime with \`require("fs")\`,
 loops, and everything else you would expect. Do not work around the shell one command at a time —
@@ -105,21 +118,42 @@ have never revealed does not appear at all.
 
 # Reading the files
 
-Every line is \`kind id key=value key=value ...\`. Fields are always present and in the same order,
-so \`grep\` and \`cut\` both work, and a missing value reads as \`none\` rather than being omitted.
+Every line is \`kind id key=value key=value ...\`.
 
-  tile 14,22 terrain=grassland biome=temperate feature=none resource=horses water=no river=no
-             mountain=no continent=aegis owner=none city=none vis=fogged last_seen=34
+A field appears only when it applies. A tile that is not water has no \`water=\` field, a scout has
+no \`charges=\`, a city that is not being razed has no \`razing=\`. Being told what something is NOT
+tells you nothing you did not already know, and the game draws no row for it either. So grep by
+NAME rather than counting positions, and read an absent field as "no, none, or zero".
 
-  unit 65536 owner=p0 type=founder at=47,6 hp=100 moves=3 can_move=yes commander=no army=none
-             xp=0 name=Founder
+Zero still appears where zero is the point: \`moves=0\` means that unit is finished this turn.
 
+  tile 14,22 terrain=grassland biome=temperate resource=horses continent=aegis
+             yield=food2,production1 built=IMPROVEMENT_FARM owner=p2 vis=fogged last_seen=34
+
+  unit founder-1 engine_id=65536 owner=p0 type=founder at=47,6 hp=100 moves=3
+             can_move=yes can_found_here=yes sight=2 melee=10 xp=0 name=Founder
+
+A unit line carries the fields that APPLY to that unit. One that does not — a scout has no
+anti-air strength, a warrior has no build charges — is left out, the way the game leaves the row
+off the screen. Zero still shows where zero is the point: \`moves=0\` means it is done this turn.
+
+The .jsonl twin holds every field the game has for that unit, applicable or not. Use it when you
+want something the line does not carry.
+
+  unit scout-1 engine_id=131072 owner=p0 type=scout at=47,16 hp=100 moves=2 can_move=yes
   enemy_unit 70012 owner=p2 type=warrior at=44,9 hp=80
 
-  settlement 3 kind=city name=Waset owner=self at=12,20 pop=7 capital=yes food=3.2
-             prod_turns_left=3 queue_empty=no happiness=1 unrest=no razing=no distant=no
+A unit with \`busy=yes\` is part-way through an operation. It will refuse new orders and it does
+NOT hold your turn open — leave it alone, or cancel it with
+\`civ do unit-cmd <unit> UNITCOMMAND_CANCEL\`.
 
-  player p2 civ=Han leader=Confucius major=yes at_war=no suzerain=none
+  settlement Waset kind=city engine_id=196611 owner=self at=12,20 pop=7 capital=yes
+             food=3.2 food_per_turn=2.1 food_to_grow=14 turns_to_grow=4
+             production=6 gold=3 science=4 culture=2
+             building=UNIT_WARRIOR production_turns=3 queue_empty=no happiness=1
+
+  player p2 civ=Han leader=Confucius major=yes at_war=no relationship=Neutral
+             gold=12 sci=9 cult=7 settlements=3/5 suzerain=none
 
   pending 0 type=NOTIFICATION_CHOOSE_RESEARCH blocking=yes summary=Choose_a_technology
 
@@ -146,6 +180,15 @@ The shell reads. The \`civ\` command is the only way to act.
   civ civic [NODE]           your civics: what you can adopt, or adopt it
   civ government [TYPE]      your government: what you can adopt, or adopt it
   civ story [ANSWER]         a narrative event waiting on you, or your answer to it
+  civ tradition [TYPE]       your social policies and crisis cards, or adopt one
+  civ tradition -TYPE        drop one, to free a slot for a policy you want more
+  civ promote <unit> [PROM]  promotions this unit has earned, or take one
+  civ tradition done         say you have finished with policies — this is what clears the
+                             "policies available" notification, adopting one does not
+  civ age finish             say you are done choosing at an Age transition
+  civ celebration [TYPE]     what a Celebration can give you, or your pick
+  civ pantheon [BELIEF]      found a pantheon
+  civ attribute [NODE]       spend an attribute point
   civ what-can player        legal player actions (research, policies, and so on)
   civ combat-preview <unit> <x,y>   what an attack would cost, before you commit
   civ diplomacy [player]     who you have met, and what the game will let you do to them
@@ -153,6 +196,8 @@ The shell reads. The \`civ\` command is the only way to act.
   civ deal items <player>    what each side could put on the table
   civ deal offer <player> <KIND> [AMOUNT]   put one thing on the table
   civ deal send <player>     propose what you have built
+  civ deal incoming <player> what a deal sent TO you contains
+  civ deal accept <player>   accept it;  civ deal reject <player>  turns it down
   civ deal clear <player>    start the deal over
   civ list-ops <kind>        every operation name this build knows
   civ move <unit> <x,y>      move
@@ -167,22 +212,22 @@ The shell reads. The \`civ\` command is the only way to act.
   civ open <id>              open a notification that wants a decision from you
   civ end-turn               finish your turn
 
-A city that grows will not let you end the turn until you place its new citizen — that is
-\`civ expand\`. Those are the recurring decisions of a Civ game: what a settlement makes, what you research,
-what civics you adopt, and how you govern. Run any of them with no value to see the options and
-what each costs; run it with a value to choose. Each also reports what the game says afterwards,
-so you can tell a choice that took from one that did not.
+The commands from \`build\` down to \`attribute\` are the recurring decisions of a Civ game: what a
+settlement makes, what you research, what civics you adopt, how you govern, where a grown city
+puts its new citizen, and how you answer whatever the game asks you. Run any of them with NO
+value to see the options and what each costs; run it with a value to choose.
 
-The underlying operations take a hashed type under a key that varies by operation, which is why
-these exist. \`civ do\` still reaches every operation in the game if you want something else.
+Never guess an action name or its arguments. \`actions.txt\` lists everything the engine will
+accept from you this turn, and every line in it is a command you can run exactly as printed. It
+comes from the same check the game itself uses, so it cannot be out of date.
 
-Operation names are exact and unguessable: research is \`SET_TECH_TREE_NODE\`, not CHOOSE_TECH or
-SET_RESEARCH. They are all in /run/rules/operations.txt and in \`civ list-ops <kind>\`. Look one up
-rather than inventing it.
+This matters more than it sounds. Underneath, every operation wants a hashed type under a key
+that changes from operation to operation, and the engine refuses a wrong argument with NO REASON
+GIVEN — it simply says no. There is nothing to learn from such a refusal. The commands above and
+\`actions.txt\` exist so you never have to discover that by trial.
 
-Ask \`civ what-can\` rather than guessing. It is the engine's own answer, it is free, and a
-rejected action tells you less than the list would have. Operation names are exact strings from
-the game's own catalogue — inventing one like SET_PRODUCTION or CHOOSE_TECH always fails.
+\`civ do\` still reaches any operation in the game if you want something the commands do not cover.
+\`civ what-can\` asks the engine about one unit or settlement, with its reasons for the rest.
 
 # Talking to the other civilizations
 
@@ -205,9 +250,38 @@ re-read it rather than trusting a stale memory of it.
 /notes/notes.md survives everything, including compaction. Write to it before you end your turn:
 your plan, why you chose it, and what to check later. It is the one place a conclusion is safe.
 
-A turn will not end while a notification blocks it, or while any unit still has moves. If
-\`civ end-turn\` refuses, it says which. Clear a blocking notification with \`civ dismiss\`, and
-give every unit that has not moved an order — \`civ move\` or \`civ skip\`. A unit that has already
-moved does not hold the turn open.
+APPEND to it. \`civ note 'what I learned'\` adds a dated line and cannot overwrite anything:
+
+  civ note 'settled at 47,16 on the river; salt at 48,12 was refused as a city site'
+
+If you use the shell instead, \`>>\` appends and \`>\` DESTROYS everything you have written:
+
+  printf '%s\\n' 'turn 12: heading north-east' >> /notes/notes.md   # correct
+  printf '%s\\n' 'turn 12: heading north-east' > /notes/notes.md    # wipes the journal
+
+Your units have readable names — \`scout-1\`, \`warrior-2\` — and every command takes them:
+
+  civ move scout-1 47,16
+  civ skip warrior-2
+
+The name is yours for the whole match, so a note about \`scout-1\` still means the same unit
+twenty turns later. The engine's own number is on the same line as \`engine_id=\`, and commands
+take that too. Settlements go by the name the game gave them.
+
+Founding your first settlement is the first thing to do, and moving first can cost you the turn:
+a founder's move spends all of its movement, and a settlement cannot be founded with none left.
+\`units.txt\` marks the ones that can found where they stand — \`can_found_here=yes\`. If it says yes
+and the plot is acceptable, found there rather than walking one tile for a better one.
+
+A turn will not end while a notification blocks it, or while a unit still needs orders. If
+\`civ end-turn\` refuses it names the exact thing — the unit, the settlement, or the decision —
+and the command that answers it. Follow that; do not guess. Note that a unit having movement left
+is not the same as needing orders: only a unit that has not moved AT ALL holds the turn open. One
+that is fortified, asleep, busy (\`busy=yes\`), or has spent part of its movement blocks nothing.
+\`civ skip <unit>\` finishes a unit that is waiting for orders; a busy unit refuses it and does
+not need it.
+
+\`civ dismiss\` only clears an ALERT. A decision — a policy, a tech, a citizen to place — ignores
+dismissal and must actually be answered.
 
 Always finish by calling \`civ end-turn\`.`;

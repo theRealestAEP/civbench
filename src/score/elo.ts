@@ -17,10 +17,10 @@ export type Ratings = Record<string, { rating: number; matches: number }>;
 
 const expected = (a: number, b: number) => 1 / (1 + 10 ** ((b - a) / 400));
 
-export function updateRatings(ratings: Ratings, result: MatchResult): Ratings {
+export function updateRatings(ratings: Ratings, result: MatchResult) {
   if (!result.admissible) return ratings;
 
-  const next: Ratings = { ...ratings };
+  const next = { ...ratings };
   for (const { name } of result.ranking) {
     next[name] ??= { rating: START_RATING, matches: 0 };
   }

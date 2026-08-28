@@ -48,8 +48,39 @@ const configPath = flag("config");
 const models = (flag("models") ?? "").split(",").filter(Boolean);
 const agentCount = Number(flag("agents") ?? models.length ?? 0) || models.length || 3;
 const defaultModel = flag("model") ?? "claude-sonnet-5";
-const turns = Number(flag("turns") ?? 10);
+let turns = Number(flag("turns") ?? 10);
 const speed = flag("speed") ?? "GAMESPEED_QUICK";
+/**
+ * Stop macOS throttling the game when its window is hidden.
+ *
+ * App Nap suspends a backgrounded app, which froze the game mid-match and made every bridge call
+ * time out. The advice until now was "keep the window in front", which is not a thing anyone
+ * should have to do for a ten-hour match. Written every launch because a `defaults` value set by
+ * hand is one `defaults delete` away from being lost silently.
+ */
+function keepAwake(): void {
+  for (const bundle of ["com.2k.civ7", "com.valvesoftware.steam"]) {
+    try {
+      execFileSync("defaults", ["write", bundle, "NSAppSleepDisabled", "-bool", "YES"], { stdio: "ignore" });
+    } catch { /* not fatal: the match still runs, it just wants the window visible */ }
+  }
+}
+
+/**
+ * Drop the game to a low scheduling priority.
+ *
+ * A match runs for hours on someone's working machine, and Civ takes two to three cores whether or
+ * not anyone is watching it. Nice makes it yield to whatever the machine is really for; it keeps
+ * every core it can get when nothing else wants them, so turns do not get slower in practice.
+ */
+function yieldPriority(): void {
+  for (const pid of findGamePids()) {
+    try {
+      execFileSync("renice", ["+10", "-p", String(pid)], { stdio: "ignore" });
+    } catch { /* best effort */ }
+  }
+}
+
 const spectate = !has("no-spectate") && !useFake;
 // Civ VII has no per-victory toggle: victories are tied to Ages. A single Age keeps a short match
 // focused, but a long one wants all three, because that is a full game and domination is defined
@@ -85,7 +116,7 @@ control_mode: ${useFake ? "direct" : "hotseat"}
 agents:
 ${seatModels
   .map(
-    (m, i) => `  - { slot: ${i}, player_id: ${i}, name: ${seatNames[i]}, brain: { model: ${m} }, budget: { actions_per_turn: 80, seconds_per_turn: ${turnSeconds} } }`,
+    (m, i) => `  - { slot: ${i}, player_id: ${i}, name: ${seatNames[i]}, brain: { model: ${m} }, budget: { actions_per_turn: 500, seconds_per_turn: ${turnSeconds} } }`,
   )
   .join("\n")}
 harness: { stall_strikes: 3 }
@@ -98,6 +129,10 @@ harness: { stall_strikes: 3 }
 
 const path = configPath ?? buildConfig();
 const { config, runId } = loadMatchConfig(path);
+// A config file's turn_limit is the match length. The `turns` flag default silently overrode it
+// — a config saying 80 turns ran 10, in the engine's maxTurns, the run loop, and the estimate.
+// An explicit --turns still wins, so a config can be trialled short without editing it.
+if (flag("turns") === undefined) turns = config.game.turnLimit;
 // Each model says which key it needs, so a run that uses only OpenRouter models does not demand
 // an Anthropic key, and a mixed run demands both.
 loadEnv();
@@ -183,6 +218,59 @@ async function waitForTarget(match: (t: CdpTarget) => boolean, label: string, se
   throw new Error(`timed out waiting for ${label}`);
 }
 
+/** Kill any leftover game process and launch a fresh one through Steam. */
+async function launchGame(): Promise<void> {
+  for (const pid of findGamePids()) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+  await sleep(8000);
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    applyOptions(); // consumed and reset at every startup
+    capFramerate();
+    execFileSync("open", ["steam://rungameid/1295660"]);
+    let up = false;
+    for (let i = 0; i < 12; i++) { await sleep(5000); if (findGamePids().length) { up = true; break; } }
+    if (up) return;
+    console.log(`   Steam ignored the launch; retrying (${attempt}/4)`);
+  }
+}
+
+/** Ask the freshly launched game's main menu to load a save. */
+async function loadSave(name: string): Promise<void> {
+  const shell = await waitForTarget((t) => t.url.includes("root-shell"), "main menu", 240);
+  const shellBridge = await CdpBridge.connect(shell.webSocketDebuggerUrl);
+  const loaded = await new GameAdapter(shellBridge).run<{ requested: boolean; error?: string }>(
+    "loadsave",
+    0,
+    { SAVE_NAME: name, SERVER_TYPE: config.controlMode === "hotseat" ? "hotseat" : "single" },
+  );
+  await shellBridge.close();
+  if (!loaded.requested) throw new Error(`could not load "${name}": ${loaded.error}`);
+  console.log("   load requested");
+}
+
+/** Two runMatch legs of the same match, as one set of per-seat totals for the report. */
+function mergeOutcomes(
+  first: Awaited<ReturnType<typeof runMatch>>,
+  second: Awaited<ReturnType<typeof runMatch>>,
+): Awaited<ReturnType<typeof runMatch>> {
+  const bySeat = new Map(first.map((o) => [o.name, { ...o }]));
+  for (const o of second) {
+    const seat = bySeat.get(o.name);
+    if (!seat) { bySeat.set(o.name, { ...o }); continue; }
+    seat.turnsPlayed += o.turnsPlayed;
+    seat.commands += o.commands;
+    seat.timeouts += o.timeouts;
+    seat.forcedEndTurns += o.forcedEndTurns;
+    seat.illegalActions += o.illegalActions;
+    seat.inputTokens += o.inputTokens;
+    seat.outputTokens += o.outputTokens;
+  }
+  // SAFETY: the array carries SeatOutcome values built above; the cast only re-attaches the
+  // `gameCrashed` marker property that runMatch's return type declares.
+  const merged = [...bySeat.values()] as Awaited<ReturnType<typeof runMatch>>;
+  merged.gameCrashed = second.gameCrashed;
+  return merged;
+}
+
 let adapter: GameAdapter;
 let closeBridge: () => Promise<void> = async () => {};
 
@@ -192,18 +280,9 @@ if (useFake) {
   closeBridge = () => transport.bridge.close();
   console.log("transport: fake Civ 7 (harness only)\n");
 } else {
+  keepAwake();
   console.log("1. launching Civilization VII");
-  for (const pid of findGamePids()) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
-  await sleep(8000);
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    applyOptions(); // consumed and reset at every startup
-    capFramerate();
-    execFileSync("open", ["steam://rungameid/1295660"]);
-    let up = false;
-    for (let i = 0; i < 12; i++) { await sleep(5000); if (findGamePids().length) { up = true; break; } }
-    if (up) break;
-    console.log(`   Steam ignored the launch; retrying (${attempt}/4)`);
-  }
+  await launchGame();
 
   // Declared out here because the gameplay-context connection below reuses it.
   let bridge: CdpBridge;
@@ -211,16 +290,7 @@ if (useFake) {
   if (resumeFrom) {
     // Resuming skips setup entirely: the save carries the map, the seats and the turn.
     console.log(`2. loading save "${resumeFrom}"`);
-    const shell = await waitForTarget((t) => t.url.includes("root-shell"), "main menu", 240);
-    bridge = await CdpBridge.connect(shell.webSocketDebuggerUrl);
-    const loaded = await new GameAdapter(bridge).run<{ requested: boolean; error?: string }>(
-      "loadsave",
-      0,
-      { SAVE_NAME: resumeFrom, SERVER_TYPE: config.controlMode === "hotseat" ? "hotseat" : "single" },
-    );
-    await bridge.close();
-    if (!loaded.requested) throw new Error(`could not load "${resumeFrom}": ${loaded.error}`);
-    console.log("   load requested");
+    await loadSave(resumeFrom);
   } else {
   console.log("2. hosting the match");
   const shell = await waitForTarget((t) => t.url.includes("root-shell"), "main menu", 240);
@@ -254,10 +324,22 @@ if (useFake) {
   }
   }
 
+  yieldPriority();
   console.log("4. waiting for the map");
   const game = await waitForTarget((t) => t.url.includes("root-game"), "gameplay context", 300);
   bridge = await CdpBridge.connect(game.webSocketDebuggerUrl);
-  adapter = new GameAdapter(bridge);
+  // The debug server is serviced on the game thread and goes quiet while the engine is busy, so
+  // over 50 turns the socket does eventually drop. Nothing used to reconnect it: every read after
+  // that failed, the match loop reported "no seat became active", and an hour of a live run was
+  // spent printing that line at a game that was fine. Re-discover, because the target gets a new
+  // id when the UI context reloads.
+  const reopen = async () => {
+    const again = await waitForTarget((t) => t.url.includes("root-game"), "gameplay context", 60);
+    bridge = await CdpBridge.connect(again.webSocketDebuggerUrl);
+    closeBridge = () => bridge.close();
+    return bridge;
+  };
+  adapter = new GameAdapter(bridge, reopen);
   closeBridge = () => bridge.close();
   for (let i = 0; i < 60; i++) {
     const ready = await adapter.run<{ hasMap: boolean }>("ready", 0).catch(() => ({ hasMap: false }));
@@ -294,7 +376,7 @@ if (spectate) {
 
   spectator = spawn("node", ["tools/spectate.ts", "1000"], { stdio: "ignore", detached: false });
   console.log("   spectator running (clears the hotseat handoff, follows the active seat)");
-  console.log("   >> bring the Civilization VII window to the front: macOS freezes it when hidden\n");
+  console.log("   the window can be minimised: App Nap is off, so macOS will not throttle it\n");
 }
 
 // ---------------------------------------------------------------- the match
@@ -316,14 +398,58 @@ const { server, rules } = await startMatch(adapter, runDir, config, agents, {
 if (server.autosave) console.log("   autosaving each turn (resume with --resume <name>)");
 console.log(`   rules exported: ${rules.tables} tables, ${rules.rows} rows`);
 
+// The start button. Everything is staged — the game is up, the seats are claimed, the ruleset
+// is exported — and nothing plays until you say so, so you can get the window where you want it
+// and the narrator attached before turn 1. `--go` skips the pause for unattended runs, and a
+// non-interactive stdin (CI, a pipe) never waits.
+if (!useFake && !has("go") && process.stdin.isTTY) {
+  console.log("\n▶ READY — press Enter to start the match (--go skips this pause)");
+  await new Promise<void>((resolve) => process.stdin.once("data", () => resolve()));
+}
+
 console.log(`5. playing ${turns} turns\n`);
-const outcomes = await runMatch(
+const matchStartTurn = await server.currentTurn().catch(() => 1);
+let outcomes = await runMatch(
   server,
   runDir,
   seats,
-  { turnLimit: turns, stallStrikes: config.harness.stallStrikes },
+  { turnLimit: turns},
   (line) => console.log(line),
 );
+
+// Civ 7 sometimes dies mid-match — a known engine SIGSEGV has ended three runs. Every turn is
+// autosaved, so a crash is a hiccup, not a lost run: relaunch the game, load the last autosave,
+// and keep playing IN THIS PROCESS — same run directory, same event log, same fog memory, and
+// the narrator never loses the thread. Only a recovery that itself fails ends the match.
+const MAX_RECOVERIES = 3;
+for (let recovery = 1; !useFake && outcomes.gameCrashed && recovery <= MAX_RECOVERIES; recovery++) {
+  const lastTurn = server.lastSnapshotTurn();
+  const runName = runDir.split("/").filter(Boolean).at(-1) ?? "run";
+  const save = `civbench-${runName}-t${String(lastTurn).padStart(4, "0")}`;
+  console.log(
+    `\nthe game crashed. Recovery ${recovery}/${MAX_RECOVERIES}: relaunching and loading ${save}`,
+  );
+  try {
+    await launchGame();
+    await loadSave(save);
+    await waitForTarget((t) => t.url.includes("root-game"), "gameplay context", 300);
+  } catch (err) {
+    console.log(`   recovery failed: ${String(err).slice(0, 140)}`);
+    break;
+  }
+  const remaining = Math.max(1, turns - (lastTurn - matchStartTurn));
+  console.log(`   resumed at turn ${lastTurn}; playing up to ${remaining} more turns\n`);
+  const more = await runMatch(server, runDir, seats, { turnLimit: remaining }, (line) => console.log(line));
+  outcomes = mergeOutcomes(outcomes, more);
+}
+
+if (outcomes.gameCrashed) {
+  console.log(
+    `\nthe game exited and could not be recovered automatically.\n` +
+      `every turn was autosaved, so the run can continue by hand:\n` +
+      `  npm start -- --config ${path} --resume civbench-<runName>-t<turn>\n`,
+  );
+}
 
 spectator?.kill();
 

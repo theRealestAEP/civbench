@@ -4,7 +4,15 @@
 // finishes. Everything it can do — read the dump, grep history, act, end the turn — happens
 // through `exec`. That is what keeps the bench agent-agnostic: a model, a scripted bot, and a
 // random baseline all implement the same three lines.
-export type Exec = (command: string) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+export type Exec = (command: string) => Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  /** True when a `civ end-turn` in this command actually ended the turn. */
+  turnEnded?: boolean;
+  /** True when the session is closed — the turn is over and the brain must stop. */
+  turnOver?: boolean;
+}>;
 
 export type TurnContext = {
   hud: string;

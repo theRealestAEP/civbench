@@ -18,6 +18,34 @@ function netYield(player, name) {
   } catch { return null; }
 }
 
+/**
+ * A rival's legacy score per path, as victory-manager.ts shows it for every MET player.
+ *
+ * Gated on having met them, like everything else here — the caller only reaches this for civs
+ * this player knows.
+ */
+function legacyOf(other) {
+  const out = [];
+  try {
+    for (const path of GameInfo.LegacyPaths ?? []) {
+      const type = path.LegacyPathType;
+      if (!type || path.EnabledByDefault === false) continue;
+      const score = other.LegacyPaths?.getScore?.(type) ?? null;
+      if (score) out.push(`${shortName(type)}${score}`);
+    }
+  } catch { return null; }
+  return out.length > 0 ? out.join(",") : null;
+}
+
+/** Whether a war would find support, the number the ribbon prints on each civ's card. */
+function warSupport(otherId, forMe) {
+  try {
+    return forMe
+      ? myDiplomacy?.getTotalWarSupportBonusForPlayer?.(otherId) ?? null
+      : myDiplomacy?.getTotalWarSupportBonusForTarget?.(otherId) ?? null;
+  } catch { return null; }
+}
+
 const out = [];
 for (const other of Players.getAlive()) {
   if (other.id === PLAYER_ID) continue;
@@ -46,6 +74,14 @@ for (const other of Players.getAlive()) {
     diplomacy: netYield(other, "YIELD_DIPLOMACY"),
     settlements: other.Stats?.numSettlements ?? null,
     settlementCap: other.Stats?.settlementCap ?? null,
+    // How close they are to winning, and whether a war against them would find support.
+    //
+    // The ribbon shows both for every met civ. Without them an agent could see who had the bigger
+    // economy and not who was closer to winning, and could not judge a war before starting one —
+    // in a benchmark scored on winning the Age.
+    legacy: legacyOf(other),
+    warSupportForMe: warSupport(other.id, true),
+    warSupportForThem: warSupport(other.id, false),
   });
 }
 return { me: PLAYER_ID, known: out };

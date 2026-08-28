@@ -52,16 +52,28 @@ export function mergeForeignSettlements(
   previous: MergedSettlement[] | null,
   turn: number,
 ): MergedSettlement[] {
+  // Keyed by owner AND id: ComponentIDs are unique per owner, so two rivals' settlements can
+  // share the bare number, and a bare-id map let one overwrite the other's memory. The bare id
+  // is still consulted when it is unambiguous, because a city CAPTURED behind fog changes owner
+  // — the remembered record sits under the old owner, and dropping it would erase a city the
+  // player has genuinely seen.
   const before = new Map<string, MergedSettlement>();
-  for (const s of previous ?? []) before.set(s.id, s);
+  const byBareId = new Map<string, MergedSettlement | null>();
+  for (const s of previous ?? []) {
+    before.set(`${s.owner}:${s.id}`, s);
+    byBareId.set(s.id, byBareId.has(s.id) ? null : s); // null marks an ambiguous id
+  }
 
-  return raw.map((settlement) => {
-    if (settlement.vis === 2) return { ...settlement, lastSeenTurn: turn };
-    const remembered = before.get(settlement.id);
+  return raw.flatMap((settlement): MergedSettlement[] => {
+    if (settlement.vis === 2) return [{ ...settlement, lastSeenTurn: turn }];
+    const remembered =
+      before.get(`${settlement.owner}:${settlement.id}`) ?? byBareId.get(settlement.id) ?? null;
     // Keep the remembered record wholesale: name and owner may have changed since, and the
     // player has no way to know that yet.
-    return remembered
-      ? { ...remembered, vis: 1 as const }
-      : { ...settlement, lastSeenTurn: null };
+    //
+    // NO memory means this player has never actually SEEN the settlement — it was founded or
+    // captured behind fog on a plot revealed long ago. Reporting its current name and owner
+    // would leak knowledge a human would not have, so it is not reported at all.
+    return remembered ? [{ ...remembered, vis: 1 as const }] : [];
   });
 }

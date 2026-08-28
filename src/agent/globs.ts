@@ -62,25 +62,48 @@ function toRegExp(pattern: string): RegExp {
  *
  * `list` returns the entry names of a directory, or null when there is no such directory.
  */
+/**
+ * Expand a path with wildcards in ANY segment, walking with `list`. `/run/turns/*\/tiles.txt`
+ * is the natural cross-turn history query the briefing's own layout invites, and it used to be
+ * passed through as a literal. Returns null when the expansion is unusable (a missing directory,
+ * or absurdly many matches) so the caller can fall back to the literal.
+ */
+function expandSegments(text: string, list: (dir: string) => string[] | null): string[] | null {
+  const absolute = text.startsWith("/");
+  const parts = text.split("/").filter((p) => p !== "");
+  let bases: string[] = [absolute ? "" : "."];
+  for (const part of parts) {
+    const next: string[] = [];
+    if (!/[*?]/.test(part)) {
+      for (const base of bases) next.push(base === "." ? part : `${base}/${part}`);
+    } else {
+      const re = toRegExp(part);
+      for (const base of bases) {
+        const entries = list(base === "" ? "/" : base);
+        if (!entries) continue;
+        for (const name of entries.filter((n) => re.test(n)).sort()) {
+          next.push(base === "." ? name : `${base}/${name}`);
+        }
+      }
+    }
+    if (next.length === 0) return null;
+    if (next.length > 500) return null; // runaway; the literal error names what was typed
+    bases = next;
+  }
+  return bases;
+}
+
 export function expandGlobs(line: string, list: (dir: string) => string[] | null): string {
   if (!/[*?]/.test(line)) return line;
 
   return tokenize(line)
     .map(({ text, quoted }) => {
       if (quoted || !/[*?]/.test(text)) return text;
-      const slash = text.lastIndexOf("/");
-      const dir = slash < 0 ? "." : text.slice(0, slash) || "/";
-      const pattern = text.slice(slash + 1);
-      // Only the last segment globs. `/run/turns/*/tiles.txt` is left alone rather than
-      // half-expanded, because a wrong expansion is worse than no expansion.
-      if (/[*?]/.test(dir)) return literal(text);
-      const entries = list(dir);
-      if (!entries) return literal(text);
-      const re = toRegExp(pattern);
-      const hits = entries.filter((name) => re.test(name)).sort();
-      if (hits.length === 0) return literal(text);
-      const prefix = slash < 0 ? "" : `${text.slice(0, slash)}/`;
-      return hits.map((name) => `${prefix}${name}`).join(" ");
+      const hits = expandSegments(text, list);
+      // A pattern that matches nothing reaches the command as a literal, so the agent reads
+      // sh's own "No such file or directory: <what they typed>".
+      if (!hits || hits.length === 0) return literal(text);
+      return hits.join(" ");
     })
     .join(" ");
 }

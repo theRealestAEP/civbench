@@ -3,12 +3,17 @@ import assert from "node:assert/strict";
 import { mergeTiles, mergeForeignSettlements, type MergedSettlement } from "../src/dump/merge.ts";
 import type { RawTilesSnapshot, MergedTile, ForeignSettlement } from "../src/dump/types.ts";
 
+// `yields` is required on RawTile — a tile always produces something, even nothing. Two calls
+// here built a tile without it and went through an `as` cast that hid the gap.
 const tile = (x: number, y: number, vis: 1 | 2, extra: Record<string, unknown> = {}) => ({
-  x, y, vis, terrain: 1, biome: 2, feature: 0, resource: 0,
-  water: false, river: false, mountain: false, continent: 1, elevation: 100, ...extra,
+  x, y, vis, terrain: "grassland", biome: "temperate", feature: null, resource: null,
+  water: false, river: false, mountain: false, continent: "home", elevation: 100,
+  yields: null, ...extra,
 });
 
 const snapshot = (tiles: unknown[]): RawTilesSnapshot =>
+  // SAFETY: the helper above builds real RawTiles; this only wraps them in a snapshot so each
+  // test can pass a bare list.
   ({ width: 10, height: 10, tiles }) as RawTilesSnapshot;
 
 test("visible tiles take the engine's current values", () => {
@@ -20,6 +25,8 @@ test("visible tiles take the engine's current values", () => {
 
 test("fogged tiles keep what the player last saw, not what is true now", () => {
   const previous: MergedTile[] = [
+    // SAFETY: a tile as the merge would have left it last turn — the same fields mergeTiles
+    // writes, assembled by hand so the test can control what was "remembered".
     { ...tile(1, 1, 2), owner: 3, cityId: "c7", lastSeenTurn: 10 } as MergedTile,
   ];
   // The plot changed hands on turn 20, but this player has not looked since turn 10.
@@ -43,8 +50,8 @@ test("unrevealed tiles are absent, not blanked", () => {
 
 test("immutable fields survive fog", () => {
   const merged = mergeTiles(snapshot([tile(2, 2, 1, {})]), [], 42);
-  assert.equal(merged[0]!.terrain, 1, "terrain does not change unseen");
-  assert.equal(merged[0]!.biome, 2);
+  assert.equal(merged[0]!.terrain, "grassland", "terrain does not change unseen");
+  assert.equal(merged[0]!.biome, "temperate");
 });
 
 test("a remembered enemy city keeps its old owner while fogged", () => {
@@ -86,4 +93,26 @@ test("what is built on a plot is remembered through fog, not re-read", () => {
   );
   assert.deepEqual(later[0]!.built, ["IMPROVEMENT_FARM"], "fog must show the remembered build");
   assert.equal(later[0]!.lastSeenTurn, 5, "and say how stale that memory is");
+});
+
+// `undefined` and `null` are different values and the same word, so a plot that had never been
+// owned and still was not reported itself as having "changed hands" from none to none — three in
+// one turn, in the section an agent reads to find out what is new.
+test("a tile that did not change is not reported as changed", async () => {
+  const { renderDelta } = await import("../src/dump/snapshot.ts");
+  const previous = [{ ...tile(1, 1, 2), owner: null, cityId: null, lastSeenTurn: 5 } as MergedTile];
+  // Same plot, unowned both times — but as `undefined` rather than `null` this turn.
+  const now = [{ ...tile(1, 1, 2), lastSeenTurn: 6 } as unknown as MergedTile];
+  const raw = {
+    header: { turn: 6 },
+    units: { own: [], foreign: [] },
+    settlements: { own: [], foreign: [] },
+    pending: { items: [], blockingType: null },
+  } as unknown as Parameters<typeof renderDelta>[2];
+  const delta = renderDelta(now, previous, raw, {
+    tilesChanged: 0,
+    unitsChanged: 0,
+    settlementsChanged: 0,
+  });
+  assert.doesNotMatch(delta, /none -> none/, "nothing changed, so nothing should be reported");
 });

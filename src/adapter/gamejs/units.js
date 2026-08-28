@@ -13,6 +13,14 @@ const VISIBLE = RevealedStates.VISIBLE;
  * Fog is applied structurally: a foreign unit is described only on a plot this player can see
  * right now, and only from what the map itself shows. Its owner's private view of it is not read.
  */
+/** A rival's combat strength, which the map shows on its banner. */
+function enemyStrength(unit) {
+  try {
+    const melee = unit.Combat?.getMeleeStrength?.(false);
+    return typeof melee === "number" && melee > 0 ? { melee } : {};
+  } catch { return {}; }
+}
+
 const describe = (unit, own) => {
   const loc = unit.location ?? {};
   const base = {
@@ -24,9 +32,66 @@ const describe = (unit, own) => {
   };
   // A rival's unit shows what the map shows: what it is, where it stands, how hurt it looks.
   if (!own) {
-    return { ...base, ...withAliases(describeAll(unit, ["Movement", "Experience"])) };
+    return { ...base, ...withAliases(describeAll(unit, ["Movement", "Experience"])), ...enemyStrength(unit) };
   }
-  return { ...base, name: locText(unit.name ?? null), ...withAliases(describeAll(unit)) };
+  // Can it found a settlement where it stands, right now?
+  //
+  // Every agent in every run lost turn 1 to this: they see `moves=3` and `move_cost=1`, move the
+  // founder one tile, and the move spends everything — so FOUND_CITY is refused and the first
+  // turn is gone. A human's UI shows the found button lit or dark before they commit. This is
+  // that button.
+  // Combat strength, which no unit line has ever carried.
+  //
+  // `Combat_meleeStrength` was in the field alias table, but melee strength is a METHOD —
+  // `combat.getMeleeStrength(false)` — and describeAll drops functions, so the alias was dead and
+  // the property does not exist. An agent could not compare two of its own units or judge a fight
+  // without spending a separate combat-preview call. unit-actions.ts shows these for EVERY unit.
+  const combat = unit.Combat;
+  const strength = {};
+  if (combat) {
+    try {
+      const melee = combat.getMeleeStrength?.(false);
+      if (typeof melee === "number" && melee > 0) {
+        strength[combat.canAttack ? "melee" : "defense"] = melee;
+      }
+    } catch { /* not a combat unit */ }
+    for (const [key, field] of [["ranged", "rangedStrength"], ["bombard", "bombardStrength"], ["range", "attackRange"]]) {
+      const value = combat[field];
+      if (typeof value === "number" && value > 0) strength[key] = value;
+    }
+  }
+
+  // What this unit is already doing.
+  //
+  // A unit on a multi-turn operation — auto-explore, a queued path — refuses every new order with
+  // no reason the engine will give. Nothing on the unit line said so, so agents re-ordered them
+  // every turn for the rest of the match: 136 refusals across 8 units in one 26-turn run, every
+  // one of them the harness failing to mention that the unit was busy.
+  let activity = null;
+  try {
+    if (typeof UnitActivityTypes !== "undefined") {
+      for (const key of Object.keys(UnitActivityTypes)) {
+        if (UnitActivityTypes[key] === unit.activityType) { activity = key.toLowerCase(); break; }
+      }
+    }
+  } catch { activity = null; }
+  const busy = activity === "operation" || unit.hasPendingOperations === true;
+
+  let canFound = false;
+  try {
+    canFound = Game.UnitOperations.canStart(unit.id, UnitOperationTypes.FOUND_CITY, {}, false)?.Success === true;
+  } catch { canFound = false; }
+  return {
+    ...base,
+    name: locText(unit.name ?? null),
+    ...withAliases(describeAll(unit)),
+    ...strength,
+    // `orders` is what a human reads off the unit's banner. `busy` is the one that matters: a
+    // busy unit will refuse everything until it finishes, and does not need orders from you.
+    orders: activity && activity !== "awake" && activity !== "none" ? activity : null,
+    busy,
+    canFoundHere: canFound,
+  };
 };
 
 const own = [];

@@ -3,6 +3,7 @@
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { mergeTiles, mergeForeignSettlements, type MergedSettlement } from "./merge.ts";
+import { emptyHandles, type Handles } from "./handles.ts";
 import { renderHud, type MatchFacts } from "./hud.ts";
 import {
   tileLines, unitLines, settlementLines, playerLines, pendingLines, toJsonl,
@@ -13,9 +14,15 @@ import type { MergedTile, RawSnapshot } from "./types.ts";
 export type PlayerMemory = {
   tiles: MergedTile[] | null;
   foreignSettlements: MergedSettlement[] | null;
+  /** Readable names for units, kept for the life of the match. */
+  handles: Handles;
 };
 
-export const emptyMemory = (): PlayerMemory => ({ tiles: null, foreignSettlements: null });
+export const emptyMemory = (): PlayerMemory => ({
+  tiles: null,
+  foreignSettlements: null,
+  handles: emptyHandles(),
+});
 
 export type WrittenSnapshot = {
   dir: string;
@@ -33,7 +40,8 @@ export const pad = (turn: number) => `t${String(turn).padStart(4, "0")}`;
  * The point is to make the cheap read the useful one: an agent should be able to open delta.md,
  * see nothing surprising, and get on with playing rather than re-reading thousands of tile lines.
  */
-function renderDelta(
+// eslint-disable-next-line complexity -- a renderer: one conditional per delta section, in the order the agent reads them.
+export function renderDelta(
   tiles: MergedTile[],
   previous: MergedTile[] | null,
   raw: RawSnapshot,
@@ -54,8 +62,18 @@ function renderDelta(
     const old = before.get(key);
     if (!old) {
       newlySeen.push(key);
-    } else if (old.owner !== tile.owner || old.cityId !== tile.cityId) {
-      changed.push(`${key} owner ${old.owner ?? "none"} -> ${tile.owner ?? "none"}`);
+    } else {
+      // Compare what the agent would SEE, not the raw values. `undefined` and `null` are
+      // different values and the same word, so a plot that had never been owned and still was not
+      // reported itself as having "changed hands" from none to none — three of them in one turn,
+      // in the section an agent reads to find out what is new.
+      const was = old.owner ?? null;
+      const now = tile.owner ?? null;
+      const wasCity = old.cityId ?? null;
+      const nowCity = tile.cityId ?? null;
+      if (was !== now || wasCity !== nowCity) {
+        changed.push(`${key} owner ${was ?? "none"} -> ${now ?? "none"}`);
+      }
     }
   }
 
@@ -81,7 +99,7 @@ function renderDelta(
     lines.push("", "the game is waiting on you for:");
     for (const item of raw.pending.items) lines.push(`  ${item.summary ?? item.type}`);
   }
-  lines.push("", `(counts: ${counts.tilesChanged} tiles, ${counts.unitsChanged} units, ${counts.settlementsChanged} settlements)`);
+  lines.push("", `(changed tiles: ${counts.tilesChanged}; in sight: ${counts.unitsChanged} units, ${counts.settlementsChanged} settlements)`);
   return lines.join("\n") + "\n";
 }
 
@@ -98,14 +116,13 @@ function countChangedTiles(next: MergedTile[], previous: MergedTile[] | null): n
   return changed;
 }
 
-export function writeSnapshot(
-  agentDir: string,
-  raw: RawSnapshot,
-  memory: PlayerMemory,
-  messageCount = 0,
-  notesText?: string,
-  match?: MatchFacts,
-): WrittenSnapshot {
+/**
+ * The fog filter and carry-forward merge, shared by the turn-start snapshot and every mid-turn
+ * refresh. It used to live only in writeSnapshot, so refreshDump wrote raw.units.foreign
+ * UNFILTERED — every mid-turn refresh bypassed the second defense layer the comment below calls
+ * the invariant the whole benchmark rests on.
+ */
+export function applyFog(raw: RawSnapshot, memory: PlayerMemory) {
   const turn = raw.header.turn;
   const tiles = mergeTiles(raw.tiles, memory.tiles, turn);
 
@@ -118,11 +135,29 @@ export function writeSnapshot(
   const everSeen = new Set(tiles.map((t) => `${t.x},${t.y}`));
   const knownForeign = raw.settlements.foreign.filter((c) => everSeen.has(`${c.x},${c.y}`));
 
-  const foreignSettlements = mergeForeignSettlements(
-    knownForeign,
-    memory.foreignSettlements,
-    turn,
-  );
+  const foreignSettlements = mergeForeignSettlements(knownForeign, memory.foreignSettlements, turn);
+
+  return { tiles, visibleForeign, foreignSettlements };
+}
+
+export function writeSnapshot(
+  agentDir: string,
+  raw: RawSnapshot,
+  memory: PlayerMemory,
+  messageCount = 0,
+  notesText?: string,
+  match?: MatchFacts,
+): WrittenSnapshot {
+  const turn = raw.header.turn;
+  const { tiles, visibleForeign, foreignSettlements } = applyFog(raw, memory);
+
+  // Retire the handle of any unit that no longer exists, so a recycled engine id can never
+  // silently inherit a dead unit's name. Ordinals never restart, so a retired handle is never
+  // reassigned either — a unit seen again later gets a fresh name.
+  const liveIds = new Set(raw.units.own.map((u) => u.id));
+  for (const id of Object.keys(memory.handles.units)) {
+    if (!liveIds.has(id)) delete memory.handles.units[id];
+  }
 
   const counts = {
     tilesChanged: countChangedTiles(tiles, memory.tiles),
@@ -146,7 +181,7 @@ export function writeSnapshot(
   // Text for grep and sed; JSONL for jq. Same records, same order (§6.1).
   const files: Array<[string, string[], unknown[]]> = [
     ["tiles", tileLines(tiles), tiles],
-    ["units", unitLines(raw.units.own, visibleForeign), [...raw.units.own, ...visibleForeign]],
+    ["units", unitLines(raw.units.own, visibleForeign, memory.handles), [...raw.units.own, ...visibleForeign]],
     ["settlements", settlementLines(raw.settlements.own, foreignSettlements), [...raw.settlements.own, ...foreignSettlements]],
     ["players", playerLines(raw.players.known), raw.players.known],
   ];
@@ -156,6 +191,8 @@ export function writeSnapshot(
   }
 
   writeFileSync(join(turnDir, "pending.txt"), pendingLines(raw.pending).join("\n") + "\n");
+  // The briefing promises a .jsonl twin for the /current files; pending had none.
+  writeFileSync(join(turnDir, "pending.jsonl"), toJsonl(raw.pending.items) + "\n");
 
   // The delta. Promised by the HUD on every turn and, until now, never written — so agents
   // re-read the entire dump each turn instead. Two thirds of an agent's commands were `cat`.
@@ -177,16 +214,22 @@ export function writeSnapshot(
     settlementsText: read("settlements.txt"),
     messagesText: read("messages.txt"),
     notesText: notesText,
+    playersText: read("players.txt"),
+    // Written after the snapshot, so this reads last turn's on turn one and the current one after.
+    actionsText: read("actions.txt"),
   }, match);
   writeFileSync(join(turnDir, "hud.txt"), hud + "\n");
 
   // One line per turn, so an agent can find the right turn before reading it (§8).
   const indexPath = join(agentDir, "index.md");
   if (!existsSync(indexPath)) writeFileSync(indexPath, "# turn index\n");
+  // The label matches the directory name (t0004, not t4), so a line can be copied into a path.
   appendFileSync(
     indexPath,
-    `- t${turn}: age=${raw.header.age} gold=${raw.header.gold ?? "?"} settlements=${raw.header.settlements.total ?? "?"} units=${raw.header.unitCount} pending=${raw.pending.items.length}\n`,
+    `- ${pad(turn)}: age=${raw.header.age} gold=${raw.header.gold ?? "?"} settlements=${raw.header.settlements.total ?? "?"} units=${raw.header.unitCount} pending=${raw.pending.items.length}\n`,
   );
 
-  return { dir: turnDir, hud, memory: { tiles, foreignSettlements }, counts };
+  // handles carries forward: a handle assigned on turn 3 must still name the same unit on turn 30,
+  // or a journal entry about "scout-1" becomes a lie.
+  return { dir: turnDir, hud, memory: { tiles, foreignSettlements, handles: memory.handles }, counts };
 }

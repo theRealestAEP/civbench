@@ -45,7 +45,7 @@ const outcomes = await runMatch(
   server,
   runDir,
   seats,
-  { turnLimit, stallStrikes: config.harness.stallStrikes },
+  { turnLimit },
   (line) => console.log(line),
 );
 

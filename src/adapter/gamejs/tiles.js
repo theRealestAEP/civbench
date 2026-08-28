@@ -11,7 +11,37 @@ const H = GameplayMap.getGridHeight();
 const HIDDEN = RevealedStates.HIDDEN;
 const VISIBLE = RevealedStates.VISIBLE;
 
+/** Movement cost and defence for a terrain, memoised: a full map asks this thousands of times. */
+const __terrain = new Map();
+function terrainCost(hash) {
+  if (__terrain.has(hash)) return __terrain.get(hash);
+  let out = {};
+  try {
+    const row = GameInfo.Terrains?.lookup?.(hash);
+    if (row) {
+      out = {
+        moveCost: row.MovementCost ?? null,
+        defense: row.DefenseModifier || null,
+        impassable: row.Impassable === true ? true : null,
+      };
+    }
+  } catch { out = {}; }
+  __terrain.set(hash, out);
+  return out;
+}
+
 const out = [];
+/** Your settlements, with their locations, so the growth check below can skip distant plots. */
+const OWN_CITIES = [];
+try {
+  for (const cid of Players.get(PLAYER_ID)?.Cities?.getCityIds?.() ?? []) {
+    const city = Cities.get(cid);
+    if (city?.location) {
+      OWN_CITIES.push({ id: cid, name: String(cid.id ?? cid), x: city.location.x, y: city.location.y });
+    }
+  }
+} catch { /* no settlements yet */ }
+
 for (let y = 0; y < H; y++) {
   for (let x = 0; x < W; x++) {
     const vis = GameplayMap.getRevealedState(PLAYER_ID, x, y);
@@ -30,6 +60,13 @@ for (let y = 0; y < H; y++) {
       mountain: GameplayMap.isMountain(x, y),
       continent: shortName(typeName("Continents", GameplayMap.getContinentType(x, y))),
       elevation: GameplayMap.getElevation(x, y),
+      // What it costs to walk here, and what it is worth to defend.
+      //
+      // The Terrains table carries these and we export it, but joining a tile to it by hand is
+      // work the agent should not be doing mid-move. One agent moved a warrior and then wrote
+      // "the warrior moves two spaces each — did we use six moves?", because nothing on the tile
+      // said what a step costs.
+      ...terrainCost(GameplayMap.getTerrainType(x, y)),
       // What the plot is worth.
       //
       // A human reads these off the map and the plot tooltip; getPlotYields() in the UI's
@@ -67,6 +104,42 @@ for (let y = 0; y < H; y++) {
         }
         tile.built = built.length > 0 ? built : null;
       } catch { tile.built = null; }
+      // A discovery sitting on this plot.
+      //
+      // A human sees these highlighted on the map — discovery-layer.ts draws an overlay on every
+      // one. We showed them nowhere, and the engine refuses to let a unit skip its turn while one
+      // is adjacent: "There is a Discovery nearby!", seven times across six turns, against an
+      // agent with no way to find out where "nearby" was or what to do about it. Walk onto it.
+      //
+      // getHiddenFilteredConstructibles is the call the game's own layer makes — a discovery is a
+      // constructible flagged `Discovery`, and it does not come back from getConstructibles.
+      // Can one of your settlements grow onto this plot?
+      //
+      // A human sees the claimable ring highlighted when a city grows. We showed nothing, so an
+      // agent placing a citizen guessed a coordinate, was refused, and only then got the list —
+      // three times in six turns, each costing an action. `canStart` is the engine's own mask, so
+      // this is the same answer `civ expand` gives, just visible before you have to ask.
+      // Only plots near one of your settlements can be asked about. A city can never grow onto a
+      // plot four rings out, and asking the engine anyway would mean a canStart call for every
+      // revealed tile times every city — well over a thousand per snapshot, on the same thread
+      // that runs the game.
+      tile.expandFor = null;
+      for (const near of OWN_CITIES) {
+        if (Math.abs(near.x - x) > 3 || Math.abs(near.y - y) > 3) continue;
+        let ok = false;
+        try { ok = Game.CityCommands.canStart(near.id, CityCommandTypes.EXPAND, { X: x, Y: y }, false)?.Success === true; }
+        catch { ok = false; }
+        if (ok) { tile.expandFor = near.name; break; }
+      }
+      try {
+        let discovery = null;
+        for (const cid of MapConstructibles.getHiddenFilteredConstructibles(x, y) ?? []) {
+          const instance = Constructibles.getByComponentID(cid);
+          const info = instance ? GameInfo.Constructibles.lookup(instance.type) : null;
+          if (info?.Discovery) { discovery = info.ConstructibleType; break; }
+        }
+        tile.discovery = discovery;
+      } catch { tile.discovery = null; }
     }
     out.push(tile);
   }

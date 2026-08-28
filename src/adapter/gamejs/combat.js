@@ -13,12 +13,18 @@ if (!unit) return { error: `unit ${UNIT_ID} not found for p${PLAYER_ID}` };
 
 const args = { X: TARGET_X, Y: TARGET_Y, Location: { x: TARGET_X, y: TARGET_Y } };
 
-// Install the result catcher once per page, not once per call.
+// Install the result catcher once per page, not once per call. The stash carries the KEY of the
+// request that fired the simulation: with one bare `last` slot, two previews in flight (two
+// seats, or one seat asking twice) returned whichever landed last, silently attributed to the
+// wrong attack.
+const combatKey = `${PLAYER_ID}:${UNIT_ID}:${TARGET_X},${TARGET_Y}`;
 if (!globalThis.__civbenchCombat) {
-  globalThis.__civbenchCombat = { last: null };
+  globalThis.__civbenchCombat = { pendingKey: null, key: null, results: null };
   try {
     engine.on("SimulateCombatResult", (results) => {
-      globalThis.__civbenchCombat.last = results;
+      const stash = globalThis.__civbenchCombat;
+      stash.key = stash.pendingKey;
+      stash.results = results;
     });
   } catch (err) {
     globalThis.__civbenchCombat.error = String(err);
@@ -26,8 +32,10 @@ if (!globalThis.__civbenchCombat) {
 }
 
 if (MODE === "read") {
-  const last = globalThis.__civbenchCombat.last;
-  return last ? { ready: true, results: last } : { ready: false };
+  const stash = globalThis.__civbenchCombat;
+  return stash.results && stash.key === combatKey
+    ? { ready: true, results: stash.results }
+    : { ready: false };
 }
 
 let combatType = null;
@@ -45,7 +53,9 @@ if (combatType === CombatTypes.NO_COMBAT) {
 }
 
 // Ask the engine to work out the damage. The answer lands on the event above.
-globalThis.__civbenchCombat.last = null;
+globalThis.__civbenchCombat.pendingKey = combatKey;
+globalThis.__civbenchCombat.key = null;
+globalThis.__civbenchCombat.results = null;
 try {
   Game.Combat.simulateAttackAsync(unit.id, { ...args, CombatType: combatType });
 } catch (err) {

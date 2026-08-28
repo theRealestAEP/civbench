@@ -21,11 +21,11 @@ async function makeRun(): Promise<string> {
   const server = new MatchServer(new GameAdapter(new FakeBridge(makeWorld({ seats: 2 }))), runDir, configs);
   await runMatch(server, runDir, configs.map((config) => ({ config, brain: new ScriptedBrain() })), {
     turnLimit: 3,
-    stallStrikes: 3,
   });
   return runDir;
 }
 import { updateRatings, leaderboard, ANCHOR, START_RATING, K_FACTOR } from "../src/score/elo.ts";
+import type { Ratings } from "../src/score/elo.ts";
 
 test("scoring reads a real run and separates outcome from hygiene", async () => {
   const metrics = scoreRun(await makeRun());
@@ -123,7 +123,9 @@ test("a tie splits the difference rather than picking a winner", () => {
 });
 
 test("the anchor plays matches without ever moving", () => {
-  let ratings = { [ANCHOR]: { rating: START_RATING, matches: 0 } };
+  // Annotated, because inference from the first assignment alone gives a type with only the
+  // anchor in it — and then the challenger this test is about is not allowed to exist.
+  let ratings: Ratings = { [ANCHOR]: { rating: START_RATING, matches: 0 } };
   for (let i = 0; i < 5; i++) {
     ratings = updateRatings(ratings, {
       ranking: [{ name: "challenger", rank: 1 }, { name: ANCHOR, rank: 2 }],
@@ -153,7 +155,10 @@ test("the replay escapes agent-controlled text", async () => {
         result: { ok: false, code: "</script><script>alert(2)</script>" },
       },
     ],
-  } as never);
+    // SAFETY: this payload is deliberately hostile — an agent-chosen operation name carrying a
+    // closing script tag. It is shaped like ReplayData but typed loosely so the test can put text
+    // in fields the type narrows; the assertions below are about escaping, not about the shape.
+  } as unknown as Parameters<typeof renderReplayPage>[0], "escape test");
   // The payload may appear as DATA — it is a record of what the agent did. What it must never do
   // is escape its context: no raw closing script tag, and no unescaped `<` in the data blob.
   assert.ok(!html.includes("</script><script>"), "an agent must not break out of the data block");

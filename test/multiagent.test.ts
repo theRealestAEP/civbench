@@ -28,17 +28,16 @@ function makeMatch() {
 
 test("both seats play, each in its own directory", async () => {
   const { runDir, server, seats } = makeMatch();
-  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 2, stallStrikes: 3 });
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 2 });
   assert.equal(outcomes.length, 2);
   for (const outcome of outcomes) {
     assert.equal(outcome.turnsPlayed, 2);
-    assert.equal(outcome.forfeited, false);
   }
 });
 
 test("the two seats see genuinely different maps", async () => {
   const { runDir, server, seats } = makeMatch();
-  await runMatch(server, runDir, seats, { turnLimit: 1, stallStrikes: 3 });
+  await runMatch(server, runDir, seats, { turnLimit: 1 });
   const alpha = readFileSync(join(runDir, "agents/alpha/turns/t0042/tiles.txt"), "utf8");
   const beta = readFileSync(join(runDir, "agents/beta/turns/t0042/tiles.txt"), "utf8");
 
@@ -51,13 +50,14 @@ test("the two seats see genuinely different maps", async () => {
 
 test("neither seat's units appear in the other's dump", async () => {
   const { runDir, server, seats } = makeMatch();
-  await runMatch(server, runDir, seats, { turnLimit: 1, stallStrikes: 3 });
+  await runMatch(server, runDir, seats, { turnLimit: 1 });
   const alpha = readFileSync(join(runDir, "agents/alpha/turns/t0042/units.txt"), "utf8");
   const beta = readFileSync(join(runDir, "agents/beta/turns/t0042/units.txt"), "utf8");
-  assert.ok(alpha.includes("unit 10"), "alpha sees its own unit");
-  assert.ok(!alpha.includes("20"), "beta's unit is out of sight");
-  assert.ok(beta.includes("unit 20"));
-  assert.ok(!beta.includes("unit 10"));
+  // Units lead with a readable handle now; the engine id is on the same line as engine_id=.
+  assert.ok(alpha.includes("engine_id=10"), "alpha sees its own unit");
+  assert.ok(!alpha.includes("engine_id=20"), "beta's unit is out of sight");
+  assert.ok(beta.includes("engine_id=20"));
+  assert.ok(!beta.includes("engine_id=10"));
 });
 
 test("a seat cannot reach the other seat's files from inside its sandbox", async () => {
@@ -77,6 +77,32 @@ test("a seat cannot reach the other seat's files from inside its sandbox", async
     assert.ok(
       result.exitCode !== 0 || !result.stdout.includes("tile "),
       `escape succeeded: ${attempt} -> ${result.stdout.slice(0, 80)}`,
+    );
+  }
+});
+
+// The built-in commands go through the read-only VFS, which already refuses `..` — but the
+// CUSTOM tools (grep, head, tail, sed, cut, test, find) resolve paths themselves, and their
+// resolver used to check only the prefix before join() normalised the dots away. `grep x
+// /run/../../events.jsonl` read the event log agents must never see, and a rival's notes.
+test("the custom shell tools cannot traverse out of their mounts either", async () => {
+  const { runDir, server } = makeMatch();
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes/alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  for (const attempt of [
+    "grep -c . /run/../../events.jsonl",
+    "head -5 /run/../../events.jsonl",
+    "sed -n '1,5p' /run/../../events.jsonl",
+    "grep -c tile /run/../beta/turns/t0042/tiles.txt",
+    "cut -d' ' -f1 /notes/../../events.jsonl",
+  ]) {
+    const result = await session.exec(attempt);
+    assert.ok(
+      result.exitCode !== 0 && !result.stdout.trim(),
+      `custom-tool escape succeeded: ${attempt} -> ${result.stdout.slice(0, 80)}`,
     );
   }
 });
