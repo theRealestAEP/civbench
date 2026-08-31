@@ -103,7 +103,7 @@ export function writeManifest(
         game: config.game,
         controlMode: config.controlMode,
         harnessVersion: process.env.npm_package_version ?? "0.0.1",
-        agents: config.agents.map((a) => ({ name: a.name, brain: a.brain, budget: a.budget })),
+        agents: config.agents.map((a) => ({ name: a.name, brain: a.brain, budget: a.budget, voice: a.voice })),
       },
       null,
       2,

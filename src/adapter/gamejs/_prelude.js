@@ -76,6 +76,24 @@ const OPERATION_ENUMS = {
 };
 
 /** Name -> whatever the engine accepts. Unknown names pass through so the engine can answer. */
+/**
+ * Who owns a foreign unit or settlement, in words. Mirrors the game's own guards: a valid player id
+ * (>= 0), civilization name for a major, and `independentName(id)` ONLY for a confirmed independent —
+ * the game never calls it otherwise. All calls match the source's arity, which native bindings
+ * require (a wrong-arity call segfaults, uncatchably).
+ */
+function ownerIdentity(ownerId) {
+  try {
+    if (!(ownerId >= 0)) return {};
+    const pl = Players.get(ownerId);
+    if (!pl) return {};
+    if (pl.isMajor) return { owner_kind: "civilization", owner_name: locText(pl.civilizationName ?? pl.leaderName ?? null) };
+    let name = null;
+    try { if (pl.isIndependent) name = Game.IndependentPowers?.independentName?.(ownerId) ?? null; } catch { name = null; }
+    return { owner_kind: pl.isIndependent ? "city_state" : "free", owner_name: locText(name) };
+  } catch { return {}; }
+}
+
 function operationValue(kind, name) {
   const spec = OPERATION_ENUMS[kind];
   if (!spec) return name;

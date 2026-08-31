@@ -86,6 +86,7 @@ function adapterArgsFor(request: ActionRequest) {
     ACTION_TYPE: request.actionType,
     ARGS: request.args ?? {},
     THING: request.args?.thing ?? null,
+    BUILD_PLOT: request.args?.plot ?? null,
     OTHER_PLAYER: request.args?.other ?? null,
     ACTION: request.args?.action ?? null,
     MODE: request.args?.mode ?? null,
@@ -135,6 +136,25 @@ export class MatchServer {
   #lastTurnSeen = new Map<number, number>();
   /** The turn-start change counts, so `civ hud` can repeat them instead of printing zeros. */
   #lastCounts = new Map<number, HudCounts>();
+  /** When this player's last engine mutation was dispatched, for write pacing. */
+  #lastMutationAt = new Map<number, number>();
+
+  /**
+   * A floor between consecutive engine writes for one seat.
+   *
+   * All five identical engine SIGSEGVs (AsyncWorker1, same stack) sat inside a WRITE BURST:
+   * 50-160 actions in the final two minutes, whole-army skip sweeps and move orders landing
+   * milliseconds apart, interleaved with turn-complete requests. A human cannot click that
+   * fast, and the engine's async workers were visibly never hardened for it. 150ms per write
+   * costs ~1.5s on a busy turn — noise next to a model round trip — and dissolves the burst.
+   */
+  async #paceMutation(playerId: number): Promise<void> {
+    const last = this.#lastMutationAt.get(playerId) ?? 0;
+    const wait = 150 - (Date.now() - last);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    this.#lastMutationAt.set(playerId, Date.now());
+  }
+
   /**
    * Count of this player's APPLIED mutations, ever. The legality sweeps (whatcan.js,
    * actions.js) key their caches on it: same turn + same count means the world has not moved,
@@ -195,6 +215,37 @@ export class MatchServer {
     return this.#agents.get(playerId)?.name ?? `p${playerId}`;
   }
 
+  /** Seats whose save-carried unit orders have been sanitized since this process started. */
+  #sanitized = new Set<number>();
+
+  /**
+   * Cancel every queued unit operation this seat carried INTO the session — once, at its first
+   * turn after a launch or resume.
+   *
+   * A move the engine accepts but cannot path stays in the unit's queue as a zombie, and
+   * ZOMBIES TRAVEL IN SAVES: the same autosave detonated the engine at the same turn in two
+   * consecutive processes, after cleanup for newly created zombies was already live. Cancelling
+   * a healthy multi-turn move too is the accepted cost — the agent re-issues it for one action,
+   * while a zombie left in the queue eventually kills the game.
+   */
+  async #sanitizeCarriedOrders(playerId: number, units: Array<{ id: string; hasPendingOperations?: boolean }>): Promise<void> {
+    if (this.#sanitized.has(playerId)) return;
+    this.#sanitized.add(playerId);
+    for (const unit of units) {
+      if (unit.hasPendingOperations !== true) continue;
+      await this.#paceMutation(playerId);
+      await this.#adapter
+        .run<ActionResult>("act", playerId, adapterArgsFor({
+          kind: "unit_command",
+          targetId: unit.id,
+          actionType: "UNITCOMMAND_CANCEL",
+          args: {},
+        }))
+        .catch(() => undefined);
+      this.logCorrection(playerId, "CARRIED_ORDER_CANCELLED", `unit ${unit.id}`);
+    }
+  }
+
   /** Read the game for one player and write their turn files. Returns the HUD to push. */
   async beginTurn(playerId: number): Promise<string> {
     // Clear the hotseat handoff curtain before reading. Cosmetic only, but without it the match
@@ -204,6 +255,7 @@ export class MatchServer {
     await this.#adapter.run("focusseat", playerId).catch(() => undefined);
 
     const raw = await this.#adapter.snapshot(playerId);
+    await this.#sanitizeCarriedOrders(playerId, raw.units.own);
     const unread = this.#chat.unreadFor(this.#nameOf(playerId));
     // notes.md lives in the writable mount, which the snapshot writer does not know about.
     let notesText: string | undefined;
@@ -416,7 +468,12 @@ export class MatchServer {
    *
    * Throttled and fire-and-forget: a spectator overlay must never slow a turn down or fail one.
    */
+  /** Set false to disable the overlay entirely (--no-spectate). The overlay is a UI-DOM eval
+   *  every 700ms during agent activity — the A/B lever for the engine-crash investigation. */
+  overlayEnabled = true;
+
   showOnScreen(playerId: number, name: string, update: { thinking?: string; action?: string }): void {
+    if (!this.overlayEnabled) return;
     if (update.thinking) this.#lastThinking.set(playerId, update.thinking);
     if (update.action) this.#lastAction.set(playerId, update.action);
 
@@ -534,16 +591,29 @@ export class MatchServer {
    * One method for build, tech, civic and government, because they differ only in which argument
    * shape the engine wants — and that difference belongs in one table, not in four call paths.
    */
-  async choose(playerId: number, what: string, value?: string, targetId?: string): Promise<ChooseResult> {
+  async choose(
+    playerId: number,
+    what: string,
+    value?: string,
+    targetId?: string,
+    /** `x,y` for a building whose plot the agent wants to choose (see choose.js build.args). */
+    plot?: string,
+  ): Promise<ChooseResult> {
     if (!value) {
       return this.#adapter.run<ChooseResult>("choose", playerId, {
         WHAT: what,
         THING: null,
         TARGET_ID: targetId ?? null,
         BLOCKER: null,
+        BUILD_PLOT: plot ?? null,
       });
     }
-    return this.act(playerId, { kind: "choose", actionType: what, targetId, args: { thing: value } });
+    return this.act(playerId, {
+      kind: "choose",
+      actionType: what,
+      targetId,
+      args: { thing: value, plot: plot ?? null },
+    });
   }
 
   /** What you can do to another civilization, and doing it. */
@@ -708,6 +778,29 @@ export class MatchServer {
    * Without this the event log said ok:true for an action the agent was told failed, and the
    * record and the transcript disagreed.
    */
+  /**
+   * Cancel a unit's queued orders — harness cleanup, off the agent's budget.
+   *
+   * A MOVE_TO the engine accepts but cannot path leaves a ZOMBIE entry in the unit's operation
+   * queue: the unit turns unskippable (the famous stuck warriors held queue=1 for 17 turns),
+   * agents grind refusal loops around it, and the engine's async worker re-chews the dead entry
+   * every cycle — the strongest surviving correlate of seven identical engine SIGSEGVs, with
+   * unpathable moves present in every crash window. The harness watched the dead order get
+   * created (DID_NOT_MOVE), so the harness clears it.
+   */
+  async cancelDeadOrder(playerId: number, unitId: string): Promise<void> {
+    await this.#paceMutation(playerId);
+    await this.#adapter
+      .run<ActionResult>("act", playerId, adapterArgsFor({
+        kind: "unit_command",
+        targetId: unitId,
+        actionType: "UNITCOMMAND_CANCEL",
+        args: {},
+      }))
+      .catch(() => undefined);
+    this.logCorrection(playerId, "DEAD_ORDER_CANCELLED", `unit ${unitId}`);
+  }
+
   logCorrection(playerId: number, code: string, message: string): void {
     this.#log.append({
       turn: this.lastSnapshotTurn(),
@@ -792,6 +885,36 @@ export class MatchServer {
    * fifteen-turn game with one line of memory and three with none — in the one file the briefing
    * calls "the only thing that survives between turns". This cannot overwrite.
    */
+  /** The player's resources and the settlements that can take them (for NOTIFICATION_ASSIGN_NEW_RESOURCES). */
+  async resources(
+    playerId: number,
+  ): Promise<{ resources: Array<{ name: string; index: number }>; cities: Array<{ name: string; id: string }> }> {
+    return this.#adapter
+      .run<{ resources: Array<{ name: string; index: number }>; cities: Array<{ name: string; id: string }> }>(
+        "resource",
+        playerId,
+        { MODE: "list", RESOURCE: null, CITY: null },
+      )
+      .catch(() => ({ resources: [], cities: [] }));
+  }
+
+  /** Assign one resource to a settlement. ASSIGN_RESOURCE is a player operation, logged as one. */
+  async assignResource(playerId: number, resource: string, city: string): Promise<ActionResult> {
+    const request: ActionRequest = { kind: "player_operation", actionType: "ASSIGN_RESOURCE", args: { resource, city } };
+    const result = await this.#adapter
+      .run<ActionResult>("resource", playerId, { MODE: "assign", RESOURCE: resource, CITY: city })
+      .catch((err) => ({ ok: false, code: "ENGINE_INTERNAL", message: String(err).slice(0, 120) }));
+    this.#log.append({
+      turn: this.lastSnapshotTurn(),
+      player: playerId,
+      playerName: this.#nameOf(playerId),
+      kind: "action",
+      request,
+      result,
+    });
+    return result;
+  }
+
   async note(playerId: number, text: string): Promise<ActionResult> {
     const line = text.trim();
     if (line.length === 0) return { ok: false, code: "EMPTY_NOTE", message: "nothing to write" };
@@ -938,6 +1061,39 @@ export class MatchServer {
       }, { logKind: "action_refused" });
     }
 
+    // An operation that has a purpose-built command, reached the raw way.
+    //
+    // These fail almost every time — 29/29 CHANGE_GOVERNMENT, 31/33 SET_TECH_TREE_NODE, 22/28
+    // CITYCOMMAND_EXPAND — because each wants a differently encoded argument (a row index here,
+    // a hash there, a plot for a building) and only choose.js knows which. Meanwhile the same
+    // decisions through `civ government` / `civ tech` / `civ expand` succeed ~90% of the time.
+    // So the raw attempt is not refused into silence: it is redirected to the command that works.
+    const REDIRECTS: Array<[RegExp, string]> = [
+      [/^CHANGE_GOVERNMENT$/, "civ government <TYPE>"],
+      [/^SET_TECH_TREE_NODE$/, "civ tech <NODE>"],
+      [/^SET_CULTURE_TREE_NODE$/, "civ civic <NODE>"],
+      [/^CHANGE_TRADITION$/, "civ tradition <TYPE>"],
+      [/^CITYCOMMAND_EXPAND$/, "civ expand <city> <x,y>"],
+      [/^CITYOPERATION_BUILD$/, "civ build <city> <THING>"],
+      [/^SET_AGE_TRANSITION_DATA$/, "civ age finish"],
+      [/^CHOOSE_NARRATIVE_STORY_DIRECTION$/, "civ story <ANSWER>"],
+      [/^CHOOSE_GOLDEN_AGE$/, "civ celebration <TYPE>"],
+      [/^FOUND_PANTHEON$/, "civ pantheon <BELIEF>"],
+      [/^BUY_ATTRIBUTE_TREE_NODE$/, "civ attribute <NODE>"],
+      [/^UNITCOMMAND_PROMOTE$/, "civ promote <unit>"],
+    ];
+    const redirect = REDIRECTS.find(([pattern]) => pattern.test(request.actionType));
+    if (redirect && request.kind !== "choose") {
+      return this.#refuseAction(playerId, request, {
+        ok: false,
+        code: "USE_THE_COMMAND",
+        message:
+          `${request.actionType} needs an argument encoding that differs per operation, so the ` +
+          `raw form nearly always fails silently. Use \`${redirect[1]}\` — it knows the encoding.`,
+        hint: `run \`${redirect[1].split(" ").slice(0, 2).join(" ")}\` with no value to see the options`,
+      }, { logKind: "action", spends: state });
+    }
+
     // Engine internals with no UI button. One returned ok once and taught an agent a 17-turn
     // ritual; a human is never offered these, so refusing them is parity, not a limit.
     if (ENGINE_INTERNAL_OPS.test(request.actionType)) {
@@ -1005,6 +1161,7 @@ export class MatchServer {
     }
 
     state.actionsUsed++;
+    await this.#paceMutation(playerId);
     const result = await this.#adapter.run<ActionResult>(
       scriptForAction(request.kind),
       playerId,
@@ -1227,6 +1384,7 @@ export class MatchServer {
     // this turn, but the replay and the run report do.
     await this.settleDump(playerId).catch(() => undefined);
     if (forced) await this.#clearEndTurnBlockers(playerId);
+    await this.#paceMutation(playerId);
     const result = await this.#adapter.run<EndTurnRun>("endturn", playerId, { FORCED: forced, CLEAR_ONLY: false });
     // A refused end-turn is not the end of the turn. Saying otherwise left the seat active in the
     // game while the match moved on, and the round then waited forever for it to advance.
@@ -1251,7 +1409,11 @@ export class MatchServer {
     state: TurnState | undefined,
   ): Promise<void> {
     this.#log.append({
-      turn: await this.#safeTurn(),
+      // The turn this SEAT began, not a live query. #safeTurn() reads the engine's current turn,
+      // and ending the last seat's turn advances that counter — so the end could be logged one
+      // turn ahead of its begin. That skewed the very first turn's last seat: begin=1, end=2, and
+      // the commentator's turn reader then dropped the seat from turn 1 entirely.
+      turn: this.#lastTurnSeen.get(playerId) ?? (await this.#safeTurn()),
       player: playerId,
       playerName: this.#nameOf(playerId),
       kind: forced ? "turn_end_forced" : "turn_end",
@@ -1319,34 +1481,70 @@ export class MatchServer {
    * Elimination only counts when this match HAS rivals: a one-seat harness test is not "decided"
    * at turn 1 because its only player is the last one standing.
    */
-  async gameOver(): Promise<{ over: boolean; why: string | null }> {
+  /**
+   * Submit the Age-transition "done" for every seat that will accept it, and return how many did.
+   *
+   * A non-final Age ends by transitioning, during which NO seat is active — so the run loop is
+   * offered no turn and would stall to its round cap. This lets the harness finish the transition
+   * as a last resort (canStart-gated, so it is a no-op outside a transition), guaranteeing the
+   * match cannot deadlock even if every agent idles.
+   */
+  async finishAgeTransitions(seatIds: number[]): Promise<number> {
+    let finished = 0;
+    for (const id of seatIds) {
+      const result = await this.#adapter.run<{ finished: boolean }>("agefinish", id).catch(() => null);
+      if (result?.finished) finished += 1;
+    }
+    return finished;
+  }
+
+  async gameOver(): Promise<{ over: boolean; why: string | null; victory: boolean }> {
     const seen = await this.#adapter
-      .run<{ victories: Array<{ team: number | null; type: string | null }>; aliveMajors: number }>(
-        "gameover", 0,
-      )
+      .run<{
+        victories: Array<{ team: number | null; type: string | null; winners: string[] }>;
+        ageOver: boolean;
+        isFinalAge: boolean;
+        ageName: string | null;
+        aliveMajors: number;
+      }>("gameover", 0)
       .catch(() => null);
-    if (!seen) return { over: false, why: null };
+    if (!seen) return { over: false, why: null, victory: false };
+
+    // CIV's own call. If getVictories() named a victory, that is THE result — report it faithfully,
+    // whoever won and however hollow it looks. Single-age countdowns award a dominance victory by
+    // score (not legacy), so a 0-legacy game can still have a real CIV-declared winner.
     const claimed = seen.victories[0];
     if (claimed) {
-      return {
-        over: true,
-        why: `${claimed.type ?? "a victory"} claimed by team ${claimed.team ?? "?"}`,
-      };
+      const who = claimed.winners.length > 0 ? claimed.winners.join(", ") : `team ${claimed.team ?? "?"}`;
+      const kind = claimed.type ? claimed.type.replace(/^VICTORY_/, "").toLowerCase() : "";
+      return { over: true, why: `${who} won${kind ? ` a ${kind} victory` : ""} (CIV declared it)`, victory: true };
     }
+
+    // No CIV victory. The remaining checks only decide when to STOP the loop — they never name a
+    // winner, because that is CIV's call, not the harness's.
     const seats = this.#agents.size;
-    if (seats > 1 && seen.aliveMajors >= 0 && seen.aliveMajors <= 1) {
-      return { over: true, why: `only ${seen.aliveMajors} major civilization left alive` };
+    // Only the FINAL age ending ends the match. A non-final age ending is an age TRANSITION — the
+    // game continues into the next age — so it must NOT be reported as game-over (that once ended a
+    // multi-age match prematurely). A single-age game's one age is its final age.
+    if (seen.ageOver && seen.isFinalAge) {
+      return { over: true, why: `the ${seen.ageName ?? "final"} age ended; CIV declared no victory`, victory: false };
     }
-    return { over: false, why: null };
+    if (seats > 1 && seen.aliveMajors >= 0 && seen.aliveMajors <= 1) {
+      return { over: true, why: `only ${seen.aliveMajors} major civ left; awaiting CIV's victory call`, victory: false };
+    }
+    return { over: false, why: null, victory: false };
   }
 
   /** The match's decisive moment, once, in the record. */
-  logGameOver(why: string): void {
+  logGameOver(why: string, victory: boolean): void {
     this.#log.append({
       turn: this.lastSnapshotTurn(),
       player: null,
       kind: "game_over",
       message: why,
+      // Distinguishes a real win from an age simply ending with no victor, so the report never
+      // credits a hollow age-end as a victory again.
+      victory,
     });
   }
 

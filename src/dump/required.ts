@@ -27,7 +27,18 @@ const ANSWERS: Array<[RegExp, string]> = [
   // Advisor warnings are informational but can block; dismissal usually clears them, and when it
   // does not, activating the notification does.
   [/ADVISOR_WARNING/, "civ dismiss — and if it will not clear, civ open <id>"],
-  [/CRISIS/, "civ what-can player"],
+  // An Age crisis deals you CRISIS POLICY CARDS, and they go in crisis culture slots — the same
+  // policy screen as any tradition (model-policies.ts reads CRISIS_CULTURE_SLOT alongside the
+  // others). The old answer here was `civ what-can player`, a placeholder that answers nothing:
+  // NOTIFICATION_CRISIS blocked the end of a turn 86 times across the runs and was never once
+  // resolved by an agent. `civ tradition` lists the crisis cards and adopts them.
+  [/CRISIS/, "civ tradition <TYPE>, then `civ tradition done`"],
+  // A town picks a project through the same production chooser as a city — the game just opens it
+  // (notification-handlers.ts ChooseTownProject selects the town). So it is answered by `civ build`.
+  [/TOWN_PROJECT/, "civ build <town>"],
+  // A new resource must be assigned to a settlement. `civ resource` lists the unassigned resources
+  // and the settlements that can take them, and assigns one.
+  [/ASSIGN.*RESOURCE|NEW_RESOURCE/, "civ resource, then `civ resource <resource> <city>`"],
   [/PRODUCTION|CHOOSE_PRODUCTION/, "civ build <city>"],
   [/COMMAND_UNITS|MOVE_A_UNIT|UNIT/, "civ move <unit> <x,y>, or civ skip <unit>"],
 ];

@@ -21,8 +21,13 @@
     "spectate": "node tools/spectate.ts",
     "start": "node tools/start.ts",
     "agent-log": "node tools/agent-log.ts",
+    "patch-crash": "node tools/patch-crash.ts",
     "lint": "oxlint",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "audit": "node tools/audit.ts",
+    "play": "sh scripts/play.sh",
+    "stats": "node tools/stats-page.ts",
+    "verify-live": "node tools/dev/verify-live.ts"
   },
   "dependencies": {
     "@mariozechner/pi-agent-core": "^0.73.1",

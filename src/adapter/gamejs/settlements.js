@@ -61,6 +61,22 @@ for (const id of player?.Cities?.getCityIds?.() ?? []) {
     queueEmpty: city.BuildQueue?.isEmpty ?? null,
     happiness: city.Happiness?.netHappinessPerTurn ?? null,
     hasUnrest: city.Happiness?.hasUnrest ?? null,
+    // Properties (not calls) — reading them is safe. Rebellion pressure the banner shows.
+    unrestTurns: city.Happiness?.turnsOfUnrest ?? null,
+    warWeariness: city.Happiness?.hasWarWeariness ?? null,
+    // City faith — banner majority/urban/rural. Properties on city.Religion, guarded like the game.
+    religion: (() => {
+      try {
+        const r = city.Religion;
+        if (!r) return null;
+        const nm = (h) => (h === undefined || h === null ? null : typeName("Religions", h) ?? null);
+        const out = { majority: nm(r.majorityReligion), urban: nm(r.urbanReligion), rural: nm(r.ruralReligion) };
+        return out.majority || out.urban || out.rural ? out : null;
+      } catch { return null; }
+    })(),
+    // Rebellion pressure the city banner shows: how many turns of unrest are queued (a revolt
+    // countdown), and whether war is wearing the settlement down. Net happiness alone did not say
+    // how close a settlement was to actually revolting.
     beingRazed: city.isBeingRazed ?? false,
     distantLands: city.isDistantLands ?? false,
   });
@@ -82,6 +98,7 @@ for (const other of Players.getAlive()) {
       name: locText(city.name ?? null),
       kind: city.isTown ? "town" : "city",
       owner: city.owner,
+      ...ownerIdentity(city.owner),
       x: loc.x,
       y: loc.y,
       isCapital: city.isCapital ?? false,

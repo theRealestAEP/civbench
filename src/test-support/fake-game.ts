@@ -59,6 +59,16 @@ export type FakeWorld = {
   atWar: Set<string>;
   /** Each city's build queue, head first, as type hashes. */
   buildQueue: Map<number, number[]>;
+  /** Victories CIV has claimed, as {team, victory-hash}. Drives Game.VictoryManager.getVictories. */
+  victories: Array<{ team: number; victory: number }>;
+  /** Whether the current age has ended (Game.AgeProgressManager.isAgeOver). */
+  ageOver: boolean;
+  /** Whether the current age is the FINAL one — only a final-age end is game-over. */
+  finalAge: boolean;
+  /** Per-player resources available to assign, as {index (plot), hash (ResourceType)}. */
+  resources: Record<number, Array<{ index: number; hash: number }>>;
+  /** ASSIGN_RESOURCE sends recorded, so a test can assert a resource was placed. */
+  resourceAssigns: Array<{ player: number; location: unknown; city: number }>;
   /**
    * Units that already have standing orders this turn — skipping, asleep, fortified.
    *
@@ -143,6 +153,11 @@ export function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     dealsSent: [],
     atWar: new Set(),
     buildQueue: new Map(),
+    victories: [],
+    ageOver: false,
+    finalAge: false,
+    resources: {},
+    resourceAssigns: [],
     notifications: new Map(),
     ...overrides,
   };
@@ -249,6 +264,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     civilizationName: `CIV_${id}`,
     leaderName: `LEADER_${id}`,
     isMajor: true,
+    team: id,
     // Research and civics. The real API hands back node type hashes, and the names only come
     // from GameInfo.ProgressionTreeNodes — the same name/hash split as everything else.
     Techs: {
@@ -294,6 +310,9 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     Cities: {
       getCityIds: () =>
         world.cities.filter((c) => c.owner === id).map((c) => ({ owner: c.owner, id: c.id, type: 27 })),
+    },
+    Resources: {
+      getResources: () => (world.resources[id] ?? []).map((r) => ({ value: r.index, uniqueResource: { resource: r.hash } })),
     },
     Treasury: { goldBalance: 100 + id },
     Stats: {
@@ -375,6 +394,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     CityCommandTypes: { PURCHASE: "CITYCOMMAND_PURCHASE" },
     PlayerOperationTypes: {
       SET_TECH_TREE_NODE: "SET_TECH_TREE_NODE",
+      ASSIGN_RESOURCE: "ASSIGN_RESOURCE",
       SET_CULTURE_TREE_NODE: "SET_CULTURE_TREE_NODE",
       CHOOSE_NARRATIVE_STORY_DIRECTION: "CHOOSE_NARRATIVE_STORY_DIRECTION",
       DECLARE_WAR: "DECLARE_WAR",
@@ -419,10 +439,14 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       AgeProgressManager: {
         getCurrentAgeProgressionPoints: () => 14,
         getMaxAgeProgressionPoints: () => 60,
-        isFinalAge: false,
-        isAgeOver: false,
+        get isFinalAge() { return world.finalAge; },
+        get isAgeOver() { return world.ageOver; },
         canTransitionToNextAge: () => false,
         ageCountdownStarted: false,
+      },
+      // CIV's authoritative claimed-victories list. gameover.js reads exactly this.
+      VictoryManager: {
+        getVictories: () => world.victories.map((v) => ({ team: v.team, victory: v.victory })),
       },
       // Operation APIs. canStart mirrors the real contract: { Success, FailureReasons }.
       UnitOperations: {
@@ -533,6 +557,10 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
         // Record the choice, so getResearching can report it back the way the real game does.
         // eslint-disable-next-line complexity -- a test double covering many operations by design; each op is a short flat branch.
         sendRequest: (pid: number, type: OperationType, args: OperationArgs) => {
+          if (type === "ASSIGN_RESOURCE") {
+            world.resourceAssigns.push({ player: pid, location: args?.Location, city: Number(args?.City) });
+            return;
+          }
           if (type === "CHOOSE_NARRATIVE_STORY_DIRECTION") {
             world.storyAnswered.add(pid);
             return;
@@ -708,9 +736,10 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     },
     GameInfo: {
       Terrains: { lookup: (h: number) => ({ TerrainType: `TERRAIN_${h}` }) },
+      Victories: { lookup: (h: number) => ({ VictoryType: `VICTORY_${h}` }) },
       Biomes: { lookup: (h: number) => ({ BiomeType: `BIOME_${h}` }) },
       Features: { lookup: () => null },
-      Resources: { lookup: () => null },
+      Resources: { lookup: (h: number) => ({ ResourceType: `RESOURCE_${h}` }) },
       Continents: { lookup: (h: number) => ({ ContinentType: `CONTINENT_${h}` }) },
       // These reverse the SAME hash Types.lookup produces, so a thing chosen by name reads back
       // as that name. Returning `UNIT_${h}` for any hash meant a queued UNIT_WARRIOR read back as
@@ -829,6 +858,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     GameplayMap: {
       getGridWidth: () => world.width,
       getGridHeight: () => world.height,
+      getLocationFromIndex: (idx: number) => ({ x: idx % world.width, y: Math.floor(idx / world.width) }),
       getRevealedState: visOf,
       getTerrainType: () => 1,
       getBiomeType: () => 2,

@@ -32,7 +32,7 @@ const describe = (unit, own) => {
   };
   // A rival's unit shows what the map shows: what it is, where it stands, how hurt it looks.
   if (!own) {
-    return { ...base, ...withAliases(describeAll(unit, ["Movement", "Experience"])), ...enemyStrength(unit) };
+    return { ...base, ...ownerIdentity(unit.owner), ...withAliases(describeAll(unit, ["Movement", "Experience"])), ...enemyStrength(unit) };
   }
   // Can it found a settlement where it stands, right now?
   //

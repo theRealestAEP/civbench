@@ -8,11 +8,14 @@ import { join } from "node:path";
 import type { MatchServer, AgentConfig } from "./match.ts";
 import type { Brain } from "../agent/brain.ts";
 import { createAgentSandbox } from "../agent/sandbox.ts";
+import { findGamePids } from "../adapter/discover.ts";
 
 export type Seat = { config: AgentConfig; brain: Brain };
 
 export type RunOptions = {
   turnLimit: number;
+  /** True when a real game process backs the match, enabling instant crash detection. */
+  live?: boolean;
 };
 
 export type SeatOutcome = {
@@ -74,10 +77,11 @@ const GONE_AFTER = 2;
 
 /** A claimed victory or a last civilization standing ends the match; say so and record it. */
 async function matchDecided(server: MatchServer, onProgress: ProgressSink): Promise<boolean> {
-  const decided = await server.gameOver().catch(() => ({ over: false, why: null }));
+  const decided = await server.gameOver().catch(() => ({ over: false, why: null, victory: false }));
   if (!decided.over) return false;
-  onProgress(`  the match is decided: ${decided.why ?? "the game reports it is over"}`);
-  server.logGameOver(decided.why ?? "the game reports it is over");
+  const why = decided.why ?? "the game reports it is over";
+  onProgress(`  the match ${decided.victory ? "is decided" : "has ended"}: ${why}`);
+  server.logGameOver(why, decided.victory);
   return true;
 }
 
@@ -281,6 +285,14 @@ export async function runMatch(
     // Iterating seats in a fixed order deadlocks: the loop waits for seat 0 while the game waits
     // for seat 2 to play.
     while (playedThisRound.size < seats.length) {
+      // The process table answers "did the game crash" in milliseconds; the seat-wait timeouts
+      // below take four minutes to reach the same conclusion. Eight engine crashes taught the
+      // difference — recovery now starts before the first timeout would have fired.
+      if (options.live && findGamePids().length === 0) {
+        onProgress("  the game process is gone — it crashed.");
+        gameGone = true;
+        break;
+      }
       // Every seat is always a candidate. The game decides whose turn it is, and a seat the
       // harness has given up on is still a seat the game will keep offering turns to.
       const candidates = seatIds.filter((id) => !playedThisRound.has(id));
@@ -288,6 +300,15 @@ export async function runMatch(
 
       const activeId = await server.activeSeat(candidates);
       if (activeId === null) {
+        // No seat is active. This is NORMAL during an Age TRANSITION: the game waits for every seat
+        // to submit "done", but offers no turn, so the loop would spin to its round cap (a live run
+        // stalled 50 minutes until a human clicked through). Finish the transition for any seat that
+        // will accept it and keep going. Outside a transition this is a no-op (canStart-gated).
+        const finishedSeats = await server.finishAgeTransitions(seatIds).catch(() => 0);
+        if (finishedSeats > 0) {
+          onProgress(`  age transition — finished ${finishedSeats} seat(s), continuing into the next age`);
+          continue;
+        }
         // The server knows which of the three this was — a failed read, a seat that has already
         // played, or a genuinely idle game. They used to print identically, and an hour of a live
         // run was spent reading "the game may be waiting on something" at a healthy game whose

@@ -49,16 +49,14 @@ function allReadyUnits() {
   return out;
 }
 
-function readyUnit() {
-  if (Game.UnitOperations.canStartAny(PLAYER_ID) === false) return null;
-  const first = typeof UI !== "undefined" ? UI?.Player?.getFirstReadyUnit?.() ?? null : null;
-  if (!first) return null;
-  // isUnitCycle_RemainingMoves is a user setting. With it off — the default — only a unit that has
-  // not moved AT ALL blocks the turn. With it on, any ready unit does.
-  if (Configuration.getUser().isUnitCycle_RemainingMoves) return first;
-  const unit = Units.get(first);
-  return unit && unit.canMove && !unit.hasMoved ? first : null;
-}
+// readyUnit() is gone, deliberately. It called UI.Player.getFirstReadyUnit() — a UI-layer,
+// LOCAL-PLAYER-only API that reaches into the engine's unit-cycling machinery — on every
+// end-turn attempt, refusals included. Five identical SIGSEGVs (null deref on AsyncWorker1,
+// the same six stack frames every time) each landed seconds after an end-turn attempt, and
+// this was the last unit-cycle touch left in that path after the WAIT_FOR and probe-storm
+// suspects were eliminated and the crash recurred. allReadyUnits() below answers the same
+// question from Game.UnitOperations.canStart alone — the engine's validator, no UI layer —
+// so nothing is lost but the suspect call.
 
 /** A ready unit as something an agent can act on: its id and what it is. */
 function describeReady(cid) {
@@ -87,7 +85,7 @@ function promotableUnit() {
     const xp = unit?.Experience;
     if (!xp) continue;
     let can = false;
-    try { can = xp.canPromote === true || (xp.getStoredPromotionPoints?.() ?? 0) > 0; }
+    try { can = xp.canPromote === true || (xp.getStoredPromotionPoints ?? 0) > 0; }
     catch { can = false; }
     if (can) return { id: String(cid.id ?? cid), type: unit?.type !== undefined ? typeName("Units", unit.type) : null };
   }
@@ -95,7 +93,26 @@ function promotableUnit() {
 }
 
 const blocking = endTurnBlocker(PLAYER_ID)?.name ?? null;
-const ready = describeReady(readyUnit());
+// The first unit still holding the turn open, from gameplay APIs alone. Skippable is not
+// enough: with the default unit-cycling setting only a unit that has not moved AT ALL blocks
+// the game's own end of turn, and dropping that rule once made this file stricter than the
+// game. The default is hardcoded here — reading the setting was the old code's only reason to
+// touch the UI-layer APIs now banned from this path.
+const firstReady = (() => {
+  try {
+    if (Game.UnitOperations.canStartAny(PLAYER_ID) === false) return null;
+    for (const cid of player?.Units?.getUnitIds?.() ?? []) {
+      let can = null;
+      try { can = Game.UnitOperations.canStart(cid, UnitOperationTypes.SKIP_TURN, {}, false); }
+      catch { continue; }
+      if (!can?.Success) continue;
+      const unit = Units.get(cid);
+      if (unit && unit.canMove && !unit.hasMoved) return cid;
+    }
+  } catch { return null; }
+  return null;
+})();
+const ready = describeReady(firstReady);
 
 /**
  * A settlement with nothing in its build queue.
@@ -126,8 +143,13 @@ if (CLEAR_ONLY === true) {
   // canStart is the mask. SKIP_TURN is legal only for a unit the engine considers ready, so
   // asking it is both the test and the filter — the version that sent SKIP_TURN to every unit and
   // swallowed the result was refused every time and could not tell.
+  // At most a few skips per call. This loop used to fire a sendRequest at every ready unit in
+  // one tick — the same write-burst shape that sat under all five identical engine SIGSEGVs.
+  // The caller retries with a 900ms gap, so a large army still gets cleared, just at a pace the
+  // engine's async workers have actually been tested at.
   let skipped = 0;
   for (const cid of player?.Units?.getUnitIds?.() ?? []) {
+    if (skipped >= 4) break;
     let can = null;
     try { can = Game.UnitOperations.canStart(cid, UnitOperationTypes.SKIP_TURN, {}, false); }
     catch { continue; }

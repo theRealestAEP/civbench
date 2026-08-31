@@ -174,7 +174,8 @@ The shell reads. The \`civ\` command is the only way to act.
   civ near <unit|x,y> [r]    the tiles around a place, nearest first — use this before moving
   civ what-can <unit>        legal actions for a unit, with reasons for the rest
   civ what-can city:<id>     legal actions for a settlement
-  civ build <city> [THING]   what that settlement can build, or start building it
+  civ build <city> [THING] [x,y]   what that settlement can build, or start building it.
+                             A BUILDING occupies a tile: name one, or let the game choose.
   civ expand <city> [x,y]    where a grown city can place its new citizen
   civ tech [NODE]            your research: what you can pick, or pick it
   civ civic [NODE]           your civics: what you can adopt, or adopt it

@@ -68,9 +68,35 @@ function treeNode(tree) {
     const active = tree?.getResearching?.();
     if (!active || active.type === undefined) return null;
     const def = GameInfo.ProgressionTreeNodes.lookup(active.type);
-    return def ? { node: def.ProgressionTreeNodeType, progress: active.progress ?? null } : null;
+    if (!def) return null;
+    // Turns to finish — model-tech-tree.ts: player.Techs.getTurnsForNode(nodeType). One arg.
+    let turnsLeft = null;
+    try { turnsLeft = tree.getTurnsForNode?.(active.type) ?? null; } catch { turnsLeft = null; }
+    return { node: def.ProgressionTreeNodeType, progress: active.progress ?? null, turnsLeft };
   } catch { return null; }
 }
+
+/**
+ * Military power: the combat strength of this player's units, summed.
+ *
+ * Civ has no single "military might" on the player object, but the diplo ribbon a human watches
+ * conveys the same idea, and the parts are on each unit — the melee or ranged strength units.js
+ * already reads. Sum them for a stat the standings page can compare across seats.
+ */
+const militaryStrength = (() => {
+  let total = 0;
+  try {
+    for (const id of p.Units?.getUnitIds?.() ?? []) {
+      const unit = Units.get(id);
+      const combat = unit?.Combat;
+      if (!combat) continue;
+      const melee = combat.getMeleeStrength?.(false) ?? 0;
+      const ranged = combat.rangedStrength ?? 0;
+      total += Math.max(typeof melee === "number" ? melee : 0, typeof ranged === "number" ? ranged : 0);
+    }
+  } catch { return total; }
+  return total;
+})();
 
 return {
   researching: treeNode(p?.Techs),
@@ -109,6 +135,14 @@ return {
     population: p.Stats?.totalPopulation ?? null,
   },
   unitCount: (p.Units?.getUnitIds?.() ?? []).length,
+  militaryStrength,
+  // Arg-less/correct-arity reads mirrored from the game's own advice code. getNumWonders is
+  // deliberately omitted: its signature is getNumWonders(originalConstructor, currentAgeOnly) and a
+  // wrong-arity native call segfaults, which is what crashed the UI before.
+  greatWorks: (() => { try { return p.Stats?.getTotalGreatWorksSlotted?.() ?? null; } catch { return null; } })(),
+  conqueredSettlements: (() => { try { return p.Stats?.getNumConqueredSettlements?.(true, true, true, false) ?? null; } catch { return null; } })(),
+  religionFounded: (() => { try { return p.Religion?.hasCreatedReligion?.() ?? null; } catch { return null; } })(),
+  tradeRoutes: (() => { try { return p.Trade?.countPlayerTradeRoutes?.() ?? null; } catch { return null; } })(),
   legacy,
   // The name. getGovernmentType returns a hash, and it was reaching header.json unresolved.
   government: typeName("Governments", p.Culture?.getGovernmentType?.()) ?? null,

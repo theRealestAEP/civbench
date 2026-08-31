@@ -14,13 +14,19 @@ import type { Event } from "../server/events.ts";
 /** The numbers a viewer reads off the ribbon: where this seat stands. From header.json. */
 export type SeatStats = {
   age: string | number | null;
+  /** Treasury, and the per-turn figures a viewer watches climb. */
   gold: number | null;
+  goldPerTurn: number | null;
   science: number | null;
   culture: number | null;
+  production: number | null;
+  population: number | null;
   settlements: number | null;
   units: number | null;
-  /** Legacy-path scores, the game's own win progress. */
-  legacy: Record<string, number>;
+  /** What the seat is researching now, for the strategy read. */
+  researching: string | null;
+  /** Legacy-path progress: score toward the target that wins the path. The game's own win meter. */
+  legacy: Record<string, { score: number; target: number }>;
 };
 
 export type TurnBrief = {
@@ -36,6 +42,24 @@ export type TurnBrief = {
   stats?: SeatStats | null;
   /** The tail of the seat's own journal — its plan, in its own words across turns. */
   notes?: string;
+  /** What the seat's own state dump shows this turn. Optional: a run may predate the dumps. */
+  world?: SeatWorld | null;
+};
+
+/**
+ * The ground truth a spectator overlay would show for one seat: its settlements, its army, who
+ * it has met, and what enemies it can see. Read from the seat's own per-turn dump files. Without
+ * this the caster knows only counts, and it guesses at everything the counts stand for.
+ */
+export type SeatWorld = {
+  /** One line per settlement: name, kind, pop, what it is building. Authoritative. */
+  settlements: string[];
+  /** One line per player the seat has met, with its war state. */
+  relations: string[];
+  /** Enemy units in sight this turn, from the seat's delta. */
+  sightings: string[];
+  /** The seat's army counted by type, e.g. "4 warrior, 1 scout, 1 galley". Authoritative. */
+  unitCensus: string | null;
 };
 
 /** One game turn, once every seat that began it has ended it. */
@@ -74,8 +98,16 @@ function describe(event: Event): string | null {
     // The failure MESSAGE stays out. It is harness error text, and carrying it gave the caster
     // gravity toward narrating plumbing — one broadcast described an agent's blocked automation
     // command instead of the game.
-    case "action":
+    case "action": {
+      // Builds and techs are ORDERS, not outcomes. The raw line "ok build
+      // UNIT_SETTLER" read to the caster as a settler existing, and one
+      // broadcast narrated Bruno marching a settler that was still three
+      // turns of hammers away. Say what actually happened: a queue entry.
+      if (res.ok && (req.actionType === "build" || req.actionType === "tech" || req.actionType === "civic")) {
+        return `ok QUEUED ${what} (an order - it completes turns later, nothing exists yet)`;
+      }
       return res.ok ? `ok ${what}` : `FAILED ${what} -> ${res.code ?? "?"}`;
+    }
     case "action_refused":
       return `REFUSED ${what} -> out of budget`;
     case "message":
@@ -100,27 +132,120 @@ function readStats(runDir: string, seat: string, turn: number): SeatStats | null
     const header = JSON.parse(readFileSync(path, "utf8")) as {
       age?: string | number;
       gold?: number;
-      yields?: { science?: number; culture?: number };
-      settlements?: { total?: number };
+      yields?: { science?: number; culture?: number; production?: number; gold?: number };
+      settlements?: { total?: number; population?: number };
       unitCount?: number;
-      legacy?: Array<{ type: string; score?: number }>;
+      researching?: { node?: string };
+      legacy?: Array<{ type: string; score?: number; target?: number }>;
     };
     return {
       age: header.age ?? null,
       gold: header.gold ?? null,
+      goldPerTurn: header.yields?.gold ?? null,
       science: header.yields?.science ?? null,
       culture: header.yields?.culture ?? null,
+      production: header.yields?.production ?? null,
+      population: header.settlements?.population ?? null,
       settlements: header.settlements?.total ?? null,
       units: header.unitCount ?? null,
+      researching: header.researching?.node
+        ? header.researching.node.replace(/^NODE_(TECH|CIVIC)_[A-Z]+_/, "").replace(/_/g, " ").toLowerCase()
+        : null,
       legacy: Object.fromEntries(
         (header.legacy ?? [])
           .filter((l) => (l.score ?? 0) > 0)
-          .map((l) => [l.type.replace(/^LEGACY_PATH_/, "").toLowerCase(), l.score ?? 0]),
+          .map((l) => [
+            l.type.replace(/^LEGACY_PATH_/, "").replace(/^path_/, "").toLowerCase(),
+            { score: l.score ?? 0, target: l.target ?? 0 },
+          ]),
       ),
     };
   } catch {
     return null;
   }
+}
+
+/** The `key=value` pairs of one dump line. The dumps write one record per line in this shape. */
+function kv(line: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const token of line.split(" ")) {
+    const eq = token.indexOf("=");
+    if (eq > 0) out.set(token.slice(0, eq), token.slice(eq + 1));
+  }
+  return out;
+}
+
+/** One dump file as trimmed non-empty lines, or null when the file is not there. */
+function readDumpLines(dir: string, file: string): string[] | null {
+  const path = join(dir, file);
+  if (!existsSync(path)) return null;
+  return readFileSync(path, "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+}
+
+/**
+ * The seat's view of the world, from the same per-turn dump its own agent reads.
+ *
+ * settlements.txt and units.txt are the authoritative answer to "what exists" — the caster once
+ * narrated a settler three turns of hammers away, and lists beat inference. tiles.* stays out
+ * (about 100 KB a seat) and hud.txt stays out (it repeats header.json and delta.md).
+ */
+function readWorld(runDir: string, seat: string, turn: number): SeatWorld | null {
+  const dir = join(runDir, "agents", seat, "turns", `t${String(turn).padStart(4, "0")}`);
+
+  const settlements = (readDumpLines(dir, "settlements.txt") ?? [])
+    .filter((l) => l.startsWith("settlement "))
+    .map((l) => {
+      const f = kv(l);
+      const name = l.split(" ")[1] ?? "?";
+      const owner = f.get("owner") && f.get("owner") !== "self" ? ` of ${f.get("owner")}` : "";
+      const capital = f.get("capital") === "yes" ? ", capital" : "";
+      const building = f.get("building") ? `building ${f.get("building")}` : "build queue empty";
+      return `${name} (${f.get("kind") ?? "?"}${capital}, pop ${f.get("pop") ?? "?"})${owner} — ${building}`;
+    });
+
+  const relations = (readDumpLines(dir, "players.txt") ?? [])
+    .filter((l) => l.startsWith("player "))
+    .map((l) => {
+      const f = kv(l);
+      const id = l.split(" ")[1] ?? "?";
+      const who = f.get("leader") && f.get("leader") !== f.get("civ") ? `${f.get("civ")} (${f.get("leader")})` : (f.get("civ") ?? "?");
+      return `${id} ${who} — ${f.get("at_war") === "yes" ? "AT WAR" : (f.get("relationship") ?? "unmet")}`;
+    });
+
+  // The delta's sightings block: the lines indented under "enemy units in sight:".
+  const deltaPath = join(dir, "delta.md");
+  const sightings: string[] = [];
+  if (existsSync(deltaPath)) {
+    let inBlock = false;
+    for (const raw of readFileSync(deltaPath, "utf8").split("\n")) {
+      if (/^enemy units in sight:/.test(raw.trim()) && !raw.trim().endsWith(": 0")) {
+        inBlock = true;
+        continue;
+      }
+      if (inBlock) {
+        if (/^\s+\S/.test(raw)) sightings.push(raw.trim());
+        else inBlock = false;
+      }
+    }
+  }
+
+  const unitLines = readDumpLines(dir, "units.txt");
+  let unitCensus: string | null = null;
+  if (unitLines) {
+    const byType = new Map<string, number>();
+    for (const l of unitLines) {
+      if (!l.startsWith("unit ")) continue;
+      const type = kv(l).get("type") ?? "?";
+      byType.set(type, (byType.get(type) ?? 0) + 1);
+    }
+    unitCensus = [...byType].map(([type, n]) => `${n} ${type}`).join(", ") || null;
+  }
+
+  if (settlements.length === 0 && relations.length === 0 && sightings.length === 0 && unitCensus === null) return null;
+  return { settlements, relations, sightings, unitCensus };
 }
 
 /** How many journal lines the caster sees. The tail is the seat's recent plan in its own words. */
@@ -131,13 +256,40 @@ const NOTES_LINES = 8;
  * per turn — and it beats the transcript opening as a strategy source: the first thinking block
  * is often "let me read delta.md", while a note reads "t13: chose Writing; queued settler".
  */
+/**
+ * Plumbing a spectator must never hear, if it rides in on the seat's own journal or reasoning.
+ *
+ * The did-lines are already filtered before the caster sees them (commentate.ts gameVisible), but
+ * `notes` and `reasoning` reached the prompt raw — and agents journal things like "granary order was
+ * rejected" or "promotion command errored" and open with "the ILLEGAL_ACTION means...". The model
+ * sanitised those by luck; nothing guaranteed it. This scrubs the COPY the caster reads (the raw log
+ * is untouched), clause by clause, so game-world text survives and only the plumbing clause is cut.
+ */
+const PLUMBING =
+  /[A-Z]{2,}_[A-Z_]+|\b(errored|rejected|failed to queue|inexplicably failed|rejected by syntax|no valid construction|does not exist in this build|order (failed|was rejected)|command (failed|rejected|exposed|errored)|interface (errored|failed)|engine errored)\b/i;
+
+/** Drop plumbing clauses (split on newline, then on ; and sentence breaks); keep the rest. */
+function scrubPlumbing(text: string): string {
+  return text
+    .split("\n")
+    .map((line) =>
+      line
+        .split(/(?<=[;.])\s+/)
+        .filter((clause) => !PLUMBING.test(clause))
+        .join(" ")
+        .trim(),
+    )
+    .filter((line) => line && line !== "-")
+    .join("\n");
+}
+
 function readNotesTail(runDir: string, seat: string): string {
   const path = join(runDir, "notes", seat, "notes.md");
   if (!existsSync(path)) return "";
   const dated = readFileSync(path, "utf8")
     .split("\n")
     .filter((line) => /^- t\d+:/.test(line));
-  return dated.slice(-NOTES_LINES).join("\n");
+  return scrubPlumbing(dated.slice(-NOTES_LINES).join("\n"));
 }
 
 /**
@@ -147,7 +299,7 @@ function readNotesTail(runDir: string, seat: string): string {
  * war broke out" gets said instead of never.
  */
 export function milestonesOf(turn: CompleteTurn): string[] {
-  const BIG = /FOUND_CITY|DECLARE_WAR|MAKE_PEACE|FORM_ALLIANCE|^said to|^ok accept|^ok reject/;
+  const BIG = new RegExp(`${LOUD.source}|^said to|^ok accept|^ok reject`);
   const out: string[] = [];
   for (const seat of turn.seats) {
     for (const line of seat.did) {
@@ -160,6 +312,83 @@ export function milestonesOf(turn: CompleteTurn): string[] {
   return out;
 }
 
+/** Turns of silence the gate tolerates before a heartbeat segment keeps the broadcast alive. */
+export const HEARTBEAT_EVERY = 5;
+
+/** An action line the gate always speaks about: the game visibly changed shape. */
+const LOUD = /FOUND_CITY|DECLARE_WAR|MAKE_PEACE|FORM_ALLIANCE|ATTACK|BOMBARD|PILLAGE|RAZE|CAPTURE/;
+
+/** A per-turn yield swing worth a segment: at least 30 percent and at least 3 absolute. */
+const swung = (now: number | null | undefined, then: number | null | undefined): boolean =>
+  now != null && then != null && Math.abs(now - then) >= 3 && Math.abs(now - then) / Math.max(then, 1) >= 0.3;
+
+/**
+ * Why this turn deserves live commentary — empty when it is a quiet one (docs/narrator-review.md).
+ *
+ * The narrator used to speak on every turn, a metronome of builders building. This is the gate:
+ * events that change the shape of the game always speak; number moves speak when they are big;
+ * scouts wandering and settlers queuing say nothing. `prev` is the last turn that WAS spoken, so
+ * a swing that builds up across quiet turns still fires.
+ */
+export function interestOf(turn: CompleteTurn, prev?: CompleteTurn): string[] {
+  const reasons: string[] = [];
+  for (const seat of turn.seats) {
+    for (const line of seat.did) {
+      if (line.includes("CORRECTION:")) continue; // a voided order changed nothing
+      if (line.startsWith("ok ") && LOUD.test(line)) reasons.push(`${seat.seat}: ${line}`);
+      if (/^said to/.test(line)) reasons.push(`${seat.seat}: words exchanged`);
+      if (/^ok (accept|reject)/.test(line)) reasons.push(`${seat.seat}: a deal answered`);
+    }
+    if (seat.endedByLoop) reasons.push(`${seat.seat}: had its turn taken away`);
+
+    const before = prev?.seats.find((s) => s.seat === seat.seat);
+    const now = seat.stats;
+    const then = before?.stats;
+    if (now && then) {
+      if (now.settlements != null && then.settlements != null && now.settlements !== then.settlements)
+        reasons.push(`${seat.seat}: settlements ${then.settlements} -> ${now.settlements}`);
+      if (now.units != null && then.units != null && then.units - now.units >= 2)
+        reasons.push(`${seat.seat}: lost ${then.units - now.units} units`);
+      if (now.units != null && then.units != null && now.units - then.units >= 3)
+        reasons.push(`${seat.seat}: army grew by ${now.units - then.units}`);
+      for (const [path, { score }] of Object.entries(now.legacy)) {
+        if (score !== (then.legacy[path]?.score ?? 0)) reasons.push(`${seat.seat}: victory progress moved on ${path}`);
+      }
+      if (swung(now.science, then.science)) reasons.push(`${seat.seat}: science ${then.science} -> ${now.science}`);
+      if (swung(now.culture, then.culture)) reasons.push(`${seat.seat}: culture ${then.culture} -> ${now.culture}`);
+      if (swung(now.production, then.production)) reasons.push(`${seat.seat}: production ${then.production} -> ${now.production}`);
+      if (now.goldPerTurn != null && then.goldPerTurn != null && now.goldPerTurn < 0 && then.goldPerTurn >= 0)
+        reasons.push(`${seat.seat}: treasury started bleeding`);
+    }
+    // A new line in the seat's player list is first contact — the classic always-speak moment.
+    if (seat.world && before?.world) {
+      const known = new Set(before.world.relations.map((r) => r.split(" ")[0]));
+      for (const r of seat.world.relations) {
+        if (!known.has(r.split(" ")[0])) reasons.push(`${seat.seat}: first contact — ${r}`);
+      }
+    }
+  }
+  return reasons;
+}
+
+/**
+ * The follow loop's whole question: speak on this turn, or hold?
+ *
+ * `quietStreak` is how many turns in a row have already been held. The heartbeat bounds the
+ * silence: at most HEARTBEAT_EVERY - 1 held turns, then a strategy read even on a quiet board —
+ * the VOICE prompt's lull mode already knows what to do with one.
+ */
+export function shouldSpeak(
+  turn: CompleteTurn,
+  prev: CompleteTurn | undefined,
+  quietStreak: number,
+) {
+  const reasons = interestOf(turn, prev);
+  if (reasons.length > 0) return { speak: true, reasons };
+  if (quietStreak + 1 >= HEARTBEAT_EVERY) return { speak: true, reasons: ["heartbeat: time for a strategy read"] };
+  return { speak: false, reasons: [] };
+}
+
 /** The opening of one seat's reasoning for one turn. Empty when the seat wrote none. */
 function readReasoning(runDir: string, seat: string, turn: number): string {
   const dir = `t${String(turn).padStart(4, "0")}`;
@@ -168,7 +397,7 @@ function readReasoning(runDir: string, seat: string, turn: number): string {
   // The transcript interleaves reasoning with shell output. Take the first thinking block: it is
   // where the seat states its plan, before the dump reading buries it.
   const block = readFileSync(path, "utf8").split("--- thinking ---")[1] ?? "";
-  return block.split("--- ran ---")[0]!.trim().slice(0, REASONING_CHARS);
+  return scrubPlumbing(block.split("--- ran ---")[0]!.trim()).slice(0, REASONING_CHARS);
 }
 
 /**
@@ -180,16 +409,20 @@ function readReasoning(runDir: string, seat: string, turn: number): string {
 export function readTurns(runDir: string): CompleteTurn[] {
   const open = new Map<string, TurnBrief>();
   const turns = new Map<number, TurnBrief[]>();
-  const started = new Map<number, number>();
+  const everBegan = new Set<string>();
+  let maxBegun = 0;
+  let terminal = false;
 
   for (const event of readEvents(runDir)) {
+    if (event.kind === "game_over" || event.kind === "decided") terminal = true;
     const seat = typeof event.playerName === "string" ? event.playerName : null;
     if (!seat) continue;
     const key = `${event.turn}:${seat}`;
 
     if (event.kind === "turn_begin") {
       open.set(key, { turn: event.turn, seat, did: [], endedByLoop: false, reasoning: "" });
-      started.set(event.turn, (started.get(event.turn) ?? 0) + 1);
+      everBegan.add(seat);
+      if (event.turn > maxBegun) maxBegun = event.turn;
       continue;
     }
     const brief = open.get(key);
@@ -206,18 +439,62 @@ export function readTurns(runDir: string): CompleteTurn[] {
       brief.endedByLoop = event.kind === "turn_end_forced";
       brief.reasoning = readReasoning(runDir, seat, event.turn);
       brief.stats = readStats(runDir, seat, event.turn);
+      brief.world = readWorld(runDir, seat, event.turn);
       brief.notes = readNotesTail(runDir, seat);
       open.delete(key);
       if (!turns.has(event.turn)) turns.set(event.turn, []);
       turns.get(event.turn)!.push(brief);
       continue;
     }
+    // A correction voids the ok right before it: the engine reported success, then found the
+    // order never took. Rewrite that line rather than appending one — a new line would be
+    // filtered as console noise, and the caster went on to narrate a library and a brickyard
+    // that were never queued (turn 30 of run 65661dbf8382-016).
+    if (event.kind === "action_correction") {
+      for (let i = brief.did.length - 1; i >= 0; i--) {
+        if (brief.did[i]!.startsWith("ok QUEUED")) {
+          brief.did[i] = `${brief.did[i]} — CORRECTION: the order did NOT take, the queue is still empty`;
+          break;
+        }
+      }
+      continue;
+    }
     const line = describe(event);
     if (line) brief.did.push(line);
   }
 
+  // The roster is every seat in the match, from the manifest when it is there, else every seat
+  // that has ever begun a turn. A turn is finished when EVERY roster seat has ended it — the plain
+  // case — OR a later turn has already begun, which proves the turn fully cycled and lets a match
+  // keep being narrated after a seat is eliminated and stops taking turns, OR the game is over.
+  //
+  // The old rule compared ended-count to begun-count SO FAR, and seats play one at a time: in the
+  // window after the second seat ended and before the third began, both counts were two, so a live
+  // reader called the turn finished and the commentator announced a seat "absent" that had simply
+  // not started yet.
+  const roster = readRoster(runDir, everBegan);
   return [...turns]
-    .filter(([turn, seats]) => seats.length >= (started.get(turn) ?? 0))
+    .filter(([turn, seats]) => {
+      const ended = new Set(seats.map((s) => s.seat));
+      const allEnded = roster.every((r) => ended.has(r));
+      return allEnded || turn < maxBegun || terminal;
+    })
     .map(([turn, seats]) => ({ turn, seats }))
     .sort((a, b) => a.turn - b.turn);
+}
+
+/** The match roster: the manifest's seats, or every seat that has begun a turn if there is none. */
+function readRoster(runDir: string, fallback: Set<string>): string[] {
+  const path = join(runDir, "manifest.json");
+  if (existsSync(path)) {
+    try {
+      // SAFETY: the manifest is written by this harness at match start; agents[].name is the roster.
+      const manifest = JSON.parse(readFileSync(path, "utf8")) as { agents?: Array<{ name?: string }> };
+      const names = (manifest.agents ?? []).flatMap((a) => (a.name ? [a.name] : []));
+      if (names.length > 0) return names;
+    } catch {
+      // fall through to the seats we saw
+    }
+  }
+  return [...fallback];
 }

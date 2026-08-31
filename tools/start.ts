@@ -11,7 +11,7 @@
 // It does the whole sequence with no gaps, which matters: Civ VII's debug bridge is serviced on
 // the game thread, so any idle pause between steps can leave it unreachable (docs/FINDINGS.md).
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, createReadStream } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadEnv, requireKey } from "../src/config/env.ts";
@@ -233,18 +233,64 @@ async function launchGame(): Promise<void> {
   }
 }
 
-/** Ask the freshly launched game's main menu to load a save. */
+/**
+ * Ask the freshly launched game's main menu to load a save.
+ *
+ * Three phases against loadsave.js: query the save list, wait for the results to arrive on the
+ * engine's own event, then load the entry with ITS metadata. Loading with fabricated metadata
+ * turned a hotseat save into a one-human game and killed the first live resume.
+ */
 async function loadSave(name: string): Promise<void> {
   const shell = await waitForTarget((t) => t.url.includes("root-shell"), "main menu", 240);
   const shellBridge = await CdpBridge.connect(shell.webSocketDebuggerUrl);
-  const loaded = await new GameAdapter(shellBridge).run<{ requested: boolean; error?: string }>(
-    "loadsave",
-    0,
-    { SAVE_NAME: name, SERVER_TYPE: config.controlMode === "hotseat" ? "hotseat" : "single" },
-  );
-  await shellBridge.close();
-  if (!loaded.requested) throw new Error(`could not load "${name}": ${loaded.error}`);
-  console.log("   load requested");
+  const shellAdapter = new GameAdapter(shellBridge);
+  const serverType = config.controlMode === "hotseat" ? "hotseat" : "single";
+  try {
+    const queried = await shellAdapter.run<{ queries: number }>(
+      "loadsave", 0, { MODE: "query", SAVE_NAME: name, SERVER_TYPE: serverType },
+    );
+    let found = false;
+    for (let i = 0; i < 20; i++) {
+      await sleep(1000);
+      const seen = await shellAdapter.run<{ found: boolean; answered: number; total: number }>(
+        "loadsave", 0, { MODE: "find", SAVE_NAME: name, SERVER_TYPE: serverType },
+      );
+      if (seen.found) { found = true; break; }
+      // Every query answered and the save is not there: waiting longer will not help.
+      if (seen.answered >= queried.queries && i > 3) break;
+    }
+    if (!found) throw new Error(`save "${name}" did not appear in the game's save list`);
+    const loaded = await shellAdapter.run<{ requested: boolean; error?: string; name?: string }>(
+      "loadsave", 0, { MODE: "load", SAVE_NAME: name, SERVER_TYPE: serverType },
+    );
+    if (!loaded.requested) throw new Error(`could not load "${name}": ${loaded.error}`);
+    console.log(`   load requested (${loaded.name ?? name})`);
+  } finally {
+    await shellBridge.close();
+  }
+
+  // A loaded HOTSEAT game parks in the multiplayer staging room, exactly like a hosted one, and
+  // waits for Network.startGame(). The resume path never sent it, so the first live resume sat
+  // at "waiting for the map" until the timeout with a perfectly loaded 3-seat game behind it.
+  // Retried, because startGame is refused while the load is still setting the room up.
+  if (config.controlMode === "hotseat") {
+    console.log("   starting the loaded hotseat lobby");
+    for (let attempt = 0; attempt < 18; attempt++) {
+      await sleep(5000);
+      try {
+        const lobby = await waitForTarget((t) => t.url.includes("root-shell"), "lobby", 30);
+        const lobbyBridge = await CdpBridge.connect(lobby.webSocketDebuggerUrl);
+        const started = await new GameAdapter(lobbyBridge)
+          .run<{ started: boolean; error: string | null }>("startlobby", 0);
+        await lobbyBridge.close();
+        if (started.started) {
+          console.log("   startGame: accepted");
+          return;
+        }
+      } catch { /* the shell target reloads during staging; try again */ }
+    }
+    console.log("   startGame never accepted — the map wait below will say if it mattered");
+  }
 }
 
 /** Two runMatch legs of the same match, as one set of per-seat totals for the report. */
@@ -348,8 +394,17 @@ if (useFake) {
   }
 
   // Verify we actually got the seats we asked for. A single-player host silently gives one.
-  const seatCheck = await adapter.run<{ majors: Array<{ id: number; human: boolean }> }>("seats", 0);
-  const humans = seatCheck.majors.filter((m) => m.human).map((m) => m.id);
+  // POLLED: right after a save loads, the seat flags lag the map by several seconds, and the
+  // first live resume died here with "got 1" while the save genuinely held three.
+  let humans: number[] = [];
+  for (let i = 0; i < 20; i++) {
+    const seatCheck = await adapter
+      .run<{ majors: Array<{ id: number; human: boolean }> }>("seats", 0)
+      .catch(() => ({ majors: [] }));
+    humans = seatCheck.majors.filter((m) => m.human).map((m) => m.id);
+    if (humans.length >= config.agents.length) break;
+    await sleep(3000);
+  }
   console.log(`   human seats: ${humans.join(", ") || "none"}`);
   if (humans.length < config.agents.length) {
     throw new Error(
@@ -395,6 +450,8 @@ const { server, rules } = await startMatch(adapter, runDir, config, agents, {
   turnLimit: turns,
   majorPlayers: majors,
 });
+// The A/B lever for the engine-crash hunt: --no-spectate silences the overlay evals too.
+if (!spectate) server.overlayEnabled = false;
 if (server.autosave) console.log("   autosaving each turn (resume with --resume <name>)");
 console.log(`   rules exported: ${rules.tables} tables, ${rules.rows} rows`);
 
@@ -402,9 +459,27 @@ console.log(`   rules exported: ${rules.tables} tables, ${rules.rows} rows`);
 // is exported — and nothing plays until you say so, so you can get the window where you want it
 // and the narrator attached before turn 1. `--go` skips the pause for unattended runs, and a
 // non-interactive stdin (CI, a pipe) never waits.
-if (!useFake && !has("go") && process.stdin.isTTY) {
-  console.log("\n▶ READY — press Enter to start the match (--go skips this pause)");
-  await new Promise<void>((resolve) => process.stdin.once("data", () => resolve()));
+if (!useFake && !has("go")) {
+  // Wait on the CONTROLLING TERMINAL, not process.stdin. stdin is often not a TTY under a launcher
+  // (tmux/npm layering, a pipe, an IDE terminal), and the old `process.stdin.isTTY` gate silently
+  // skipped the pause in those cases, so the match auto-started. /dev/tty is the real terminal and
+  // opens whenever one exists; it fails only in genuinely non-interactive contexts (CI), where we
+  // then proceed without blocking.
+  await new Promise<void>((resolve) => {
+    let tty: ReturnType<typeof createReadStream>;
+    try {
+      tty = createReadStream("/dev/tty");
+    } catch {
+      resolve();
+      return;
+    }
+    tty.on("error", () => resolve()); // no controlling terminal -> do not block
+    console.log("\n▶ READY — press Enter to start the match (--go skips this pause)");
+    tty.once("data", () => {
+      tty.close();
+      resolve();
+    });
+  });
 }
 
 console.log(`5. playing ${turns} turns\n`);
@@ -413,7 +488,7 @@ let outcomes = await runMatch(
   server,
   runDir,
   seats,
-  { turnLimit: turns},
+  { turnLimit: turns, live: !useFake },
   (line) => console.log(line),
 );
 
@@ -421,7 +496,11 @@ let outcomes = await runMatch(
 // autosaved, so a crash is a hiccup, not a lost run: relaunch the game, load the last autosave,
 // and keep playing IN THIS PROCESS — same run directory, same event log, same fog memory, and
 // the narrator never loses the thread. Only a recovery that itself fails ends the match.
-const MAX_RECOVERIES = 3;
+// Effectively unlimited: the engine bug behind this fires roughly every 10-40 minutes of play
+// no matter which trigger the harness starves (eight identical crashes, every theory falsified
+// by the next one). Each recovery costs a few minutes and loses at most one turn, so the cap
+// exists only to stop a truly wedged system from looping forever.
+const MAX_RECOVERIES = 50;
 for (let recovery = 1; !useFake && outcomes.gameCrashed && recovery <= MAX_RECOVERIES; recovery++) {
   const lastTurn = server.lastSnapshotTurn();
   const runName = runDir.split("/").filter(Boolean).at(-1) ?? "run";
@@ -439,7 +518,7 @@ for (let recovery = 1; !useFake && outcomes.gameCrashed && recovery <= MAX_RECOV
   }
   const remaining = Math.max(1, turns - (lastTurn - matchStartTurn));
   console.log(`   resumed at turn ${lastTurn}; playing up to ${remaining} more turns\n`);
-  const more = await runMatch(server, runDir, seats, { turnLimit: remaining }, (line) => console.log(line));
+  const more = await runMatch(server, runDir, seats, { turnLimit: remaining, live: true }, (line) => console.log(line));
   outcomes = mergeOutcomes(outcomes, more);
 }
 

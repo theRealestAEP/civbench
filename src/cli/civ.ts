@@ -47,7 +47,8 @@ const USAGE = `civ — act on the game. Reading is done with the shell; this is 
   civ say <text>                           tell every civ you have met
   civ say @<seat> <text>                   tell one civ privately
   civ inbox                                what other civs have said to you
-  civ build <city> [THING]                 what that settlement can build, or build one
+  civ build <city> [THING] [x,y]           what that settlement can build, or build one
+                                           (a building takes a plot; omit it and the game picks)
   civ expand <city> [x,y]                  where a grown city can put its new citizen
   civ tech [NODE]                          your research: what you can pick, or pick one
   civ civic [NODE]                         your civics: what you can adopt, or adopt one
@@ -67,6 +68,7 @@ const USAGE = `civ — act on the game. Reading is done with the shell; this is 
   civ deal incoming <player>               what a deal sent TO you contains
   civ deal accept <player>                 accept the deal they sent you
   civ deal reject <player>                 turn it down
+  civ resource [<resource> <city>]         assign a new resource to a settlement, or list both
   civ dismiss [id]                         clear a notification; with no id, the one blocking you
   civ open <id>                            open a notification that wants a decision
   civ end-turn                             end your turn
@@ -95,7 +97,12 @@ function parseArgs(parts: string[]): EngineArgs {
     if (eq < 0) continue;
     const key = part.slice(0, eq);
     const raw = part.slice(eq + 1);
-    out[key] = /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw) : raw;
+    // The engine's coordinate arguments are X and Y. Agents naturally write `x=48 y=16`, the
+    // engine ignores the lowercase keys, and the order is refused "with no reason" — a move to a
+    // real plot that silently does nothing. Normalise the two coordinate keys; every other key
+    // passes through untouched, since the rest of the engine's arguments are already PascalCase.
+    const norm = key === "x" ? "X" : key === "y" ? "Y" : key;
+    out[norm] = /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw) : raw;
   }
   return out;
 }
@@ -321,19 +328,35 @@ export async function runCivCommand(
         });
         if (!changed && state && state.at === before && state.at !== asked) {
           server.logCorrection(playerId, "DID_NOT_MOVE", `unit ${unit} still at ${before ?? "?"}`);
+          // The accepted-but-unpathable order sits in the unit's queue as a zombie: the unit
+          // turns unskippable and the engine's async worker re-chews the dead entry — the
+          // pattern under every observed engine crash. Clear what we watched get created.
+          await server.cancelDeadOrder(playerId, unit);
           return fail(
             `failed: DID_NOT_MOVE\n` +
               `unit ${unit} is still at ${before} with its movement unspent — the engine accepted ` +
-              `the order and moved nothing. ${asked} is probably unreachable this turn.\n` +
+              `the order and moved nothing. ${asked} is probably unreachable this turn. The dead ` +
+              `order was cancelled, so the unit is not left stuck.\n` +
               `hint: \`civ near ${unit} 2\` lists the plots around it, with their move cost\n`,
           );
         }
         // A move order spends the movement the unit has and then stops, so a distant target ends
-        // the turn short of it and continues next turn. Say where it ended up.
+        // the turn short of it and continues next turn. Say where it ended up AND how much
+        // movement is left — 69 of 73 "no moves left" refusals were an agent re-ordering a unit
+        // it had just moved, because a successful move said only "ok" and never that the unit was
+        // now spent. One tile can cost two movement, so "moved" does not imply "can move again".
         const where = await server.unitReport(playerId, unit);
         if (where) {
           const at = state?.at ?? null;
-          moved.note = at !== null && at !== asked ? `${where} (short of ${asked})` : where;
+          const base = at !== null && at !== asked ? `${where} (short of ${asked})` : where;
+          const left = state?.moves ?? null;
+          const spent =
+            left === 0
+              ? " — no movement left, this unit is done for the turn"
+              : left != null
+                ? ` — ${left} movement left`
+                : "";
+          moved.note = `${base}${spent}`;
         }
       }
       return renderResult(moved);
@@ -343,6 +366,25 @@ export async function runCivCommand(
       const text = rest.join(" ");
       if (!text) return fail("usage: civ note <text>\n");
       return renderResult(await server.note(playerId, text));
+    }
+
+    case "resource": {
+      // Answers NOTIFICATION_ASSIGN_NEW_RESOURCES. No args = list the resources and the settlements
+      // that can take them; `civ resource <resource> <city>` assigns one.
+      const which = rest[0];
+      if (!which) {
+        const { resources, cities } = await server.resources(playerId);
+        if (resources.length === 0) return ok("you have no resources to assign right now\n");
+        const lines = ["resources you can assign:"];
+        for (const r of resources) lines.push(`  ${r.name}`);
+        lines.push("settlements that can take one:");
+        for (const c of cities) lines.push(`  ${c.name}  city:${c.id}`);
+        lines.push("assign with: civ resource <resource> <city>");
+        return ok(lines.join("\n") + "\n");
+      }
+      const city = parseId(rest[1]);
+      if (!city) return fail("usage: civ resource <resource> <city>   (run `civ resource` to list both)\n");
+      return renderResult(await server.assignResource(playerId, which, city));
     }
 
     case "skip": {
@@ -426,7 +468,10 @@ export async function runCivCommand(
         return fail(`usage: civ ${command} <${command === "promote" ? "unit" : "city"}> [value]\n`);
       }
       const value = rest[isCity ? 1 : 0];
-      const r = await server.choose(playerId, what, value, targetId);
+      // `civ build <city> <THING> [x,y]` — a building needs a plot, and the engine picks a legal
+      // one when the agent does not name it. `civ build <city>` lists the plots each item may go on.
+      const plot = what === "build" ? rest[2] : undefined;
+      const r = await server.choose(playerId, what, value, targetId, plot);
       if (!r.listing) {
         // A build joins a queue rather than replacing what is in progress, so say what the queue
         // holds now. Without this an agent sees "ok", looks, still sees the previous item at the

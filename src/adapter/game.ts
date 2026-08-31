@@ -20,7 +20,7 @@ const scriptCache = new Map<string, string>();
 /** Scripts that change game state. Never auto-replayed across a reconnect (see run()). */
 const MUTATING_SCRIPTS = new Set([
   "act", "choose", "diplomacy", "notify", "deal", "endturn", "save", "chat",
-  "newgame", "startlobby", "loadsave", "handoff",
+  "newgame", "startlobby", "loadsave", "handoff", "agefinish", "resource",
 ]);
 
 function readGameJs(name: string): string {

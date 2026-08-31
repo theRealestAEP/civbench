@@ -22,7 +22,7 @@ async function setup() {
   const notesDir = join(runDir, "notes", "alpha");
   mkdirSync(notesDir, { recursive: true });
   const session = createAgentSandbox(server, 0, notesDir, () => hud);
-  return { runDir, server, hud, session };
+  return { runDir, server, hud, session, world };
 }
 
 test("the turn writes a dump the agent can grep", async () => {
@@ -1357,4 +1357,111 @@ test("a closed session refuses commands and tells the brain the turn is over", a
   assert.notEqual(result.exitCode, 0);
   assert.equal(result.turnOver, true);
   assert.match(result.stderr, /your turn is over/);
+});
+
+// A BUILDING silently failed to queue for the life of the project. `civ build X BUILDING_GRANARY`
+// answered "added to the build queue", the queue stayed empty, and the agent was then told
+// NOT_QUEUED — two harness statements contradicting each other in one turn. Units worked, so no
+// aggregate failure rate looked wrong; only segmenting builds by ARGUMENT KIND exposed it.
+// The cause: a constructible occupies a tile, and the game's own production chooser never sends
+// a bare build for one — it carries a plot. See choose.js build.args.
+test("a building carries a plot, so it actually reaches the build queue", async () => {
+  const { session } = await setup();
+  const built = await session.exec("civ build 30 BUILDING_GRANARY");
+  assert.equal(built.exitCode, 0, `a building must queue, not silently fail: ${built.stdout}`);
+  assert.doesNotMatch(built.stdout, /NOT_QUEUED/, "the queue must actually contain it afterwards");
+});
+
+// Agents reach for raw operations that have purpose-built commands, and the raw path fails
+// almost every time because each operation wants a differently encoded argument (row index vs
+// hash vs a plot). Across the runs: 29/29 CHANGE_GOVERNMENT, 31/33 SET_TECH_TREE_NODE and 22/28
+// CITYCOMMAND_EXPAND failed this way, while the same decisions through `civ government` /
+// `civ tech` / `civ expand` succeeded ~90% of the time. Send them to the command that works.
+test("a raw operation with a real command redirects instead of failing silently", async () => {
+  const { session } = await setup();
+  const raw = await session.exec("civ do player-op CHANGE_GOVERNMENT GovernmentType=1");
+  assert.notEqual(raw.exitCode, 0);
+  assert.match(raw.stdout, /USE_THE_COMMAND/);
+  assert.match(raw.stdout, /civ government/, "it must name the command that knows the encoding");
+});
+
+// `civ do unit-op U UNITOPERATION_MOVE_TO x=3 y=4` used to silently do nothing: the engine's
+// coordinate arguments are X and Y, the lowercase keys were passed through untouched, and the
+// order was refused "with no reason" — a move to a real plot that moved nothing. Agents write
+// lowercase naturally, so this footgun turned reasonable commands into unexplained no-ops.
+test("civ do normalizes lowercase x/y to the engine's X/Y", async () => {
+  const { session, world } = await setup();
+  const unit = world.units.find((u) => u.id === 10)!;
+  assert.deepEqual([unit.x, unit.y], [1, 1], "starts where the world put it");
+  const r = await session.exec("civ do unit-op 10 UNITOPERATION_MOVE_TO x=3 y=4");
+  assert.equal(r.exitCode, 0, r.stdout);
+  assert.deepEqual([unit.x, unit.y], [3, 4], "the move must land, not silently no-op on a case mismatch");
+});
+
+// Victory is CIV's call, read from getVictories() — the harness reports it faithfully and never
+// invents or suppresses one. A run once flagged a 0-legacy game "a victory claimed by team 1"
+// because ANY getVictories() entry was treated as a win with `?? "a victory"` papering over a null
+// type; and a later over-correction wrongly SUPPRESSED real entries. These pin both directions.
+test("a CIV-declared victory is reported faithfully, with the winner named", async () => {
+  const { server, world } = await setup();
+  world.victories = [{ team: 0, victory: 7 }];
+  const decided = await server.gameOver();
+  assert.equal(decided.over, true);
+  assert.equal(decided.victory, true, "a getVictories() entry is a real win");
+  assert.match(String(decided.why), /CIV_0/, "the winner is named, not just 'team 0'");
+});
+
+test("the FINAL age ending with no CIV victory ends the match but is NOT a victory", async () => {
+  const { server, world } = await setup();
+  world.victories = [];
+  world.ageOver = true;
+  world.finalAge = true; // a single-age game's one age is its final age
+  const decided = await server.gameOver();
+  assert.equal(decided.over, true, "the final age ending ends the match");
+  assert.equal(decided.victory, false, "an age-end with no CIV victory is not a win");
+  assert.match(String(decided.why), /age ended/i);
+});
+
+// A non-final age ending is an age TRANSITION, not the end of the game — reporting it as game-over
+// once ended a multi-age match prematurely (and the transition itself deadlocked the run loop).
+test("a non-final age ending is a transition, not game-over", async () => {
+  const { server, world } = await setup();
+  world.victories = [];
+  world.ageOver = true;
+  world.finalAge = false;
+  const decided = await server.gameOver();
+  assert.equal(decided.over, false, "the game continues into the next age");
+});
+
+test("an ongoing game with no victory and the age not over is not decided", async () => {
+  const { server, world } = await setup();
+  world.victories = [];
+  world.ageOver = false;
+  const decided = await server.gameOver();
+  assert.equal(decided.over, false);
+  assert.equal(decided.victory, false);
+});
+
+// NOTIFICATION_ASSIGN_NEW_RESOURCES blocks the end of a turn until each new resource is placed in a
+// settlement, and there was no command for it — so the block could only be cleared by a human.
+// `civ resource` lists them and assigns one (ASSIGN_RESOURCE with the {Location, City} args the
+// game itself sends, no Action field).
+test("civ resource lists resources and assigns one to a settlement", async () => {
+  const { session, world } = await setup();
+  world.resources[0] = [{ index: 5, hash: 999 }];
+  const list = await session.exec("civ resource");
+  assert.match(list.stdout, /RESOURCE_999/, list.stdout);
+  assert.match(list.stdout, /city:30/, "the settlements that can take it are listed");
+  const assign = await session.exec("civ resource RESOURCE_999 30");
+  assert.equal(assign.exitCode, 0, assign.stdout);
+  assert.equal(world.resourceAssigns.length, 1, "the assign must reach the engine");
+  assert.equal(world.resourceAssigns[0]!.city, 30, "assigned to the named settlement");
+});
+
+test("civ resource refuses a resource the player does not have", async () => {
+  const { session, world } = await setup();
+  world.resources[0] = [];
+  const assign = await session.exec("civ resource RESOURCE_404 30");
+  assert.notEqual(assign.exitCode, 0);
+  assert.match(assign.stdout, /NO_SUCH_THING/);
 });

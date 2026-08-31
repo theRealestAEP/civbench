@@ -29,6 +29,7 @@ const state = await bridge.eval<{
     rivalGold: number | string | null;
     researching: string | null;
     progress: number | null;
+    newReads: string | null;
     civics: string | null;
     cities: number;
     units: number;
@@ -91,7 +92,38 @@ const state = await bridge.eval<{
       }
     } catch (e) { rivalGold = "err"; }
 
+    // The state added by reading the game's source, exercised here with the SAME arity the dump
+    // uses. If any of these had wrong arity the game would segfault during this eval; surviving it
+    // is the proof the dump is safe. A JS-level miss just reports "err".
+    let newReads = null;
+    try {
+      const bits = [];
+      bits.push("gw=" + (p.Stats && p.Stats.getTotalGreatWorksSlotted ? p.Stats.getTotalGreatWorksSlotted() : "na"));
+      bits.push("conq=" + (p.Stats && p.Stats.getNumConqueredSettlements ? p.Stats.getNumConqueredSettlements(true, true, true, false) : "na"));
+      bits.push("eta=" + (tech && p.Techs && p.Techs.getTurnsForNode ? p.Techs.getTurnsForNode(tech.type) : "na"));
+      bits.push("rel=" + (p.Religion && p.Religion.hasCreatedReligion ? p.Religion.hasCreatedReligion() : "na"));
+      bits.push("trade=" + (p.Trade && p.Trade.countPlayerTradeRoutes ? p.Trade.countPlayerTradeRoutes() : "na"));
+      // ASSIGN_RESOURCE arity: getResources() + getLocationFromIndex + canStart({Location,City}).
+      // Surviving this eval proves the arity is safe (wrong arity would segfault, not return).
+      try {
+        const rl = p.Resources && p.Resources.getResources ? p.Resources.getResources() : [];
+        const r0 = rl && rl[0];
+        const cid0 = p.Cities && p.Cities.getCityIds ? p.Cities.getCityIds()[0] : null;
+        let rok = "na";
+        if (r0 && r0.value != null && cid0 && GameplayMap.getLocationFromIndex && Game.PlayerOperations) {
+          const loc = GameplayMap.getLocationFromIndex(r0.value);
+          rok = String(Game.PlayerOperations.canStart(p.id, PlayerOperationTypes.ASSIGN_RESOURCE, { Location: loc, City: cid0.id }, false) != null);
+        }
+        bits.push("res=" + (rl ? rl.length : "na") + "/assignCanStart=" + rok);
+      } catch (e) { bits.push("res=err"); }
+      if (p.isIndependent && Game.IndependentPowers && Game.IndependentPowers.independentName) {
+        bits.push("ind=" + Game.IndependentPowers.independentName(p.id));
+      }
+      newReads = bits.join(" ");
+    } catch (e) { newReads = "err: " + String(e); }
+
     players.push({
+      newReads,
       melee,
       unitFields,
       tileYield,
@@ -167,6 +199,9 @@ for (const p of state.players) {
   if (p.met > 0) {
     check(p.rivalGold !== null && p.rivalGold !== "err", "rival standing reads", String(p.rivalGold));
   }
+  // The freshly-added state reads. Surviving the eval at all proves their arity is safe (a wrong
+  // one would have crashed the game here, not returned "err").
+  check(p.newReads != null && !String(p.newReads).startsWith("err"), "new state reads (arity-safe)", String(p.newReads));
 }
 
 console.log("-- engine APIs the harness leans on (a null or err here is a live bug)");

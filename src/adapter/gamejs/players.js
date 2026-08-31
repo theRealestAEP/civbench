@@ -57,9 +57,15 @@ for (const other of Players.getAlive()) {
     relationship = locText(myDiplomacy?.getRelationshipLevelName?.(other.id) ?? null);
   } catch { relationship = null; }
 
-  out.push({
+    // Real independent name (Carthage, not "Villages") only for a confirmed independent, matching
+    // the game's guard and the method's single-arg arity.
+    let indName = null;
+    try { if (other.isIndependent) indName = Game.IndependentPowers?.independentName?.(other.id) ?? null; } catch { indName = null; }
+    out.push({
     id: other.id,
-    civ: locText(other.civilizationName ?? other.civilizationType ?? null),
+    name: locText(indName ?? other.civilizationName ?? other.leaderName ?? null),
+    kind: other.isMajor ? "civilization" : "city_state",
+    civ: locText(indName ?? other.civilizationName ?? other.civilizationType ?? null),
     leader: locText(other.leaderName ?? other.leaderType ?? null),
     isHuman: Players.isHuman?.(other.id) ?? null,
     isMajor: other.isMajor ?? null,

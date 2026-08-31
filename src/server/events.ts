@@ -41,6 +41,8 @@ export type Event = {
   /** Turn bookkeeping. */
   pending?: number;
   blocking?: string | null;
+  /** game_over: true for a real win, false when the age merely ended with no victor. */
+  victory?: boolean;
   actionsUsed?: number;
   illegalActions?: number;
   timeoutMs?: number;

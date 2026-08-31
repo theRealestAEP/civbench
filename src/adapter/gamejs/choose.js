@@ -95,13 +95,51 @@ const DECISIONS = {
     // `{ ConstructibleType: constructible.$index }` — and we sent `.Hash` for all three. canStart
     // accepted it, sendRequest queued nothing, and the harness answered "BUILDING_GRANARY added
     // to the build queue" in the same breath as "Pārsa has nothing in its build queue".
+    /**
+     * A unit needs only its type. A BUILDING NEEDS A PLOT.
+     *
+     * Buildings quietly refused to queue for the life of the project: `civ build X GRANARY`
+     * reported "added to the build queue", the queue stayed empty, and the NOT_QUEUED verifier
+     * then told the agent its order had failed with no reason it could act on. Units worked,
+     * so every seat could make warriors and no seat could ever make a building.
+     *
+     * The game's own production chooser explains why (production-chooser-helpers.ts): an item
+     * with an `interfaceMode` — every constructible — does NOT get a bare sendRequest. The UI
+     * switches to a placement mode, the human clicks a tile, and the plot rides along in the
+     * arguments. canStart() answers with the legal plots in `result.Plots`, which is how the UI
+     * knows where the clicks may go, and the same call answers for us. Take the engine's first
+     * legal plot; an agent that wants a specific one can pass `x,y` (see PLOT below).
+     */
     args: (name) => {
+      // The adapter only declares consts it was given, so this may be undefined.
+      const PLOT = typeof BUILD_PLOT === "undefined" ? null : BUILD_PLOT;
       const row = GameInfo.Types.lookup(name);
       if (!row) return null;
       if (row.Kind === "KIND_UNIT") return { UnitType: row.Hash };
       for (const [table, key] of [["Constructibles", "ConstructibleType"], ["Projects", "ProjectType"]]) {
         for (const def of GameInfo[table] ?? []) {
-          if (def[key] === name) return { [key]: def.$index };
+          if (def[key] !== name) continue;
+          const base = { [key]: def.$index };
+          // Projects are placed by the engine; only constructibles want a plot.
+          if (key !== "ConstructibleType") return base;
+          const city = findOwnCity(PLAYER_ID, TARGET_ID);
+          if (!city) return base;
+          let check = null;
+          try { check = Game.CityOperations.canStart(city.id, CityOperationTypes.BUILD, base, false); }
+          catch { check = null; }
+          const plots = check?.Plots ?? [];
+          if (plots.length === 0) return base;
+          // An explicit "THING at x,y" wins when the agent named one and it is legal.
+          let chosen = plots[0];
+          if (typeof PLOT === "string" && /^\d+\s*,\s*\d+$/.test(PLOT)) {
+            const [px, py] = PLOT.split(",").map((n) => Number(n.trim()));
+            for (const index of plots) {
+              const at = GameplayMap.getLocationFromIndex(index);
+              if (at?.x === px && at?.y === py) { chosen = index; break; }
+            }
+          }
+          const at = GameplayMap.getLocationFromIndex(chosen);
+          return at ? { ...base, X: at.x, Y: at.y } : base;
         }
       }
       return null;
@@ -197,8 +235,25 @@ const DECISIONS = {
       // Check the answer against the story's own links, the way `civ build` checks a name against
       // GameInfo.Types. Without this any string was accepted and sent to the engine, which then
       // refused it with no reason — the exact loop these commands exist to prevent.
+      // Accept what agents actually type. The exact id is canonical, but a story's options are
+      // presented as a short list and agents reasonably answer with an ORDINAL ("1") or the
+      // trailing letter ("B") — both were refused as "this game has no story named 1", which
+      // reads as the harness not understanding its own menu.
       const answers = storyChoices().map((c) => c.name);
-      if (!answers.includes(value)) return null;
+      let picked = answers.includes(value) ? value : null;
+      if (picked === null) {
+        const typed = String(value).trim();
+        if (/^\d+$/.test(typed)) {
+          picked = answers[Number(typed) - 1] ?? null; // 1-based, as the list is printed
+        } else if (/^[A-Za-z]$/.test(typed)) {
+          picked = answers.find((a) => a.toUpperCase().endsWith(typed.toUpperCase())) ?? null;
+        } else {
+          // A full id from an EARLIER story: same family, wrong instance. Not answerable.
+          picked = answers.find((a) => a.toUpperCase() === typed.toUpperCase()) ?? null;
+        }
+      }
+      if (picked === null) return null;
+      value = picked;
       return { TargetType: value, Target: target, Action: ACTIVATE };
     },
     list: () => storyChoices(),
@@ -328,8 +383,12 @@ const DECISIONS = {
       const unit = findOwnUnit(PLAYER_ID, TARGET_ID);
       const xp = unit?.Experience;
       if (!xp) return null;
-      const points = xp.getStoredPromotionPoints?.() ?? 0;
-      const level = xp.getLevel?.() ?? null;
+      // The engine's Experience getters are PROPERTIES, not methods — model-unit-promotion.ts reads
+      // them with no parentheses. Calling them (getStoredPromotionPoints?.()) threw "is not a
+      // function" and crashed the `civ promote <unit>` LIST path, so agents never saw their earned
+      // promotions and invented names (13 NO_SUCH_THING failures downstream).
+      const points = xp.getStoredPromotionPoints ?? 0;
+      const level = xp.getLevel ?? null;
       return `level ${level ?? "?"}, ${points} promotion point${points === 1 ? "" : "s"} to spend, ` +
         `${xp.experiencePoints ?? 0}/${xp.experienceToNextLevel ?? "?"} xp`;
     },
@@ -596,6 +655,11 @@ function nodeName(tree) {
 // failed to choose, so any legal answer beats a stalled match — and the agent can change it next
 // turn. It is not a substitute for the agent choosing; `civ tradition` is.
 const BLOCKER_DECISIONS = [
+  // A crisis deals policy CARDS into crisis culture slots, so the policy chooser answers it.
+  // Listed before the generic TRADITION row only for readability; both route to the same place.
+  // Without this row a crisis blocked the turn AND the forced clear had no answer for it —
+  // 86 blocked turns across the runs, never once resolved.
+  [/CRISIS/, "tradition"],
   [/TRADITION|POLICY|POLICIES/, "tradition"],
   [/GOVERNMENT/, "government"],
   [/PANTHEON/, "pantheon"],
@@ -673,7 +737,11 @@ if (!THING) {
     }
     options.push({ ...item, available });
   }
-  return { ok: true, listing: true, current: decision.current?.() ?? null, options };
+  // current() reads live game state; guard it so a bad getter can never crash the whole listing —
+  // the command must still return the options an agent needs.
+  let current = null;
+  try { current = decision.current?.() ?? null; } catch { current = null; }
+  return { ok: true, listing: true, current, options };
 }
 
 // "done" closes a decision the agent has finished with, where the game has such a step.

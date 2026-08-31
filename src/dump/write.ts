@@ -28,7 +28,9 @@ function field(value: Scalar): string {
  * Fields that stay even when empty, because their absence would mislead rather than inform.
  * `vis` says whether you can see the plot at all; `moves=0` says a unit is finished this turn.
  */
-const ALWAYS: ReadonlySet<string> = new Set(["vis", "moves", "hp", "pop", "kind", "owner", "at", "type", "name"]);
+const ALWAYS: ReadonlySet<string> = new Set(["vis", "moves", "hp", "pop", "kind", "owner", "at", "type", "name", "can_found_here"]);
+// can_found_here only reaches line() for founder units (unitRecord includes it just for them), so
+// keeping it here shows "can_found_here=no" on a blocked settler without adding noise to warriors.
 
 /**
  * `kind id k=v k=v ...` — one fact per line.
@@ -154,6 +156,11 @@ const KEEP_ZERO = new Set(["moves", "hp", "xp", "at", "owner", "type", "name"]);
 // eslint-disable-next-line complexity -- field-inclusion rules: one branch per field family, mirroring what the game's UI draws.
 function unitRecord(u: OwnUnit | ForeignUnit): DumpRecord {
   const out: DumpRecord = {};
+  // A settler/founder's `can_found_here` is the decisive flag, but the general "false = omit" rule
+  // below hid it exactly when it was false — so agents saw the found button only when it was lit,
+  // never when it was dark, and spammed illegal FOUND_CITY for a dozen turns. Keep it visible for
+  // founders in both states. Other units keep the old behavior (no can_found_here=no noise).
+  const isFounder = /settler|found/i.test(u.type ?? "");
   for (const [key, value] of Object.entries(u)) {
     if (value === undefined || value === null) continue;
     if (key === "id" || key === "x" || key === "y") continue;
@@ -166,7 +173,8 @@ function unitRecord(u: OwnUnit | ForeignUnit): DumpRecord {
       const name = DISPLAY.get(key) ?? key;
       // A field that does not apply is left out, the way the UI leaves out its row.
       const empty = value === false || value === 0 || value === "";
-      if (!empty || KEEP_ZERO.has(name)) out[name] = value;
+      const keepAnyway = KEEP_ZERO.has(name) || (name === "can_found_here" && isFounder);
+      if (!empty || keepAnyway) out[name] = value;
     }
   }
   // ForeignUnit is a Pick of OwnUnit, so every field read here is on both arms of the union.

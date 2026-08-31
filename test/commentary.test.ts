@@ -6,10 +6,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readTurns } from "../src/commentary/brief.ts";
-import type { CompleteTurn } from "../src/commentary/brief.ts";
+import { readTurns, interestOf, shouldSpeak, HEARTBEAT_EVERY } from "../src/commentary/brief.ts";
+import type { CompleteTurn, TurnBrief, SeatStats } from "../src/commentary/brief.ts";
 import {
-  commentateTurn, hasCommentary, promptFor, writeCommentary, newMemory, MEMORY_TURNS } from "../src/commentary/commentate.ts";
+  commentateTurn, hasCommentary, promptFor, writeCommentary, newMemory, MEMORY_TURNS, PLAY_KEY } from "../src/commentary/commentate.ts";
 import type { Speak } from "../src/commentary/speak.ts";
 
 type Event = Record<string, unknown>;
@@ -92,16 +92,16 @@ test("a failed action is kept, with its code but not the harness error text", ()
 
 test("a turn the loop had to end is flagged", () => {
   const runDir = makeRun([begin(3, "Cleo"), end(3, "Cleo", true)]);
-  const brief = readTurns(runDir)[0]!.seats[0]!;
-  assert.equal(brief.endedByLoop, true);
-  assert.match(promptFor(brief), /never ended its own turn/);
+  const turn = readTurns(runDir)[0]!;
+  assert.equal(turn.seats[0]!.endedByLoop, true);
+  assert.match(promptFor(turn), /never ended its own turn/);
 });
 
 test("an empty turn reads as empty rather than as nothing at all", () => {
   const runDir = makeRun([begin(3, "Cleo"), end(3, "Cleo")]);
-  const brief = readTurns(runDir)[0]!.seats[0]!;
-  assert.deepEqual(brief.did, []);
-  assert.match(promptFor(brief), /took no actions/);
+  const turn = readTurns(runDir)[0]!;
+  assert.deepEqual(turn.seats[0]!.did, []);
+  assert.match(promptFor(turn), /took no actions/);
 });
 
 // The opening states the plan. Everything after it is dump reading, and it is enormous.
@@ -112,28 +112,29 @@ test("only the opening of the seat's own reasoning is carried", () => {
     "--- thinking ---\nI will found on the river.\n\n--- ran ---\n$ civ near 10 3\n" +
       "tile 1,1 terrain=flat\n".repeat(500) + "\n--- thinking ---\nSecond thoughts.\n",
   );
-  const brief = readTurns(runDir)[0]!.seats[0]!;
-  assert.equal(brief.reasoning, "I will found on the river.");
-  assert.match(promptFor(brief), /found on the river/);
+  const turn = readTurns(runDir)[0]!;
+  assert.equal(turn.seats[0]!.reasoning, "I will found on the river.");
+  assert.match(promptFor(turn), /found on the river/);
 });
 
 test("a seat that wrote no reasoning still gets a brief", () => {
   const runDir = makeRun([begin(1, "Ada"), end(1, "Ada")]);
-  const brief = readTurns(runDir)[0]!.seats[0]!;
-  assert.equal(brief.reasoning, "");
-  assert.doesNotMatch(promptFor(brief), /reasoning/);
+  const turn = readTurns(runDir)[0]!;
+  assert.equal(turn.seats[0]!.reasoning, "");
+  assert.doesNotMatch(promptFor(turn), /reasoning/);
 });
 
-test("each seat in a turn gets its own call and its own line", async () => {
+test("a turn gets one play-by-play call that sees every seat", async () => {
   const runDir = makeRun([
     begin(1, "Ada"), end(1, "Ada"),
     begin(1, "Bruno"), end(1, "Bruno"),
   ]);
   const speak = stub();
   const lines = await commentateTurn(readTurns(runDir)[0]!, speak);
-  assert.equal(speak.prompts.length, 2, "one call per seat");
-  assert.deepEqual(lines.map((l) => l.seat), ["Ada", "Bruno"]);
-  assert.equal(speak.prompts[1]!.includes("Ada"), false, "a seat's brief holds only its own turn");
+  assert.equal(speak.prompts.length, 1, "one call for the whole turn, not one per seat");
+  assert.deepEqual(lines.map((l) => l.seat), ["play-by-play"]);
+  assert.match(speak.prompts[0]!, /Ada/);
+  assert.match(speak.prompts[0]!, /Bruno/, "one prompt sees every seat, so it can pick the biggest beats");
 });
 
 // A model that answers in paragraphs still has to render on one line beside the turn.
@@ -167,7 +168,7 @@ test("commentary lands outside every agent directory", () => {
 
 // Without memory the caster can only describe one turn at a time, and the plan's own example
 // line — "they are still the only one who has met nobody" — cannot be written at all.
-test("the caster is given its own recent lines about that seat", async () => {
+test("the caster is given its own recent lines", async () => {
   const prompts: string[] = [];
   const speak = async (_system: string, user: string) => {
     prompts.push(user);
@@ -180,10 +181,10 @@ test("the caster is given its own recent lines about that seat", async () => {
   });
 
   await commentateTurn(turn(1), speak, memory);
-  assert.doesNotMatch(prompts[0]!, /What you said about/, "the first turn has no past to compare to");
+  assert.doesNotMatch(prompts[0]!, /Your last/, "the first turn has no past to compare to");
 
   await commentateTurn(turn(2), speak, memory);
-  assert.match(prompts[1]!, /What you said about Ada/);
+  assert.match(prompts[1]!, /Your last/);
   assert.match(prompts[1]!, /line 1/, "it must see what it actually said last turn");
 });
 
@@ -201,7 +202,7 @@ test("memory is a sliding window, so a long match does not grow the prompt forev
       memory,
     );
   }
-  assert.equal(memory.get("Ada")!.length, MEMORY_TURNS, "the window must stay bounded");
+  assert.equal(memory.get(PLAY_KEY)!.length, MEMORY_TURNS, "the window must stay bounded");
   const last = prompts.at(-1)!;
   assert.doesNotMatch(last, /\bline 1\b/, "the oldest line must have fallen out of the window");
   assert.match(last, new RegExp(`line ${prompts.length - 1}`), "the newest must still be in it");
@@ -235,10 +236,10 @@ function writeNotes(runDir: string, seat: string, lines: string[]): void {
 test("a seat's standing reaches the prompt", () => {
   const runDir = makeRun([begin(4, "Ada"), end(4, "Ada")]);
   writeHeader(runDir, "Ada", 4, 147, 3);
-  const brief = readTurns(runDir)[0]!.seats[0]!;
-  const prompt = promptFor(brief);
+  const turn = readTurns(runDir)[0]!;
+  const prompt = promptFor(turn);
   assert.match(prompt, /Where it stands/);
-  assert.match(prompt, /gold 147/);
+  assert.match(prompt, /treasury 147/);
   assert.match(prompt, /antiquity_science 3/, "legacy progress is the win condition — it must be visible");
 });
 
@@ -250,8 +251,8 @@ test("the seat's journal reaches the prompt, tail only", () => {
     ...Array.from({ length: 12 }, (_, i) => `- t${i + 1}: filler turn ${i + 1}`),
     "- t13: chose Writing; queued settler for second city",
   ]);
-  const brief = readTurns(runDir)[0]!.seats[0]!;
-  const prompt = promptFor(brief);
+  const turn = readTurns(runDir)[0]!;
+  const prompt = promptFor(turn);
   assert.match(prompt, /its own journal/i);
   assert.match(prompt, /queued settler/);
   assert.doesNotMatch(prompt, /filler turn 1\b/, "only the tail is carried, or a long match grows the prompt");
@@ -272,16 +273,16 @@ test("a standings call happens on the cadence, and only with numbers to stand on
   };
 
   const offCadence = await commentateTurn(seatsFor(4, true), speak);
-  assert.deepEqual(offCadence.map((l) => l.seat), ["Ada", "Bruno"], "turn 4 is not a standings turn");
+  assert.deepEqual(offCadence.map((l) => l.seat), ["play-by-play"], "turn 4 is not a standings turn");
 
   const onCadence = await commentateTurn(seatsFor(5, true), speak);
-  assert.deepEqual(onCadence.map((l) => l.seat), ["Ada", "Bruno", "standings"]);
+  assert.deepEqual(onCadence.map((l) => l.seat), ["play-by-play", "standings"]);
   const standingsPrompt = speak.prompts.at(-1)!;
-  assert.match(standingsPrompt, /Ada:.*gold 100/, "the standings call must see every seat side by side");
-  assert.match(standingsPrompt, /Bruno:.*gold 40/);
+  assert.match(standingsPrompt, /Ada:.*treasury 100/, "the standings call must see every seat side by side");
+  assert.match(standingsPrompt, /Bruno:.*treasury 40/);
 
   const noNumbers = await commentateTurn(seatsFor(10, false), speak);
-  assert.deepEqual(noNumbers.map((l) => l.seat), ["Ada", "Bruno"], "no numbers, no standings call");
+  assert.deepEqual(noNumbers.map((l) => l.seat), ["play-by-play"], "no numbers, no standings call");
 });
 
 // The follow loop drops whole turns when it falls behind — right for pacing, but the dropped
@@ -309,6 +310,279 @@ test("milestones survive a dropped turn and are told once", async () => {
     ],
   };
   await commentateTurn(next, speak, newMemory(), milestones);
-  assert.match(speak.prompts[0]!, /DECLARE_WAR/, "the first seat's prompt carries the missed beats");
-  assert.doesNotMatch(speak.prompts[1]!, /DECLARE_WAR/, "told once, not once per seat");
+  assert.equal(speak.prompts.length, 1, "one call for the whole turn");
+  assert.match(speak.prompts[0]!, /DECLARE_WAR/, "the play-by-play prompt carries the missed beats");
+});
+
+// The narrator announced a seat "absent from this turn's record" for a turn that, once finished,
+// held all three seats. Cause: seats play one at a time, and the turn reader called a turn done as
+// soon as ended-count met begun-count-so-far. In the window after the second seat ended and before
+// the third BEGAN, both were two, so a live read emitted the turn a seat short. The roster (from
+// the manifest) is the fix: a turn is done when every roster seat has ended it.
+function makeRunWithRoster(events: Event[], roster: string[]): string {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-cast-"));
+  writeFileSync(
+    join(runDir, "events.jsonl"),
+    events.map((e, seq) => JSON.stringify({ seq, at: "2026-08-29T03:10:04.589Z", ...e })).join("\n") + "\n",
+  );
+  writeFileSync(join(runDir, "manifest.json"), JSON.stringify({ agents: roster.map((name) => ({ name })) }));
+  return runDir;
+}
+
+test("a turn is not finished until every roster seat has ended it", () => {
+  // Turn 1 is complete. In turn 2, the third seat has not begun yet — the exact race window.
+  const runDir = makeRunWithRoster(
+    [
+      begin(1, "Ada"), end(1, "Ada"), begin(1, "Bruno"), end(1, "Bruno"), begin(1, "Cleo"), end(1, "Cleo"),
+      begin(2, "Ada"), end(2, "Ada"), begin(2, "Bruno"), end(2, "Bruno"), // Cleo has not begun turn 2
+    ],
+    ["Ada", "Bruno", "Cleo"],
+  );
+  const turns = readTurns(runDir);
+  assert.deepEqual(turns.map((t) => t.turn), [1], "turn 2 must wait for Cleo, not go out a seat short");
+  assert.deepEqual(turns[0]!.seats.map((s) => s.seat), ["Ada", "Bruno", "Cleo"]);
+});
+
+test("a later turn beginning still finishes a turn, so elimination does not stall the caster", () => {
+  // Cleo never ends turn 2, but turn 3 has begun: the game moved on without her (eliminated). The
+  // turn must still be narrated, with the seats that actually played it.
+  const runDir = makeRunWithRoster(
+    [
+      begin(2, "Ada"), end(2, "Ada"), begin(2, "Bruno"), end(2, "Bruno"),
+      begin(3, "Ada"),
+    ],
+    ["Ada", "Bruno", "Cleo"],
+  );
+  const turns = readTurns(runDir);
+  assert.deepEqual(turns.map((t) => t.turn), [2]);
+  assert.deepEqual(turns[0]!.seats.map((s) => s.seat), ["Ada", "Bruno"], "narrate who actually played");
+});
+
+// The narrator narrated a seat's "illegal attempts". The prompt was handing it the seat's failed
+// and refused console lines, and the voice rules alone did not hold. Those lines are invisible in
+// the game world, so they must not reach the caster at all — it cannot narrate what it never sees.
+test("failed and refused actions never reach the commentary prompt", () => {
+  const runDir = makeRun([
+    begin(5, "Ada"),
+    action(5, "Ada", { kind: "build", actionType: "CITYOPERATION_BUILD", targetId: "65536", args: { thing: "UNIT_SCOUT" } }),
+    action(5, "Ada", { actionType: "SET_TECH_TREE_NODE" }, false, { code: "ILLEGAL_ACTION" }),
+    end(5, "Ada"),
+  ]);
+  const turn = readTurns(runDir);
+  const prompt = promptFor(turn[0]!);
+  assert.match(prompt, /UNIT_SCOUT/, "the successful build is game-visible and must stay");
+  assert.doesNotMatch(prompt, /ILLEGAL_ACTION/, "an illegal attempt is console plumbing, not an event");
+  assert.doesNotMatch(prompt, /FAILED/, "no failure lines reach the caster");
+});
+
+// ---- the interestingness gate ----------------------------------------------------------------
+
+const seatBrief = (name: string, over: Partial<TurnBrief> = {}): TurnBrief => ({
+  turn: 7, seat: name, did: [], endedByLoop: false, reasoning: "", ...over,
+});
+
+const statsOf = (over: Partial<SeatStats> = {}): SeatStats => ({
+  age: "antiquity", gold: 100, goldPerTurn: 2, science: 10, culture: 10, production: 10,
+  population: 5, settlements: 2, units: 5, researching: null, legacy: {}, ...over,
+});
+
+// Every event kind on the always-speak list, as the did-lines readTurns actually produces.
+test("the gate speaks on every big event kind", () => {
+  const cases: Array<[string, Partial<TurnBrief>]> = [
+    ["a city founded", { did: ["ok UNITOPERATION_FOUND_CITY on 131072"] }],
+    ["a ranged attack", { did: ["ok UNITOPERATION_RANGE_ATTACK on 196609"] }],
+    ["a naval attack", { did: ["ok UNITOPERATION_NAVAL_ATTACK on 196609"] }],
+    ["war declared", { did: ["ok DECLARE_WAR on p3"] }],
+    ["peace made", { did: ["ok MAKE_PEACE on p3"] }],
+    ["an alliance formed", { did: ["ok FORM_ALLIANCE on p3"] }],
+    ["words exchanged", { did: ['said to everyone: "meet me at the river"'] }],
+    ["a deal accepted", { did: ["ok accept on p3"] }],
+    ["a deal rejected", { did: ["ok reject on p3"] }],
+    ["a turn taken away", { endedByLoop: true }],
+  ];
+  for (const [why, over] of cases) {
+    const turn: CompleteTurn = { turn: 7, seats: [seatBrief("Ada", over)] };
+    assert.ok(interestOf(turn).length > 0, why);
+  }
+});
+
+test("a quiet turn of moves, skips and queue orders says nothing", () => {
+  const turn: CompleteTurn = {
+    turn: 7,
+    seats: [seatBrief("Ada", {
+      did: [
+        "ok UNITOPERATION_MOVE_TO on 196609",
+        "ok UNITOPERATION_SKIP_TURN on 131072",
+        "ok UNITOPERATION_FORTIFY on 262146",
+        'ok QUEUED build on 65536 {"thing":"UNIT_WARRIOR"} (an order - it completes turns later, nothing exists yet)',
+      ],
+      stats: statsOf(),
+    })],
+  };
+  assert.deepEqual(interestOf(turn, { turn: 6, seats: [seatBrief("Ada", { stats: statsOf() })] }), []);
+});
+
+test("the gate speaks on big number moves and holds on small ones", () => {
+  const prev: CompleteTurn = { turn: 6, seats: [seatBrief("Ada", { stats: statsOf() })] };
+  const speaks: Array<[string, Partial<SeatStats>]> = [
+    ["a settlement gained", { settlements: 3 }],
+    ["a settlement lost", { settlements: 1 }],
+    ["two units lost", { units: 3 }],
+    ["an army surge", { units: 8 }],
+    ["a science swing", { science: 14 }],
+    ["a treasury starting to bleed", { goldPerTurn: -1 }],
+    ["victory progress", { legacy: { antiquity_science: { score: 1, target: 10 } } }],
+  ];
+  for (const [why, over] of speaks) {
+    const turn: CompleteTurn = { turn: 7, seats: [seatBrief("Ada", { stats: statsOf(over) })] };
+    assert.ok(interestOf(turn, prev).length > 0, why);
+  }
+  const holds: Array<[string, Partial<SeatStats>]> = [
+    ["a small science drift", { science: 12 }],
+    ["one unit lost", { units: 4 }],
+    ["treasury spend without bleeding", { gold: 60 }],
+  ];
+  for (const [why, over] of holds) {
+    const turn: CompleteTurn = { turn: 7, seats: [seatBrief("Ada", { stats: statsOf(over) })] };
+    assert.deepEqual(interestOf(turn, prev), [], why);
+  }
+});
+
+test("a voided queue order does not count as an event", () => {
+  const turn: CompleteTurn = {
+    turn: 7,
+    seats: [seatBrief("Ada", {
+      did: ["ok QUEUED build on 65536 — CORRECTION: the order did NOT take, the queue is still empty"],
+    })],
+  };
+  assert.deepEqual(interestOf(turn), []);
+});
+
+test("first contact speaks once, from the seat's player list", () => {
+  const world = (relations: string[]) => ({ settlements: [], relations, sightings: [], unitCensus: null });
+  const before: CompleteTurn = { turn: 6, seats: [seatBrief("Ada", { world: world(["p8 Villages — Neutral"]) })] };
+  const met: CompleteTurn = {
+    turn: 7,
+    seats: [seatBrief("Ada", { world: world(["p8 Villages — Neutral", "p3 Greece (Cleo) — Neutral"]) })],
+  };
+  assert.ok(interestOf(met, before).some((r) => r.includes("first contact")), "a new player line is first contact");
+  assert.deepEqual(interestOf(before, before), [], "an already-met player is not news");
+});
+
+// The heartbeat bounds the silence: at most HEARTBEAT_EVERY - 1 held turns in a row.
+test("the heartbeat speaks on the boundary and holds under it", () => {
+  const quiet: CompleteTurn = { turn: 9, seats: [seatBrief("Ada", { did: ["ok UNITOPERATION_MOVE_TO on 1"] })] };
+  assert.equal(shouldSpeak(quiet, undefined, HEARTBEAT_EVERY - 2).speak, false, "under the boundary: hold");
+  const boundary = shouldSpeak(quiet, undefined, HEARTBEAT_EVERY - 1);
+  assert.equal(boundary.speak, true, "on the boundary: speak");
+  assert.match(boundary.reasons[0]!, /heartbeat/);
+});
+
+// ---- the world feed --------------------------------------------------------------------------
+
+function writeDump(runDir: string, seat: string, turn: number, files: Record<string, string>): void {
+  const dir = join(runDir, "agents", seat, "turns", `t${String(turn).padStart(4, "0")}`);
+  mkdirSync(dir, { recursive: true });
+  for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
+}
+
+// The caster once narrated a settler three turns of hammers away. The dump lists what exists;
+// handing them to the prompt as authoritative is what stops the guessing.
+test("the seat's world reaches the prompt as authoritative lists", () => {
+  const runDir = makeRun([begin(4, "Ada"), end(4, "Ada")]);
+  writeDump(runDir, "Ada", 4, {
+    "settlements.txt":
+      "settlement Paris kind=city engine_id=65536 owner=self at=25,24 pop=7 capital=yes building=UNIT_SETTLER\n" +
+      "settlement Nantes kind=town engine_id=131073 owner=self at=28,26 pop=2 queue_empty=yes\n",
+    "players.txt": "player p8 civ=Villages leader=Villages at_war=yes relationship=Neutral\n",
+    "units.txt":
+      "unit warrior-1 owner=p2 type=warrior at=26,24 hp=100\n" +
+      "unit warrior-2 owner=p2 type=warrior at=25,25 hp=100\n" +
+      "unit scout-1 owner=p2 type=scout at=35,34 hp=100\n",
+    "delta.md": "# changes\n\nenemy units in sight: 1\n  galley of p8 at 24,23\n\nyour settlements: 2\n",
+  });
+  const prompt = promptFor(readTurns(runDir)[0]!);
+  assert.match(prompt, /Paris \(city, capital, pop 7\) — building UNIT_SETTLER/);
+  assert.match(prompt, /Nantes \(town, pop 2\) — build queue empty/);
+  assert.match(prompt, /2 warrior, 1 scout/, "the army arrives counted, not as raw dump lines");
+  assert.match(prompt, /p8 Villages — AT WAR/);
+  assert.match(prompt, /galley of p8/);
+  assert.match(prompt, /authoritative/);
+});
+
+test("a run without dumps still prompts, with no world section", () => {
+  const runDir = makeRun([begin(4, "Ada"), end(4, "Ada")]);
+  const prompt = promptFor(readTurns(runDir)[0]!);
+  assert.doesNotMatch(prompt, /authoritative/);
+});
+
+// The engine sometimes reports ok and then emits a correction: the order never took. The caster
+// narrated a library and a brickyard that were never queued (turn 30 of run 65661dbf8382-016).
+test("an engine correction voids the queue order it follows", () => {
+  const runDir = makeRun([
+    begin(30, "Cleo"),
+    action(30, "Cleo", { kind: "choose", actionType: "build", targetId: "65536", args: { thing: "BUILDING_LIBRARY" } }),
+    { turn: 30, player: 0, playerName: "Cleo", kind: "action_correction", code: "NOT_QUEUED", message: "BUILDING_LIBRARY — queue still empty" },
+    action(30, "Cleo", { kind: "choose", actionType: "build", targetId: "65536", args: { thing: "UNIT_SETTLER" } }),
+    end(30, "Cleo"),
+  ]);
+  const did = readTurns(runDir)[0]!.seats[0]!.did;
+  assert.match(did[0]!, /CORRECTION: the order did NOT take/);
+  assert.doesNotMatch(did[1]!, /CORRECTION/, "the order that really queued keeps its clean line");
+});
+
+// The narrator read grid numbers aloud ("moved to 50,13") because the action lines carried raw
+// coordinate args and numeric ids. A viewer has no map grid, so those must not reach the caster;
+// a build's type (the useful arg) must survive. Direction, when given, is cardinal — a voice rule.
+test("coordinate args and numeric ids are stripped from the caster prompt, build type kept", () => {
+  const runDir = makeRun([
+    begin(6, "Ada"),
+    action(6, "Ada", { actionType: "UNITOPERATION_MOVE_TO", targetId: "131072", args: { X: 50, Y: 13 } }),
+    action(6, "Ada", { kind: "build", actionType: "CITYOPERATION_BUILD", targetId: "65536", args: { thing: "UNIT_SCOUT" } }),
+    end(6, "Ada"),
+  ]);
+  const prompt = promptFor(readTurns(runDir)[0]!);
+  assert.doesNotMatch(prompt, /"[XY]":/, "no coordinate blobs");
+  assert.doesNotMatch(prompt, /\bon \d+/, "no numeric target ids");
+  assert.match(prompt, /UNIT_SCOUT/, "the build type is a meaningful arg and stays");
+});
+
+// The narrator called powers by their raw id ("p11", "player 2") because the agents' journals and
+// the log refer to them that way and nothing translated. A legend (seats from the event log,
+// city-states from the players dump) turns those codes into names before the caster sees them.
+test("a legend rewrites player-id codes to names in the prompt", () => {
+  const runDir = makeRun([begin(9, "Ada"), end(9, "Ada")]);
+  writeNotes(runDir, "Ada", ["- t9: declared war on p11 and warned p2 to stay out of it"]);
+  const turn = readTurns(runDir)[0]!;
+  const legend = new Map<number, string>([
+    [0, "Ada"],
+    [2, "Cleo"],
+    [11, "Carthage"],
+  ]);
+  const prompt = promptFor(turn, [], [], legend);
+  assert.match(prompt, /Carthage/, "the city-state id becomes its name");
+  assert.match(prompt, /Cleo/, "the seat id becomes its name");
+  assert.doesNotMatch(prompt, /\bp(?:11|2)\b/i, "no raw player-id codes survive");
+});
+
+// The did-lines are filtered before the caster sees them, but the agents' JOURNAL and REASONING
+// reached the prompt raw — and agents journal plumbing ("granary order was rejected", open with
+// "the ILLEGAL_ACTION means..."). The model sanitised it by luck. Scrub notes+reasoning too, clause
+// by clause, so the game-world part survives and only the plumbing is cut.
+test("plumbing in a seat's notes and reasoning never reaches the caster prompt", () => {
+  const runDir = makeRun([begin(9, "Ada"), end(9, "Ada")]);
+  writeNotes(runDir, "Ada", [
+    "- t8: founded second city; granary order was rejected",
+    "- t9: monument command inexplicably failed; held the line and built walls",
+  ]);
+  writeTranscript(
+    runDir, "Ada", 9,
+    "--- thinking ---\nThe ILLEGAL_ACTION means I should reposition. I will march the horsemen north.\n\n--- ran ---\n$ civ hud\n",
+  );
+  const turn = readTurns(runDir)[0]!;
+  const prompt = promptFor(turn);
+  assert.doesNotMatch(prompt, /ILLEGAL_ACTION/, "no engine codes from reasoning");
+  assert.doesNotMatch(prompt, /rejected|inexplicably failed|command/i, "no plumbing verbs from notes");
+  assert.match(prompt, /founded second city/, "the game-world half of the note survives");
+  assert.match(prompt, /horsemen north/, "the game-world half of the reasoning survives");
 });

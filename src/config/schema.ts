@@ -25,6 +25,8 @@ export type AgentSpec = {
   civSwitch: "agent" | "fixed";
   brain: { kind: "scripted" } | { kind: "model"; model: string };
   budget: { tokensPerGame: number; secondsPerTurn: number; actionsPerTurn: number };
+  /** The seat's monologue voice. `id` is an ElevenLabs voice; `gender` is metadata for alignment. */
+  voice?: { id: string; gender?: "m" | "f" | "x" };
 };
 
 export type MatchConfig = {

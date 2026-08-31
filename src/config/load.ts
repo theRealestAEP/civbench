@@ -80,6 +80,17 @@ const CONTROL_MODES = ["direct", "hotseat", "network_mp"] as const;
 const CIV_SWITCH = ["agent", "fixed"] as const;
 const MEMORY_MODES = ["fresh", "persistent"] as const;
 
+/** A seat's monologue voice from YAML: `voice: { id, gender }`. Absent -> no configured voice. */
+function voiceOf(raw: Json | undefined): AgentSpec["voice"] {
+  if (raw === undefined || raw === null) return undefined;
+  const v = asObject(raw);
+  const id = v.id === undefined ? "" : asString(v.id, "");
+  if (!id) return undefined;
+  const g = v.gender === undefined ? undefined : asString(v.gender, "");
+  const gender = g === "m" || g === "f" || g === "x" ? g : undefined;
+  return { id, gender };
+}
+
 export function loadMatchConfig(path: string): LoadedConfig {
   const source = readFileSync(path, "utf8");
   const parsed: Json = parse(source);
@@ -128,6 +139,7 @@ export function loadMatchConfig(path: string): LoadedConfig {
           secondsPerTurn: asNumber(budget.seconds_per_turn, DEFAULT_BUDGET.secondsPerTurn),
           actionsPerTurn: asNumber(budget.actions_per_turn, DEFAULT_BUDGET.actionsPerTurn),
         },
+        voice: voiceOf(a.voice),
       };
     }),
     harness: {
