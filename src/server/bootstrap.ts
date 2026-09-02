@@ -79,7 +79,7 @@ export function seatsFrom(config: MatchConfig): MatchSeats {
     config: agents[i]!,
     brain:
       a.brain.kind === "model"
-        ? new PiBrain(a.brain.model, "low", config.harness.memoryMode)
+        ? new PiBrain(a.brain.model, a.brain.thinking, config.harness.memoryMode)
         : new ScriptedBrain(),
   }));
   return { seats, agents };
@@ -130,12 +130,16 @@ export async function startMatch(
   options: { turnLimit: number; majorPlayers?: number } ,
 ): Promise<{ server: MatchServer; rules: { tables: number; rows: number } }> {
   const majors = options.majorPlayers ?? agents.length;
+  // Show the per-turn budget on the match line only when every seat shares one, so the number is
+  // never a false claim; a mixed set stays null and each seat reads its own from `civ time`.
+  const budgets = new Set(agents.map((a) => a.secondsPerTurn));
   const server = new MatchServer(adapter, runDir, agents, {
     turnLimit: options.turnLimit,
     speed: config.game.gameSpeed ?? null,
     singleAge: config.game.singleAge !== false,
     agentRivals: agents.length - 1,
     aiRivals: Math.max(0, majors - agents.length),
+    secondsPerTurn: budgets.size === 1 ? [...budgets][0]! : null,
   });
   server.autosave = config.harness.autosaveEveryTurn;
   // Never fatal: a match without the ruleset is worse for the agents, but still a match.

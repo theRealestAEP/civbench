@@ -1465,3 +1465,20 @@ test("civ resource refuses a resource the player does not have", async () => {
   assert.notEqual(assign.exitCode, 0);
   assert.match(assign.stdout, /NO_SUCH_THING/);
 });
+
+// The turn has a wall clock, and the agent can read how much is left. Without a running clock the
+// command says so rather than inventing a number; with one it reports the seat's own budget.
+test("civ time reports the seat's per-turn wall clock", async () => {
+  const { server, session } = await setup();
+  const before = await session.exec("civ time");
+  assert.equal(before.exitCode, 0, before.stderr);
+  assert.match(before.stdout, /no turn is running/, "no clock means no invented number");
+
+  server.startTurnClock(0);
+  const during = await session.exec("civ time");
+  assert.equal(during.exitCode, 0, during.stderr);
+  // The seat's budget is 60s, so it must name 60 and report a remainder at or just under it.
+  assert.match(during.stdout, /of 60s/, "it must state the seat's own limit");
+  assert.match(during.stdout, /\d+s left/, "it must state seconds remaining");
+  assert.match(during.stdout, /civ end-turn/, "and tell them to end before the clock runs out");
+});

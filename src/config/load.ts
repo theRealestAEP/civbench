@@ -91,6 +91,8 @@ function voiceOf(raw: Json | undefined): AgentSpec["voice"] {
   return { id, gender };
 }
 
+const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"] as const;
+
 export function loadMatchConfig(path: string): LoadedConfig {
   const source = readFileSync(path, "utf8");
   const parsed: Json = parse(source);
@@ -117,6 +119,7 @@ export function loadMatchConfig(path: string): LoadedConfig {
       turnLimit: asNumber(game.turn_limit, 250),
       fillerAi: asOneOf(game.filler_ai, FILLER_AI, "none", "game.filler_ai"),
       gameModes: asStrings(game.game_modes, []),
+      agentsPickLeaders: asBoolean(game.agents_pick_leaders, false),
     },
     controlMode: asOneOf(raw.control_mode, CONTROL_MODES, "direct", "control_mode"),
     agents: (Array.isArray(raw.agents) ? raw.agents : []).map((entry, index): AgentSpec => {
@@ -132,7 +135,11 @@ export function loadMatchConfig(path: string): LoadedConfig {
         civSwitch: asOneOf(a.civ_switch, CIV_SWITCH, "agent", "civ_switch"),
         brain:
           brain.model !== undefined
-            ? { kind: "model", model: asString(brain.model, "") }
+            ? {
+                kind: "model",
+                model: asString(brain.model, ""),
+                thinking: asOneOf(brain.thinking, THINKING_LEVELS, "low", "brain.thinking"),
+              }
             : { kind: "scripted" },
         budget: {
           tokensPerGame: asNumber(budget.tokens_per_game, DEFAULT_BUDGET.tokensPerGame),

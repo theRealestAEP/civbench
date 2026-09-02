@@ -113,3 +113,11 @@ test("a config with a bad enum value is refused at read time, by name", async ()
     "it must name the field and what was allowed",
   );
 });
+
+// Agents may pick their own leader at setup (a behavior study). Off by default so a normal match
+// is unchanged; the flag opts in.
+test("agents_pick_leaders defaults off and parses when set", () => {
+  assert.equal(loadMatchConfig(configFile(BASE)).config.game.agentsPickLeaders, false);
+  const on = loadMatchConfig(configFile("seed: 1\ngame: { agents_pick_leaders: true }\nagents:\n  - { slot: 0, player_id: 0, name: alpha }\n"));
+  assert.equal(on.config.game.agentsPickLeaders, true);
+});

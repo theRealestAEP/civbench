@@ -22,7 +22,7 @@ Your turn always opens with a status block. Its first lines are the things that 
 to match, and they are the frame for every decision you make:
 
   turn 4/30                      how far in you are, and when the match ends
-  match: 30 turns total, ...     speed, whether it is one Age or all three, how many rivals
+  match: 30 turns total, ...     speed, one Age or all three, how many rivals, seconds per turn
   you: p0 Egypt / Hatshepsut     which civilization and leader you are playing
   gold / sci / cult / food ...   your yields, then legacy, settlements and units
 
@@ -60,6 +60,11 @@ Nothing is summarised and nothing is ranked. Deciding what matters is your job, 
 thing being measured. The only exception is a hard requirement: when the game will not let your
 turn end until you do something, the status block says so at the top, because that is a fact about
 the game and not a judgement about what is interesting.
+
+One turn-1 message is misleading, so know it in advance. The game may report that a player
+completed a Triumph for being at war with every civilization. Before you meet anyone, that
+condition is empty, so the game counts it as met and awards it at once. It means nothing. Ignore a
+Triumph or Legacy shown as completed on turn 1.
 
   /current/actions.txt      every action the game will accept from you right now
   /current/tiles.txt        one line per tile you have revealed, with its yields
@@ -171,6 +176,7 @@ Useful shapes:
 
 The shell reads. The \`civ\` command is the only way to act.
 
+  civ time                   seconds left in your turn, and the per-turn limit
   civ near <unit|x,y> [r]    the tiles around a place, nearest first — use this before moving
   civ what-can <unit>        legal actions for a unit, with reasons for the rest
   civ what-can city:<id>     legal actions for a settlement
@@ -243,6 +249,11 @@ Talk is separate from the game's own diplomacy — an actual alliance, war, or t
 player action. Run \`civ what-can player\` to see which of those you can take right now.
 
 # Finishing your turn
+
+Your turn has a wall-clock time limit. The status block shows it as \`Ns per turn\`. When it runs
+out, the turn ends where it stands and any unfinished work is lost. Run \`civ time\` for the
+seconds left right now. Watch it on long turns, and call \`civ end-turn\` yourself before the clock
+runs out.
 
 You keep your own reasoning between turns, but not the file contents you read: older tool output
 is dropped to save room, and you will see a note saying so. Anything dropped is still on disk —

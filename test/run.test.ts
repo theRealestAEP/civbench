@@ -143,6 +143,8 @@ test("assembling a match gives it the ruleset, the match facts, and autosave", a
 
   const hud = await server.beginTurn(agents[0]!.playerId);
   assert.match(hud, /match: 7 turns total/, "the match facts line the briefing describes must appear");
+  // Both seats share a 30s budget, so the per-turn wall clock shows up front on the match line.
+  assert.match(hud, /30s per turn/, "the shared per-turn time budget must appear on the match line");
   assert.ok(
     existsSync(join(runDir, "agents", agents[0]!.name, "rules")),
     "/run/rules must exist for the agent",
@@ -239,4 +241,27 @@ test("the match has no forfeit rule", async () => {
   const source = readFileSync(new URL("../src/server/run.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /forfeit/i, "a seat is never removed from the match");
   assert.doesNotMatch(source, /strikes/i, "and nothing counts strikes against it");
+});
+
+// Game.turn restarts at 1 when a new Age begins. Run 77cbb1a9653b-001 reached the Antiquity
+// boundary at turn 93 and the engine then reported turns 1, 2, 3… — numbers every seat had
+// already played, so the loop force-ended each seat as "already played" and fourteen Exploration
+// turns went by with no agent acting. The match counts turns across Ages itself.
+test("the turn count runs on across an Age boundary, and the seat keeps playing", async () => {
+  // The fake world opens on turn 42; its Age ends after turn 44, three turns in.
+  const world = makeWorld({ ageEndsAfterTurn: 44 });
+  const { runDir, server, seats } = blockedMatch(new ScriptedBrain(), world);
+  const outcomes = await runMatch(server, runDir, seats, { turnLimit: 6 });
+
+  const alpha = outcomes[0]!;
+  assert.equal(alpha.turnsPlayed, 6, "three turns before the boundary and three after");
+  assert.equal(alpha.forcedEndTurns, 0, "no turn is mistaken for one already played");
+  // The new Age's first turn is turn 45 of the match, not a second turn 1.
+  for (const turn of [42, 43, 44, 45, 46, 47]) {
+    assert.ok(
+      existsSync(join(runDir, "agents", "alpha", "turns", `t00${turn}`)),
+      `turn ${turn} was played and written under its match-wide number`,
+    );
+  }
+  assert.ok(!existsSync(join(runDir, "agents", "alpha", "turns", "t0001")), "and no turn is filed as a second turn 1");
 });

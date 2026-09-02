@@ -134,6 +134,8 @@ export class MatchServer {
   #lastAction = new Map<number, string>();
   #lastPaint = new Map<number, number>();
   #lastTurnSeen = new Map<number, number>();
+  /** When the current turn's wall clock started, per seat, so `civ time` can report the remainder. */
+  #turnStartedAt = new Map<number, number>();
   /** The turn-start change counts, so `civ hud` can repeat them instead of printing zeros. */
   #lastCounts = new Map<number, HudCounts>();
   /** When this player's last engine mutation was dispatched, for write pacing. */
@@ -166,9 +168,49 @@ export class MatchServer {
   lastSeatWait = "no seat became active — the game may be waiting on something";
   #log: EventLog;
 
+  /**
+   * Turns played in the Ages already finished, so turn numbers run on across the whole match.
+   *
+   * Game.turn restarts at 1 when a new Age begins — the game's own Exploration and Modern advice
+   * scripts test `Game.turn == 1` for the first turn of the age. Run 77cbb1a9653b-001 met this
+   * at the Antiquity boundary: the engine reported turns 1, 2, 3… while every seat's stamp for
+   * those numbers was already in the played set, so each seat was force-ended as "already
+   * played" and fourteen Exploration turns went by with no agent acting. Every turn the harness
+   * reads passes through #absoluteTurn, which adds the finished Ages' turns back.
+   */
+  #turnsBeforeThisAge = 0;
+  /** The highest raw Game.turn seen in the current Age. */
+  #highestRawTurn = 0;
+
+  #absoluteTurn(raw: number): number {
+    // Game.turn is 1 on the first turn of every Age. Anything below that is a read taken while
+    // the engine had no turn to report, and must not move the count.
+    if (raw < 1) return this.#turnsBeforeThisAge + this.#highestRawTurn;
+    // A new Age: the counter fell back to its start. Only a large fall counts — a crash recovery
+    // reloads the last autosave, which can put the counter back by one within the same Age.
+    if (raw * 2 < this.#highestRawTurn) {
+      this.#turnsBeforeThisAge += this.#highestRawTurn;
+      this.#highestRawTurn = 0;
+    }
+    this.#highestRawTurn = Math.max(this.#highestRawTurn, raw);
+    return this.#turnsBeforeThisAge + raw;
+  }
+
+  /** The game's turn as the match counts it: continuous across Age boundaries. */
+  async #turn(): Promise<number> {
+    return this.#absoluteTurn(await this.#adapter.turn());
+  }
+
+  /** One player's snapshot, its turn renumbered across Ages like every other turn read. */
+  async #snapshot(playerId: number) {
+    const raw = await this.#adapter.snapshot(playerId);
+    raw.header.turn = this.#absoluteTurn(raw.header.turn);
+    return raw;
+  }
+
   /** The turn for an event line. Logging must never throw after the engine accepted an action. */
   async #safeTurn(): Promise<number> {
-    return this.#adapter.turn().catch(() => this.lastSnapshotTurn());
+    return this.#turn().catch(() => this.lastSnapshotTurn());
   }
 
   constructor(adapter: GameAdapter, runDir: string, agents: AgentConfig[], match?: MatchFacts) {
@@ -254,7 +296,7 @@ export class MatchServer {
     // Follow the seat that is about to play, so a spectator can see whose turn it is.
     await this.#adapter.run("focusseat", playerId).catch(() => undefined);
 
-    const raw = await this.#adapter.snapshot(playerId);
+    const raw = await this.#snapshot(playerId);
     await this.#sanitizeCarriedOrders(playerId, raw.units.own);
     const unread = this.#chat.unreadFor(this.#nameOf(playerId));
     // notes.md lives in the writable mount, which the snapshot writer does not know about.
@@ -510,11 +552,32 @@ export class MatchServer {
    * about the start of this turn, and an agent needs it stable to reason against. Everything else
    * — yields, units, settlements, what the game is waiting for — is re-read.
    */
+  /** Start a seat's per-turn wall clock. The run loop calls this when the brain begins its turn. */
+  startTurnClock(playerId: number): void {
+    this.#turnStartedAt.set(playerId, Date.now());
+  }
+
+  /**
+   * A seat's turn time budget and how much of it is left, or null if no turn is running.
+   * The budget is per-seat (secondsPerTurn), so this is always the seat's own limit.
+   */
+  turnClock(playerId: number): { budgetSec: number; elapsedSec: number; remainingSec: number } | null {
+    const start = this.#turnStartedAt.get(playerId);
+    const agent = this.#agents.get(playerId);
+    if (start === undefined || !agent) return null;
+    const elapsedSec = (Date.now() - start) / 1000;
+    return {
+      budgetSec: agent.secondsPerTurn,
+      elapsedSec,
+      remainingSec: Math.max(0, agent.secondsPerTurn - elapsedSec),
+    };
+  }
+
   async currentHud(playerId: number, turnStartDelta: string): Promise<string> {
     const dir = this.#currentTurnDir.get(playerId);
     if (!dir) return turnStartDelta;
     await this.settleDump(playerId).catch(() => undefined);
-    const raw = await this.#adapter.snapshot(playerId);
+    const raw = await this.#snapshot(playerId);
     const read = (name: string): string | undefined => {
       try {
         return readFileSync(join(dir, name), "utf8");
@@ -936,7 +999,7 @@ export class MatchServer {
   async refreshDump(playerId: number): Promise<void> {
     const dir = this.#currentTurnDir.get(playerId);
     if (!dir) return;
-    const raw = await this.#adapter.snapshot(playerId);
+    const raw = await this.#snapshot(playerId);
     const memory = this.#memory.get(playerId) ?? emptyMemory();
     // The SAME fog filter the turn-start snapshot applies. This refresh used to write
     // raw.units.foreign unfiltered — every mid-turn read bypassed the second defense layer — and
@@ -1348,11 +1411,12 @@ export class MatchServer {
       await new Promise((resolve) => setTimeout(resolve, 500));
       verdict = await this.#adapter.run<Verdict>("endcheck", playerId).catch(() => null);
       if (!verdict) continue;
-      if (verdict.active === false || (verdict.turn ?? before) > before) break; // it ended
+      // Changed, not merely greater: Game.turn restarts at 1 when a new Age begins.
+      if (verdict.active === false || (verdict.turn ?? before) !== before) break; // it ended
       if (verdict.sent === true) break; // accepted, the engine is working through it
     }
     const refused = verdict !== null && verdict.active === true && verdict.sent === false &&
-      (verdict.turn ?? before) <= before;
+      (verdict.turn ?? before) === before;
     if (!refused) return;
     state.ended = false;
     const blocking = verdict?.blocking ?? null;
@@ -1444,30 +1508,52 @@ export class MatchServer {
         .run<{ blocking?: string | null; skipped?: number }>("endturn", playerId, { FORCED: true, CLEAR_ONLY: true })
         .catch(() => ({ blocking: null, skipped: 0 }));
       if (cleared.blocking) {
-        const answered = await this.#adapter
-          .run<ChooseResult & { answered?: string; picked?: string }>(
-            "choose", playerId, { WHAT: null, THING: null, TARGET_ID: null, BLOCKER: cleared.blocking },
-          )
-          .catch(() => undefined);
-        // A forced clear can ANSWER a decision for the agent — a tech picked, a story closed.
-        // That is a game-state mutation and it belongs in the record: an unlogged one is exactly
-        // what notify()'s comment forbids, and the replay could not explain the changed state.
-        this.#log.append({
-          turn: await this.#safeTurn(),
-          player: playerId,
-          playerName: this.#nameOf(playerId),
-          kind: "forced_answer",
-          blocking: cleared.blocking,
-          ok: answered?.ok ?? false,
-          code: answered?.code ?? null,
-          extra: {
-            // SAFETY: choose.js's blocker path returns { answered, picked } on success; both
-            // reads are optional, so any other shape contributes null to the record.
-            answered: (answered as { answered?: string } | undefined)?.answered ?? null,
-            picked: (answered as { picked?: string } | undefined)?.picked ?? null,
-            skippedUnits: cleared.skipped ?? null,
-          },
-        });
+        // An Age-transition blocker is not a decision choose.js can answer. At a non-final Age's
+        // end each seat must commit its next-age CIVILIZATION and then submit "finished", which
+        // agefinish.js does. Routing it through the normal chooser only ever returned
+        // NO_OPTION_WORKED, so a 3-seat match looped on the blocker for hours (run
+        // 77cbb1a9653b-001, turn 93). Not a bare /AGE/: that matches VILLAGE and PILLAGE — the
+        // same trap choose.js and required.ts call out.
+        if (/AGE_TRANSITION|CHOOSE_CIVILIZATION|AGE_ENDED/.test(cleared.blocking)) {
+          const done = await this.#adapter
+            .run<{ finished: boolean; pickedCiv?: string | null }>("agefinish", playerId)
+            .catch(() => null);
+          this.#log.append({
+            turn: await this.#safeTurn(),
+            player: playerId,
+            playerName: this.#nameOf(playerId),
+            kind: "forced_answer",
+            blocking: cleared.blocking,
+            ok: done?.finished ?? false,
+            code: done?.finished ? null : "AGE_FINISH_REFUSED",
+            extra: { answered: "age transition", picked: done?.pickedCiv ?? null, skippedUnits: cleared.skipped ?? null },
+          });
+        } else {
+          const answered = await this.#adapter
+            .run<ChooseResult & { answered?: string; picked?: string }>(
+              "choose", playerId, { WHAT: null, THING: null, TARGET_ID: null, BLOCKER: cleared.blocking },
+            )
+            .catch(() => undefined);
+          // A forced clear can ANSWER a decision for the agent — a tech picked, a story closed.
+          // That is a game-state mutation and it belongs in the record: an unlogged one is exactly
+          // what notify()'s comment forbids, and the replay could not explain the changed state.
+          this.#log.append({
+            turn: await this.#safeTurn(),
+            player: playerId,
+            playerName: this.#nameOf(playerId),
+            kind: "forced_answer",
+            blocking: cleared.blocking,
+            ok: answered?.ok ?? false,
+            code: answered?.code ?? null,
+            extra: {
+              // SAFETY: choose.js's blocker path returns { answered, picked } on success; both
+              // reads are optional, so any other shape contributes null to the record.
+              answered: (answered as { answered?: string } | undefined)?.answered ?? null,
+              picked: (answered as { picked?: string } | undefined)?.picked ?? null,
+              skippedUnits: cleared.skipped ?? null,
+            },
+          });
+        }
       }
       // Let the engine apply the skips, the dismissal and the answer before reading or sending.
       await new Promise((resolve) => setTimeout(resolve, 900));
@@ -1558,7 +1644,7 @@ export class MatchServer {
   async waitForTurnAdvance(fromTurn: number, timeoutMs = 60_000): Promise<number> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const turn = await this.#adapter.turn();
+      const turn = await this.#turn();
       if (turn > fromTurn) return turn;
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
@@ -1568,7 +1654,7 @@ export class MatchServer {
   }
 
   currentTurn(): Promise<number> {
-    return this.#adapter.turn();
+    return this.#turn();
   }
 
 

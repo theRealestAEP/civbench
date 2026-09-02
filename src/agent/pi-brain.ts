@@ -209,7 +209,8 @@ export class PiBrain implements Brain {
       transcript.push(`--- thinking ---\n${text}`);
     });
 
-    this.#turnMarkers.push(this.#messages.length);
+    const turnStart = this.#messages.length;
+    this.#turnMarkers.push(turnStart);
     await agent.prompt(hud);
 
     // Stop when the TURN ends, not when the agent decides it is finished.
@@ -254,12 +255,15 @@ export class PiBrain implements Brain {
     }
 
     const turn: TurnUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    // Only this turn's messages. The transcript persists across turns and pi stamps usage on
+    // every assistant message it holds, so summing the whole list reported the match-to-date
+    // total as the turn's cost — "$7 per turn" by turn 90 of a run whose turns cost cents.
     // SAFETY: pi records usage on its own assistant messages. Both fields are optional, so an
     // arm of the union without them contributes nothing to the totals.
-    const messages = agent.state.messages as Array<{
+    const messages = (agent.state.messages as Array<{
       role?: string;
       usage?: TurnUsage & { cost?: { total?: number } };
-    }>;
+    }>).slice(turnStart);
     for (const message of messages) {
       const u = message.usage;
       if (message.role !== "assistant" || !u) continue;

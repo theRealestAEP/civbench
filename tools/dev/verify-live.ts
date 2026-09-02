@@ -171,6 +171,7 @@ const apis = await bridge.eval<Record<string, string | boolean | null>>(`
     }
   } catch (e) { out.storyLookup = "err: " + String(e); }
   try { out.gridWidth = String(GameplayMap.getGridWidth()); } catch (e) { out.gridWidth = null; }
+  try { out.leaders = String((GameInfo.Leaders ? Array.from(GameInfo.Leaders) : []).length); } catch (e) { out.leaders = "err: " + String(e); }
   return out;
 `);
 await bridge.close();
@@ -214,6 +215,7 @@ check(apis.dealItemApi === "function", "DiplomacyDeals.getWorkingDealItem", Stri
 check(apis.dealAccept === "number" || apis.dealAccept === "string", "DealProposalActions.ACCEPTED", String(apis.dealAccept ?? "null"));
 check(typeof apis.storyLookup === "string" && !String(apis.storyLookup).startsWith("err"), "story option text lookup", String(apis.storyLookup));
 check(apis.gridWidth !== null, "GameplayMap.getGridWidth (wrap)", String(apis.gridWidth));
+check(apis.leaders !== null && !String(apis.leaders).startsWith("err") && Number(apis.leaders) > 0, "GameInfo.Leaders populated (leader pick)", String(apis.leaders));
 
 console.log(`\n${failures === 0 ? "all claims hold" : `${failures} claims FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

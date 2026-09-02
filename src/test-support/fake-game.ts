@@ -65,6 +65,12 @@ export type FakeWorld = {
   ageOver: boolean;
   /** Whether the current age is the FINAL one — only a final-age end is game-over. */
   finalAge: boolean;
+  /**
+   * The last turn of the current Age, or null when it never ends. Ending it restarts Game.turn
+   * at 1, as the real engine does at an Age boundary — the game's own Exploration and Modern
+   * advice scripts test `Game.turn == 1` for the first turn of the age.
+   */
+  ageEndsAfterTurn: number | null;
   /** Per-player resources available to assign, as {index (plot), hash (ResourceType)}. */
   resources: Record<number, Array<{ index: number; hash: number }>>;
   /** ASSIGN_RESOURCE sends recorded, so a test can assert a resource was placed. */
@@ -156,6 +162,7 @@ export function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     victories: [],
     ageOver: false,
     finalAge: false,
+    ageEndsAfterTurn: null,
     resources: {},
     resourceAssigns: [],
     notifications: new Map(),
@@ -730,13 +737,19 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
           world.unitMoves.clear(); // a new turn restores every unit's moves
           world.unitOrdered.clear(); // ...and clears their standing orders
           ended.clear();
-          world.turn += 1;
+          world.turn = world.turn === world.ageEndsAfterTurn ? 1 : world.turn + 1;
         }
       },
     },
     GameInfo: {
       Terrains: { lookup: (h: number) => ({ TerrainType: `TERRAIN_${h}` }) },
       Victories: { lookup: (h: number) => ({ VictoryType: `VICTORY_${h}` }) },
+      // The leaders an agent may pick at setup. RANDOM is a placeholder the list script filters out.
+      Leaders: table([
+        { LeaderType: "LEADER_XERXES", Name: "Xerxes" },
+        { LeaderType: "LEADER_HATSHEPSUT", Name: "Hatshepsut" },
+        { LeaderType: "LEADER_RANDOM", Name: "Random" },
+      ]),
       Biomes: { lookup: (h: number) => ({ BiomeType: `BIOME_${h}` }) },
       Features: { lookup: () => null },
       Resources: { lookup: (h: number) => ({ ResourceType: `RESOURCE_${h}` }) },

@@ -14,7 +14,11 @@ export type GameConfig = {
   turnLimit: number;
   fillerAi: "none" | "filler" | "barbarians_only";
   gameModes: string[];
+  /** When true, each agent picks its own leader at setup from the game settings (a behavior study). */
+  agentsPickLeaders: boolean;
 };
+
+export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export type AgentSpec = {
   slot: number;
@@ -23,7 +27,7 @@ export type AgentSpec = {
   leader?: string;
   civ?: string;
   civSwitch: "agent" | "fixed";
-  brain: { kind: "scripted" } | { kind: "model"; model: string };
+  brain: { kind: "scripted" } | { kind: "model"; model: string; thinking: ThinkingLevel };
   budget: { tokensPerGame: number; secondsPerTurn: number; actionsPerTurn: number };
   /** The seat's monologue voice. `id` is an ElevenLabs voice; `gender` is metadata for alignment. */
   voice?: { id: string; gender?: "m" | "f" | "x" };

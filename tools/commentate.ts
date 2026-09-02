@@ -5,7 +5,8 @@
 //
 // Default: write commentary for every finished turn the interestingness gate lets through.
 // --follow: watch a live run and stay with it. See the drop rule below.
-// --every-turn: no gate — a segment for every turn, the old metronome behavior.
+// --every-turn: no gate — a segment for every turn. Live (--follow) always does this; the flag
+//   forces it for the batch path too.
 // --drop-stale: when the audio queue falls behind, drop unspoken lines from older turns.
 import { existsSync, readFileSync, readdirSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -33,7 +34,10 @@ const monologue = args.includes("--monologue");
 const site = args.includes("--site");
 const portArg = args.indexOf("--port");
 const sitePort = portArg >= 0 ? Number(args[portArg + 1]) : 7667;
-const everyTurn = args.includes("--every-turn");
+// Live (follow) narrates every turn: the drop-stale + `behind` backstop below already thins the
+// feed when generation cannot keep up, so the highlight gate would only suppress monologues that
+// there was time to speak. The gate still governs the batch path, where highlights are the point.
+const everyTurn = args.includes("--every-turn") || follow;
 const dropStale = args.includes("--drop-stale");
 const given = args.find((a) => !a.startsWith("--"));
 

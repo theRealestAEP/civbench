@@ -29,6 +29,7 @@ const fail = (text: string, code = 1): CommandOutput => ({ stdout: text, stderr:
 const USAGE = `civ — act on the game. Reading is done with the shell; this is the only way to act.
 
   civ hud                                  the turn HUD again
+  civ time                                 seconds left in your turn, and the per-turn limit
   civ near <unit|x,y> [radius]             the tiles around a place, nearest first
   civ what-can <unit> [x,y]                legal unit actions now, with reasons for the rest
   civ what-can city:<id>                   legal actions for one settlement
@@ -173,6 +174,18 @@ export async function runCivCommand(
     case "hud":
       // Re-read, do not replay. The turn-start string is out of date the moment you act.
       return ok((await server.currentHud(playerId, deltaOf(lastHud()))) + "\n");
+
+    case "time": {
+      const clock = server.turnClock(playerId);
+      if (!clock) return ok("no turn is running, so there is no clock.\n");
+      const left = Math.round(clock.remainingSec);
+      const used = Math.round(clock.elapsedSec);
+      return ok(
+        `turn time: ${left}s left of ${clock.budgetSec}s (used ${used}s).\n` +
+          "When it runs out your turn ends where it stands and unfinished work is lost. " +
+          "Call `civ end-turn` before then.\n",
+      );
+    }
 
     case "list-ops": {
       const kinds = await server.operationTypes();

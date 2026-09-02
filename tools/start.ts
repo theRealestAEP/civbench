@@ -23,6 +23,8 @@ import { GameAdapter } from "../src/adapter/game.ts";
 import { MatchServer } from "../src/server/match.ts";
 import { runMatch } from "../src/server/run.ts";
 import { seatsFrom, writeManifest, connect, startMatch } from "../src/server/bootstrap.ts";
+import { pickLeader, matchLeader, leaderPrompt } from "../src/agent/pick-leader.ts";
+import { LEADERS } from "../src/agent/leaders-list.ts";
 import { renderReport } from "../src/server/report.ts";
 import { collectRun } from "../src/replay/build.ts";
 import { renderReplayPage } from "../src/replay/page.ts";
@@ -219,6 +221,59 @@ async function waitForTarget(match: (t: CdpTarget) => boolean, label: string, se
 }
 
 /** Kill any leftover game process and launch a fresh one through Steam. */
+/** A short, UI-free summary of the match settings for the leader pick. */
+function settingsSummary(): string {
+  const g = config.game;
+  return [
+    `Start age: ${g.startAge}`,
+    `Single age (ends in a victory, no age transitions): ${g.singleAge}`,
+    `Game speed: ${g.gameSpeed ?? "default"}`,
+    `Map: ${g.mapType}, size ${g.mapSize}`,
+    `Crises enabled: ${g.crises}`,
+    `Turn limit: ${g.turnLimit}`,
+    `Other players: ${Math.max(0, config.agents.length - 1)}`,
+    `Filler AI: ${g.fillerAi}`,
+  ].join("\n");
+}
+
+/** Let each model-driven agent choose its leader; fill `players` with the picks. Never throws. */
+/** Bound a promise; on timeout it rejects, so a stalled model falls back to the default leader. */
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    work,
+    new Promise<T>((_r, reject) => setTimeout(() => reject(new Error(`timed out after ${ms / 1000}s`)), ms)),
+  ]);
+}
+
+async function chooseLeaders(players: Record<number, { leader?: string }>): Promise<void> {
+  // The leader roster is a STATIC local list (src/agent/leaders-list.ts, extracted from the game's
+  // own leaders.xml) — no live query. Reading it from the shell was fragile: GameInfo.Leaders is
+  // empty before a match exists. setLeaderTypeName still validates the pick against the game.
+  const leaders = LEADERS;
+  const { system, user } = leaderPrompt(settingsSummary(), leaders);
+  const pickers = config.agents.filter((a) => a.brain.kind === "model");
+  console.log(`   ${pickers.length} agent(s) choosing a leader (high reasoning; this takes a moment)...`);
+  // In parallel and each on a timeout: a slow/stalled model (high thinking, and DeepSeek has a stall
+  // history) must NOT hang the whole setup — it falls back to the game's default leader.
+  await Promise.all(
+    pickers.map(async (agent) => {
+      if (agent.brain.kind !== "model") return;
+      try {
+        const answer = await withTimeout(pickLeader(agent.brain.model, system, user, agent.brain.thinking), 120_000);
+        const type = matchLeader(answer, leaders);
+        if (type) {
+          players[agent.playerId] = { leader: type };
+          console.log(`   ${agent.name} chose ${type}`);
+        } else {
+          console.log(`   ${agent.name} gave an unclear pick ("${answer.slice(0, 40)}"); using default`);
+        }
+      } catch (err) {
+        console.log(`   ${agent.name} leader pick skipped (${String(err).slice(0, 80)}); using default`);
+      }
+    }),
+  );
+}
+
 async function launchGame(): Promise<void> {
   for (const pid of findGamePids()) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
   await sleep(8000);
@@ -341,10 +396,15 @@ if (useFake) {
   console.log("2. hosting the match");
   const shell = await waitForTarget((t) => t.url.includes("root-shell"), "main menu", 240);
   bridge = await CdpBridge.connect(shell.webSocketDebuggerUrl);
-  const hosted = await new GameAdapter(bridge).run<{ summary?: Record<string, unknown> }>("newgame", 0, {
+  const shellAdapter = new GameAdapter(bridge);
+  // Each agent picks its own leader from the settings, before the game exists (a behavior study).
+  // Off by default; any failure falls back to the game's default leader and never blocks the start.
+  const players: Record<number, { leader?: string }> = {};
+  if (config.game.agentsPickLeaders) await chooseLeaders(players);
+  const hosted = await shellAdapter.run<{ summary?: Record<string, unknown> }>("newgame", 0, {
     SETUP: {
       humanSlots: config.agents.length,
-      players: {},
+      players,
       start: true,
       startAge: "AGE_ANTIQUITY",
       singleAge: config.game.singleAge,

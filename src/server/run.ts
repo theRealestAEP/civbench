@@ -159,6 +159,8 @@ async function runBrainTurn(
 ): Promise<void> {
   const activeId = seat.config.playerId;
   const started = Date.now();
+  // Start the seat's wall clock so `civ time` can report the remainder from inside the turn.
+  server.startTurnClock(activeId);
   // A model that has gone silent and a model that is working steadily both just sit there for
   // the whole turn budget, so watching the run cannot tell them apart. Say which it is: every
   // heartbeat reports how long since the model last produced anything.

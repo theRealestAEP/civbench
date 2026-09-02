@@ -28,6 +28,10 @@ export type MatchFacts = {
   /** Rival civs driven by the game's own AI. Must be counted from the loaded game, not assumed:
    *  `filler_ai: none` was silently ignored for a while and every match secretly had three. */
   aiRivals: number;
+  /** The per-turn wall-clock budget, in seconds, when every seat shares one. The exact per-seat
+   *  number is always available live from `civ time`; this is the up-front figure on the match
+   *  line, and it is null (and omitted) when seats were given different budgets. */
+  secondsPerTurn: number | null;
 };
 
 const num = (v: number | null | undefined, digits = 1): string =>
@@ -124,7 +128,8 @@ export function renderHud(
     ? [
         `match: ${match.turnLimit ?? "?"} turns total, ${match.speed ?? "default"} speed, ` +
           `${match.singleAge ? "this Age only" : "all three Ages"}, ` +
-          `${rivals} rival${rivals === 1 ? "" : "s"} (${who})`,
+          `${rivals} rival${rivals === 1 ? "" : "s"} (${who})` +
+          (match.secondsPerTurn ? `, ${match.secondsPerTurn}s per turn` : ""),
       ]
     : [];
   return [

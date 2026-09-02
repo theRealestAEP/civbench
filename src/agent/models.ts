@@ -126,6 +126,10 @@ export const MODELS = {
   "deepseek/deepseek-v4-pro": openrouter("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", 0.519, 1.038, 0.0433, 1_048_576, false),
   "z-ai/glm-5.2": openrouter("z-ai/glm-5.2", "GLM 5.2", 0.966, 3.036, 0.1932, 1_048_576, true),
   "z-ai/glm-5.3": openrouter("z-ai/glm-5.3", "GLM 5.3", 1.4, 4.4, 0.26, 1_048_576, true),
+  // Fast, non-reasoning variants (reasoning:false) — cheap and quick, which is what a 100+ turn,
+  // 3-seat match needs. "GLM 5.3 Spark" is GLM 5.3 Flash; the fast DeepSeek is v4-flash.
+  "z-ai/glm-5.3-flash": openrouter("z-ai/glm-5.3-flash", "GLM 5.3 Flash", 0.075, 0.25, 0.015, 1_310_720, false),
+  "deepseek/deepseek-v4-flash": openrouter("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", 0.081, 0.162, 0.016, 1_048_576, false),
   "moonshotai/kimi-k3": openrouter("moonshotai/kimi-k3", "Kimi K3", 3, 15, 0.3, 262_144, true),
 } satisfies Record<string, ModelDescriptor>;
 
