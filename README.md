@@ -62,6 +62,16 @@ writable `notes.md`, and one command (`civ`) to act with. It reads the position 
 `grep`, `jq`, and friends. Nothing is summarised for it, because deciding what matters is the
 thing being measured.
 
+## Popup access and interface checks
+
+Agents use `civ screen` to read open popup and chooser text, then
+`civ screen <screen-id> <control-id>` to activate a listed control. The same observations appear
+in `pending.txt` and `pending.jsonl`. Hotseat cleanup leaves gameplay choices to the agent.
+
+`npm run audit -- runs/<run-id>` reports missing screen content, unsupported inputs, and action
+failures. Recorded interface gaps make the run ineligible for benchmark comparisons.
+These checks cover recorded screens; unvisited interfaces still need live validation.
+
 ## Layout
 
 | Path | What |

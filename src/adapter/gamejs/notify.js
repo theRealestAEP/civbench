@@ -1,3 +1,7 @@
+// Popup ids belong to the screen interface, including ids from earlier dumps.
+if (String(TARGET_ID ?? "").startsWith("screen:")) {
+  return { ok: false, code: "USE_SCREEN", message: "this is a UI screen", hint: "civ screen reads its text and lists its controls" };
+}
 // Runs inside Civ 7. Acts on a notification: dismiss it, or activate it.
 //
 // This was the hole that stopped matches dead. A notification can BLOCK the end of a turn, and
@@ -51,7 +55,7 @@ if (TARGET_ID === null || TARGET_ID === undefined || TARGET_ID === "") {
       pending: live,
       hint: live.length > 0
         ? `pending right now: ${live.join(", ")}`
-        : "nothing is pending — you do not need to clear anything",
+        : "no engine notifications remain; civ screen lists open UI screens",
     };
   }
 }
@@ -65,7 +69,17 @@ const name = (() => {
 
 try {
   if (MODE === "activate") Game.Notifications.activate(target);
-  else Game.Notifications.dismiss(target);
+  else {
+    // Firaxis AdvisorWarning.dismiss acknowledges the exact notification before dismissing it.
+    // Its Target is the full ComponentID, including owner/type, returned by getIdsForPlayer.
+    if (name?.startsWith("NOTIFICATION_ADVISOR_WARNING_")) {
+      const acknowledged = startOperation(
+        Game.PlayerOperations, PLAYER_ID, PlayerOperationTypes.VIEWED_ADVISOR_WARNING, { Target: target },
+      );
+      if (!acknowledged.ok) return acknowledged;
+    }
+    Game.Notifications.dismiss(target);
+  }
 } catch (err) {
   return { ok: false, code: "NOTIFY_FAILED", message: String(err) };
 }

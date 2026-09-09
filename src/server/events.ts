@@ -117,6 +117,8 @@ function describe(event: Event): string {
         : `--- turn ENDED FOR IT by the harness ---`;
     case "forced_answer":
       return `--- harness answered blocker ${String(event.blocking ?? "?")} for it: ${String(event.extra?.picked ?? "?")} ---`;
+    case "interface_gap":
+      return `INTERFACE GAP: ${event.message}`;
     case "action_correction":
       return `CORRECTION ${event.code ?? "?"}: ${event.message ?? ""}`;
     case "game_over":

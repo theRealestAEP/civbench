@@ -19,7 +19,7 @@ const scriptCache = new Map<string, string>();
 
 /** Scripts that change game state. Never auto-replayed across a reconnect (see run()). */
 const MUTATING_SCRIPTS = new Set([
-  "act", "choose", "diplomacy", "notify", "deal", "endturn", "save", "chat",
+  "act", "choose", "diplomacy", "notify", "screen", "deal", "endturn", "save", "chat",
   "newgame", "startlobby", "loadsave", "handoff", "agefinish", "resource",
 ]);
 
@@ -31,7 +31,8 @@ function readGameJs(name: string): string {
 function loadScript(name: string): string {
   let source = scriptCache.get(name);
   if (source === undefined) {
-    source = `${readGameJs("_prelude")}\n${readGameJs(name)}`;
+    const screens = name === "pending" || name === "screen" ? readGameJs("_screens") : "";
+    source = `${readGameJs("_prelude")}\n${screens}\n${readGameJs(name)}`;
     scriptCache.set(name, source);
   }
   return source;

@@ -1117,6 +1117,27 @@ test("a move that goes nowhere is reported as a failure, not as ok", async () =>
   }
 });
 
+for (const moves of [0, 2]) {
+  test(`an accepted stalled move reports ${moves} remaining movement and the matching next step`, async () => {
+    const { session, world } = await setup();
+    world.unitMoves.set(10, moves);
+    world.stalledMoves.add(10);
+
+    const result = await session.exec("civ move 10 2,1");
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.stdout, /DID_NOT_MOVE/);
+    assert.match(result.stdout, new RegExp(`${moves} movement remaining`));
+    assert.doesNotMatch(result.stdout, /movement unspent|probably unreachable/);
+    if (moves === 0) {
+      assert.match(result.stdout, /another move next turn/);
+      assert.doesNotMatch(result.stdout, /civ near/);
+    } else {
+      assert.match(result.stdout, /civ near 10 2/);
+      assert.doesNotMatch(result.stdout, /finished moving for this turn/);
+    }
+  });
+}
+
 // 36 of 41 journal writes across three runs used `>` instead of `>>`, so six of nine agents
 // finished a fifteen-turn game with one line of memory and three with none — in the one file the
 // briefing calls "the only thing that survives between turns". `civ note` cannot overwrite.
@@ -1323,7 +1344,7 @@ test("a dismissal the game ignores is called out, with the command that answers 
   const runDir = mkdtempSync(join(tmpdir(), "civbench-dismiss-verify-"));
   const world = makeWorld();
   world.notifications.set(0, [
-    { id: 601, name: "NOTIFICATION_ADVISOR_WARNING_ECONOMIC", typeHash: 87654321, blocking: true, dismissible: false },
+    { id: 601, name: "NOTIFICATION_CHOOSE_TECH", typeHash: 87654321, blocking: true, dismissible: false },
   ]);
   const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
     { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
@@ -1336,6 +1357,9 @@ test("a dismissal the game ignores is called out, with the command that answers 
   const result = await session.exec("civ dismiss");
   assert.notEqual(result.exitCode, 0, "an ignored dismissal must not report ok");
   assert.match(result.stdout, /ignored the dismissal/);
+  assert.match(result.stdout, /civ tech/);
+  assert.doesNotMatch(result.stdout, /civ dismiss/);
+  assert.match(hud, /civ tech/);
 });
 
 // One engine-internal op returned ok once and taught an agent a 17-turn ritual. A human player
@@ -1481,4 +1505,42 @@ test("civ time reports the seat's per-turn wall clock", async () => {
   assert.match(during.stdout, /of 60s/, "it must state the seat's own limit");
   assert.match(during.stdout, /\d+s left/, "it must state seconds remaining");
   assert.match(during.stdout, /civ end-turn/, "and tell them to end before the clock runs out");
+});
+
+for (const advisor of ["MILITARY", "ECONOMIC", "CULTURE", "SCIENCE"]) {
+  test(`${advisor} advisor warning can be acknowledged with no visible popup`, async () => {
+    const { world, server, session, runDir } = await setup();
+    const warning = { id: 601, name: `NOTIFICATION_ADVISOR_WARNING_${advisor}`, typeHash: 87654321, blocking: true, dismissible: false };
+    world.notifications.set(0, [warning, { ...warning, id: 602 }]);
+    world.notifications.set(1, [{ ...warning, id: 701 }]);
+    const hud = await server.beginTurn(0);
+    assert.match(hud, /civ dismiss/);
+    const opened = await session.exec("civ open 601");
+    assert.match(opened.stdout, /civ dismiss 601/);
+    assert.match(opened.stdout, /no popup is visible/);
+    const screens = await session.exec("civ screen");
+    assert.match(screens.stdout, /"screens": \[\]/);
+
+    const dismissed = await session.exec("civ dismiss 601");
+    assert.equal(dismissed.exitCode, 0, dismissed.stdout);
+    assert.deepEqual(world.notifications.get(0)?.map(n => n.id), [602]);
+    assert.deepEqual(world.notifications.get(1)?.map(n => n.id), [701]);
+    const blocking = await session.exec("civ dismiss");
+    assert.equal(blocking.exitCode, 0, blocking.stdout);
+    assert.deepEqual(world.notifications.get(0), []);
+    await session.exec("civ skip 10");
+    const ended = await session.exec("civ end-turn");
+    assert.equal(ended.exitCode, 0, ended.stdout);
+    assert.doesNotMatch(readFileSync(join(runDir, "events.jsonl"), "utf8"), /DISMISS_IGNORED/);
+  });
+}
+
+test("forced end-turn uses the advisor acknowledgment and records it", async () => {
+  const { world, server, runDir } = await setup();
+  world.notifications.set(0, [{ id: 601, name: "NOTIFICATION_ADVISOR_WARNING_MILITARY", typeHash: 87654321, blocking: true, dismissible: false }]);
+  const ended = await server.endTurn(0, true);
+  assert.equal(ended.ok, true);
+  assert.deepEqual(world.notifications.get(0), []);
+  const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
+  assert.match(events, /"kind":"forced_answer".*"ok":true.*"answered":"advisor warning"/);
 });

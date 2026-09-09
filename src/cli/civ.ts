@@ -70,6 +70,7 @@ const USAGE = `civ — act on the game. Reading is done with the shell; this is 
   civ deal accept <player>                 accept the deal they sent you
   civ deal reject <player>                 turn it down
   civ resource [<resource> <city>]         assign a new resource to a settlement, or list both
+  civ screen [screen-id] [control-id]      read open popup text and controls, or activate one
   civ dismiss [id]                         clear a notification; with no id, the one blocking you
   civ open <id>                            open a notification that wants a decision
   civ end-turn                             end your turn
@@ -143,7 +144,7 @@ function renderResult(result: ActionResult): CommandOutput {
   // on `message`, which this printed only for failures, so the agent saw a bare "ok".
   if (result.ok) {
     const said = result.note ?? result.message;
-    return ok(said ? `ok — ${said}\n` : "ok\n");
+    return ok((said ? `ok — ${said}\n` : "ok\n") + (result.hint ? `hint: ${result.hint}\n` : ""));
   }
   // Failure messages are part of the benchmark surface (§10): always a reason, and a remedy
   // when the engine gave us one.
@@ -345,12 +346,17 @@ export async function runCivCommand(
           // turns unskippable and the engine's async worker re-chews the dead entry — the
           // pattern under every observed engine crash. Clear what we watched get created.
           await server.cancelDeadOrder(playerId, unit);
+          const remaining = state.moves === null
+            ? "remaining movement is unavailable"
+            : `${state.moves} movement remaining`;
+          const hint = state.moves === 0
+            ? "this unit has finished moving for this turn; give it another move next turn"
+            : `\`civ near ${unit} 2\` lists nearby plots and their move costs; check the unit's movement before choosing another destination`;
           return fail(
             `failed: DID_NOT_MOVE\n` +
-              `unit ${unit} is still at ${before} with its movement unspent — the engine accepted ` +
-              `the order and moved nothing. ${asked} is probably unreachable this turn. The dead ` +
-              `order was cancelled, so the unit is not left stuck.\n` +
-              `hint: \`civ near ${unit} 2\` lists the plots around it, with their move cost\n`,
+              `unit ${unit} is still at ${before}; ${remaining}. The engine accepted the order ` +
+              `but its position stayed unchanged. Cancellation of the stalled order was requested.\n` +
+              `hint: ${hint}\n`,
           );
         }
         // A move order spends the movement the unit has and then stops, so a distant target ends
@@ -582,6 +588,13 @@ export async function runCivCommand(
         );
         return ok(`what can go on the table with p${other}:\n${lines.join("\n")}\n`);
       }
+      return ok(JSON.stringify(result, null, 2) + "\n");
+    }
+
+    case "screen": {
+      if (rest.length > 2) return fail("usage: civ screen [screen-id] [control-id]\n");
+      const result = await server.screen(playerId, rest[0], rest[1]);
+      if (!result.ok || rest[1]) return renderResult(result);
       return ok(JSON.stringify(result, null, 2) + "\n");
     }
 

@@ -1,3 +1,4 @@
+import type { Window } from "happy-dom";
 // A miniature Civ 7 for tests (docs/PLAN.md §14, "fixture replay").
 //
 // This is deliberately not a mock of our own code: it fakes the GAME's API surface and then runs
@@ -37,6 +38,8 @@ export type FakeWorld = {
    *  factory: the factory runs afresh for every script evaluation, so state kept there resets
    *  between calls and a skipped unit looked unskipped on the very next command. */
   unitMoves: Map<number, number>;
+  /** Units whose move orders are accepted but leave their position and movement unchanged. */
+  stalledMoves: Set<number>;
   /** What each player has chosen to research / adopt, by player id. */
   researching: Map<number, number>;
   civic: Map<number, number>;
@@ -149,6 +152,7 @@ export function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     seats: 1,
     cityRequests: [],
     unitMoves: new Map(),
+    stalledMoves: new Set(),
     researching: new Map(),
     civic: new Map(),
     storyAnswered: new Set(),
@@ -193,7 +197,7 @@ function refId(ref: ComponentRef): number {
 type OperationType = string | number;
 
 /** Arguments an operation carries. Shapes differ per operation; all of them are JSON. */
-type OperationArgs = Record<string, Json>;
+type OperationArgs = Record<string, Json> & { Target?: { id: number; owner: number } };
 
 /** Every global the game-side scripts see. Open by nature: it IS the engine's global namespace. */
 type FakeGlobals = Record<string, Json | object>;
@@ -408,6 +412,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       CHANGE_TRADITION: "CHANGE_TRADITION",
       CHANGE_GOVERNMENT: "CHANGE_GOVERNMENT",
       CONSIDER_ASSIGN_TRADITIONS: "CONSIDER_ASSIGN_TRADITIONS",
+      VIEWED_ADVISOR_WARNING: "VIEWED_ADVISOR_WARNING",
       // MAKE_PEACE does NOT end in DIPLOMATIC_ACTION. It was missing from the operation filter,
       // so an agent could declare war and had no way out of it for the rest of the match.
       MAKE_PEACE: "MAKE_PEACE",
@@ -479,6 +484,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
             world.unitOrdered.add(unitId);
           }
           if (type === "UNITOPERATION_MOVE_TO") {
+            if (world.stalledMoves.has(unitId)) return;
             world.unitMoves.set(unitId, Math.max(0, (world.unitMoves.get(unitId) ?? 2) - 1));
             // The unit actually MOVES. It used to only lose a move and stay put, so the fake
             // could not tell a real move from the engine accepting an order and doing nothing —
@@ -547,6 +553,12 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       },
       PlayerOperations: {
         canStart: (pid: number, type: OperationType, args?: OperationArgs) => {
+          if (type === "VIEWED_ADVISOR_WARNING") {
+            const valid = args?.Target?.owner === pid && (world.notifications.get(pid) ?? []).some(
+              n => n.id === args?.Target?.id && n.name.startsWith("NOTIFICATION_ADVISOR_WARNING_"),
+            );
+            return { Success: valid, FailureReasons: valid ? [] : ["LOC_FAKE_INVALID_NOTIFICATION_TARGET"] };
+          }
           // A fake that says yes to everything cannot test a scan that looks for the one
           // operation the engine accepts — every scan would stop on the first candidate.
           if (typeof type === "string" && DIPLOMACY_OPERATIONS.has(type)) {
@@ -564,6 +576,14 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
         // Record the choice, so getResearching can report it back the way the real game does.
         // eslint-disable-next-line complexity -- a test double covering many operations by design; each op is a short flat branch.
         sendRequest: (pid: number, type: OperationType, args: OperationArgs) => {
+          if (type === "VIEWED_ADVISOR_WARNING") {
+            if (args.Target?.owner === pid) {
+              world.notifications.set(pid, (world.notifications.get(pid) ?? []).filter(
+                n => n.id !== args.Target?.id || !n.name.startsWith("NOTIFICATION_ADVISOR_WARNING_"),
+              ));
+            }
+            return;
+          }
           if (type === "ASSIGN_RESOURCE") {
             world.resourceAssigns.push({ player: pid, location: args?.Location, city: Number(args?.City) });
             return;
@@ -892,12 +912,20 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
   };
 }
 
+type FakeUiGlobals = {
+  document?: Window["document"];
+  getComputedStyle?: Window["getComputedStyle"];
+  CustomEvent?: Window["CustomEvent"];
+  GameContext?: { localPlayerID: number };
+  InputActionStatuses?: { FINISH: number };
+};
+
 /** A Bridge that runs the real gamejs scripts against the fake world. */
 export class FakeBridge implements Bridge {
   #context: object;
 
-  constructor(world: FakeWorld) {
-    this.#context = createContext(buildGlobals(world));
+  constructor(world: FakeWorld, uiGlobals: FakeUiGlobals = {}) {
+    this.#context = createContext({ ...buildGlobals(world), ...uiGlobals });
   }
 
   async eval<T = unknown>(js: string): Promise<T> {

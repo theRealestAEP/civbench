@@ -42,6 +42,7 @@ export type ActionRequest = {
     | "player_operation"
     | "choose"
     | "diplomacy"
+    | "screen"
     | "notify"
     | "deal";
   targetId?: string | number;
@@ -71,7 +72,7 @@ type TurnState = {
 
 /** The kinds that run as their own gamejs script; everything else goes through act.js. */
 function scriptForAction(kind: ActionRequest["kind"]): string {
-  return kind === "choose" || kind === "diplomacy" || kind === "notify" || kind === "deal"
+  return kind === "choose" || kind === "diplomacy" || kind === "notify" || kind === "deal" || kind === "screen"
     ? kind
     : "act";
 }
@@ -118,6 +119,7 @@ const SAME_ACTION_LIMIT = 3;
 
 export class MatchServer {
   #adapter: GameAdapter;
+  #reportedInterfaceGaps = new Set<string>();
   /** Set from the config; autosave_every_turn was previously parsed and then ignored. */
   autosave = true;
   #runDir: string;
@@ -205,6 +207,17 @@ export class MatchServer {
   async #snapshot(playerId: number) {
     const raw = await this.#adapter.snapshot(playerId);
     raw.header.turn = this.#absoluteTurn(raw.header.turn);
+    for (const item of raw.pending.items) {
+      for (const issue of item.interfaceGaps ?? []) {
+        const key = `${playerId}:${item.type}:${issue}`;
+        if (this.#reportedInterfaceGaps.has(key)) continue;
+        this.#reportedInterfaceGaps.add(key);
+        this.#log.append({
+          kind: "interface_gap", turn: raw.header.turn, player: playerId,
+          playerName: this.#nameOf(playerId), message: `${item.type}: ${issue}`,
+        });
+      }
+    }
     return raw;
   }
 
@@ -695,6 +708,14 @@ export class MatchServer {
     });
   }
 
+  /** Popup reads are free; control activation follows the normal action budget and log. */
+  async screen(playerId: number, id?: string, control?: string) {
+    if (control) return this.act(playerId, {
+      kind: "screen", actionType: "activate", targetId: id, args: { control },
+    });
+    return this.#adapter.run<ActionResult>("screen", playerId, { TARGET_ID: id ?? null, ARGS: {} });
+  }
+
   /** Dismiss or open a notification. With no id, act on whatever is blocking the turn. */
   async notify(playerId: number, mode: "dismiss" | "activate", id?: string): Promise<ActionResult>{
     // Through act(), not straight to the adapter. This changes game state, so it must spend the
@@ -728,7 +749,7 @@ export class MatchServer {
         standing = await stillThere();
       }
       if (standing) {
-        const answer = answerFor(result.targetName ?? null);
+        const answer = answerFor(result.targetName ?? null)?.replace("<id>", result.targetId);
         this.#log.append({
           turn: await this.#safeTurn(),
           player: playerId,
@@ -748,6 +769,12 @@ export class MatchServer {
             : `\`civ open ${result.targetId}\` opens it; /current/pending.txt says what it is`,
         };
       }
+    }
+    if (mode === "activate" && result.ok && result.targetName?.includes("ADVISOR_WARNING")) {
+      return {
+        ...result,
+        hint: `read the advisor warning in /current/pending.txt, then run \`civ dismiss ${result.targetId}\` to acknowledge it. This works even when no popup is visible. Then retry \`civ end-turn\``,
+      };
     }
     return result;
   }
@@ -1527,6 +1554,15 @@ export class MatchServer {
             ok: done?.finished ?? false,
             code: done?.finished ? null : "AGE_FINISH_REFUSED",
             extra: { answered: "age transition", picked: done?.pickedCiv ?? null, skippedUnits: cleared.skipped ?? null },
+          });
+        } else if (cleared.blocking.startsWith("NOTIFICATION_ADVISOR_WARNING_")) {
+          const acknowledged = await this.#adapter.run<ActionResult>(
+            "notify", playerId, { MODE: "dismiss", TARGET_ID: null },
+          );
+          this.#log.append({
+            turn: await this.#safeTurn(), player: playerId, playerName: this.#nameOf(playerId),
+            kind: "forced_answer", blocking: cleared.blocking, ok: acknowledged.ok,
+            code: acknowledged.code ?? null, extra: { answered: "advisor warning" },
           });
         } else {
           const answered = await this.#adapter

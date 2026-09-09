@@ -24,9 +24,8 @@ const ANSWERS: Array<[RegExp, string]> = [
   [/TRADITION|POLICY|POLICIES/, "civ tradition <TYPE>, then `civ tradition done`"],
   [/AGE_TRANSITION|AGE_ENDED|CHOOSE_AGE/, "civ age finish"],
   [/UNIT_PROMOTION|PROMOTION_AVAILABLE/, "civ promote <unit>"],
-  // Advisor warnings are informational but can block; dismissal usually clears them, and when it
-  // does not, activating the notification does.
-  [/ADVISOR_WARNING/, "civ dismiss — and if it will not clear, civ open <id>"],
+  // The notification command sends the same acknowledgment as the advisor popup button.
+  [/ADVISOR_WARNING/, "civ dismiss"],
   // An Age crisis deals you CRISIS POLICY CARDS, and they go in crisis culture slots — the same
   // policy screen as any tradition (model-policies.ts reads CRISIS_CULTURE_SLOT alongside the
   // others). The old answer here was `civ what-can player`, a placeholder that answers nothing:

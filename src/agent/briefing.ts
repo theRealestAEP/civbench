@@ -215,9 +215,18 @@ The shell reads. The \`civ\` command is the only way to act.
   civ do player-op <TYPE> [k=v ...]
   civ say <text>             tell every civ you have met
   civ say @<seat> <text>     tell one civ privately
+  civ screen [screen-id] [control-id]  read popup text and controls, or activate one
   civ dismiss [id]           clear a notification; with no id, whichever is blocking your turn
   civ open <id>              open a notification that wants a decision from you
   civ end-turn               finish your turn
+
+Open UI screens appear in pending.txt with their text and control ids. Use \`civ screen\`
+to read the current screens, then \`civ screen <screen-id> <control-id>\` to select a control.
+Read again after activation to see the result. Resolve the top popup first.
+For an advisor warning, read its text in /current/pending.txt and run
+\`civ dismiss <notification-id>\` to acknowledge it. This sends the same acknowledgment as
+its popup's Dismiss button and works even when the popup is absent. Then retry \`civ end-turn\`.
+Use only screen and control ids returned by \`civ screen\`; an empty list means no screen is open.
 
 The commands from \`build\` down to \`attribute\` are the recurring decisions of a Civ game: what a
 settlement makes, what you research, what civics you adopt, how you govern, where a grown city
@@ -287,7 +296,8 @@ and the plot is acceptable, found there rather than walking one tile for a bette
 
 A turn will not end while a notification blocks it, or while a unit still needs orders. If
 \`civ end-turn\` refuses it names the exact thing — the unit, the settlement, or the decision —
-and the command that answers it. Follow that; do not guess. Note that a unit having movement left
+and the command that answers it. Read the full response, including its hint. Resolve the
+stated blocker before retrying end-turn. Note that a unit having movement left
 is not the same as needing orders: only a unit that has not moved AT ALL holds the turn open. One
 that is fortified, asleep, busy (\`busy=yes\`), or has spent part of its movement blocks nothing.
 \`civ skip <unit>\` finishes a unit that is waiting for orders; a busy unit refuses it and does

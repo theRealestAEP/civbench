@@ -13,6 +13,7 @@
 // and never trust an `ok` that the agent had to issue twice.
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import type { PendingItem } from "../src/dump/types.ts";
 import type { Event } from "../src/server/events.ts";
 
 type Bucket = { ok: number; fail: number; codes: Map<string, number> };
@@ -46,11 +47,47 @@ function keyOf(event: Event): string {
 
 export type Finding = { severity: "high" | "medium"; what: string; detail: string };
 
+function auditScreens(runDir: string): Finding[] {
+  const findings: Finding[] = [];
+  // A screen can be inaccessible without any failed action. Inspect the saved observations.
+  const agentsDir = join(runDir, "agents");
+  const gaps = new Map<string, string>();
+  if (existsSync(agentsDir)) {
+    for (const agent of readdirSync(agentsDir)) {
+      const turnsDir = join(agentsDir, agent, "turns");
+      if (!existsSync(turnsDir)) continue;
+      for (const turn of readdirSync(turnsDir)) {
+        const file = join(turnsDir, turn, "pending.jsonl");
+        if (!existsSync(file)) continue;
+        for (const line of readFileSync(file, "utf8").split("\n").filter(Boolean)) {
+          // SAFETY: pending.jsonl is written from the adapter's PendingItem records.
+          const item = JSON.parse(line) as PendingItem;
+          if (!item.type?.startsWith("SCREEN_")) continue;
+          const issues = [...(item.interfaceGaps ?? [])];
+          if (!item.message) issues.push("screen text missing");
+          if (!item.controls?.length) issues.push("screen controls missing");
+          for (const issue of issues) gaps.set(`${item.type}: ${issue}`, file);
+        }
+      }
+    }
+  }
+  for (const [what, file] of gaps) findings.push({ severity: "high", what, detail: file });
+  return findings;
+}
+
 export function auditRun(runDir: string): Finding[] {
   const events = readEvents(runDir);
-  if (events.length === 0) return [];
   const findings: Finding[] = [];
 
+  findings.push(...auditScreens(runDir));
+  for (const e of events) {
+    if (e.kind === "interface_gap") findings.push({
+      severity: "high", what: e.message ?? "interface gap", detail: `${e.playerName} turn ${e.turn}`,
+    });
+    if (e.result?.code === "SCREEN_INPUT_IGNORED") findings.push({
+      severity: "high", what: "screen activation was ignored", detail: `${e.playerName} turn ${e.turn}`,
+    });
+  }
   // 1. Actions that fail far more often than they work, grouped by argument kind.
   const byKey = new Map<string, Bucket>();
   for (const e of events) {
@@ -165,4 +202,4 @@ for (const f of sorted) {
   console.log(`[${f.severity.toUpperCase()}] ${f.what}`);
   if (f.detail) console.log(`         ${f.detail}`);
 }
-if (sorted.length === 0) console.log("nothing silently failing — every action kind mostly works");
+if (sorted.length === 0) console.log("no findings from the recorded actions and popup snapshots; unvisited interfaces remain unverified");

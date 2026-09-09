@@ -283,7 +283,10 @@ export function pendingLines(pending: PendingSnapshot): string[] {
     line("pending", item.id, [
       ["type", item.type],
       ["blocking", item.type !== null && item.type === pending.blockingType],
-      ["summary", item.summary ?? item.message],
+      ["summary", item.summary],
+      ["message", item.message],
+      ["controls", item.controls ? JSON.stringify(item.controls) : null],
+      ["interface_gaps", item.interfaceGaps?.length ? item.interfaceGaps.join("; ") : null],
     ]),
   );
 }

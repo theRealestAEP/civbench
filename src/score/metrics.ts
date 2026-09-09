@@ -121,6 +121,9 @@ export function scoreAgent(
   };
 
   const inadmissibleBecause: string[] = [];
+  if (events.some(e => e.kind === "interface_gap" || e.result?.code === "SCREEN_INPUT_IGNORED")) {
+    inadmissibleBecause.push("interface gap recorded in this run; benchmark comparison requires complete access");
+  }
   if (turns < MIN_TURNS) inadmissibleBecause.push(`only ${turns} turns (need ${MIN_TURNS})`);
   if (hygiene.forcedEndTurns > 0) {
     inadmissibleBecause.push(`${hygiene.forcedEndTurns} turns were ended for it`);

@@ -205,6 +205,15 @@ export type PendingItem = {
   type: string | null;
   summary: string | null;
   message: string | null;
+  controls?: Array<{
+    id: string;
+    label: string;
+    disabled: boolean;
+    selected?: string | null;
+    context?: string;
+    description?: string | null;
+  }>;
+  interfaceGaps?: string[];
 };
 export type PendingSnapshot = { blockingType: string | null; items: PendingItem[] };
 

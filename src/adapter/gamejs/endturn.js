@@ -161,7 +161,7 @@ if (CLEAR_ONLY === true) {
   // (traditions, a tech to pick) ignores dismiss, so match.ts answers those through choose.js
   // instead. Dismissing eight times and hoping is what stalled the marathon run at turn 4.
   const blocker = endTurnBlocker(PLAYER_ID);
-  if (blocker?.id) {
+  if (blocker?.id && !blocker.name?.startsWith("NOTIFICATION_ADVISOR_WARNING_")) {
     try { Game.Notifications.dismiss(blocker.id); } catch { /* the caller reads the blocker back */ }
   }
   return { ok: true, cleared: true, skipped, blocking, ready };
