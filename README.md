@@ -3,15 +3,14 @@
 An agent-agnostic benchmark where LLM agents play **Sid Meier's Civilization VII** against each
 other, with per-agent memory, full replays, and a spectator stream.
 
-
 ## Try it without the game
 
-The harness proves itself against a fake Civilization, so neither an install nor an API key is
-needed to run the tests or the demo:
+The harness runs against a fake Civilization, so you can run the tests and the demo with no
+game install and no API key:
 
 ```sh
 npm install
-npm test                                   # 82 tests, including the fog-of-war leak guard
+npm test
 npm run match configs/duel-scripted.yaml   # a full config-driven match, report, and replay
 ```
 
@@ -29,17 +28,16 @@ npm start -- --config configs/live-3.yaml
 npm start -- --fake                          # harness only, no Civilization needed
 ```
 
-One command does the whole sequence with no idle gaps: launch, host, start the hotseat lobby,
-verify the seats, run the spectator, play, then write the report and replay. It estimates cost
-first and refuses to start if the game hands back fewer seats than you asked for.
+One command does the whole sequence: enable the debug bridge, launch the game, host a match with
+no UI, start the hotseat lobby, verify the seats, run the spectator, play, then write the report
+and replay. It estimates cost first and refuses to start if the game hands back fewer seats than
+you asked for.
+
+The sequence runs without idle gaps on purpose. The Coherent debug server is serviced on the game
+thread, so a game left idle behind another window stops answering.
 
 **Keep the Civilization VII window in front.** macOS freezes occluded windows, which stops both
 the render and the debug bridge.
-
-`npm run live` does the whole thing in one unbroken sequence: enable the debug bridge, launch
-the game, host a match with no UI, wait for the map, then play it. That matters — the Coherent
-debug server is serviced on the game thread, so a game left idle behind another window stops
-answering. Doing it in one pass avoids the problem.
 
 Other entry points:
 
@@ -48,6 +46,7 @@ npm run enable-debug   # write UIDebugger/EnableTuner into AppOptions.txt
 npm run launch         # patch options and launch, then wait for the bridge
 npm run probe          # with a match running: read live state and report what works
 npm run match cfg.yaml # play a config; uses the live game if it answers, else the fake
+npm run audit -- runs/<run-id>   # report missing screen content, unsupported inputs, action failures
 ```
 
 ## How it works
@@ -59,18 +58,12 @@ agent (any model)  ->  tinysandbox  ->  civ command  ->  Match Server  ->  bridg
 
 An agent gets a shell, a read-only directory holding everything it is entitled to see, a
 writable `notes.md`, and one command (`civ`) to act with. It reads the position itself with
-`grep`, `jq`, and friends. Nothing is summarised for it, because deciding what matters is the
-thing being measured.
-
-## Popup access and interface checks
+`grep`, `jq`, and friends. The harness leaves summarisation to the agent, because deciding what
+matters is the thing being measured.
 
 Agents use `civ screen` to read open popup and chooser text, then
 `civ screen <screen-id> <control-id>` to activate a listed control. The same observations appear
-in `pending.txt` and `pending.jsonl`. Hotseat cleanup leaves gameplay choices to the agent.
-
-`npm run audit -- runs/<run-id>` reports missing screen content, unsupported inputs, and action
-failures. Recorded interface gaps make the run ineligible for benchmark comparisons.
-These checks cover recorded screens; unvisited interfaces still need live validation.
+in `pending.txt` and `pending.jsonl`.
 
 ## Layout
 
@@ -90,8 +83,6 @@ These checks cover recorded screens; unvisited interfaces still need live valida
 
 ## Operating notes
 
-Three things about Civ 7 that are easy to lose a day to, all confirmed against a running game:
-
 - **`UIDebugger` does not persist.** The game reads it at startup and re-comments it. Re-apply it
   before every launch.
 - **Never call `Configuration.editGame().reset()`.** It strips the enabled content modules while
@@ -100,27 +91,16 @@ Three things about Civ 7 that are easy to lose a day to, all confirmed against a
 - **`Automation.setActive(true)` before hosting**, or the game waits on a *Begin Game* button that
   no one is going to press.
 
-## Status
-
-Phase 0 is answered against build 1.4.2 and the system runs live. Confirmed on a running game:
-the CDP bridge, programmatic match setup with no UI, per-player fog across six players, the
-engine's own action masking, orders accepted, turns advancing, and the scripted baseline
-founding a city, research and civics set, production queued, and turns ending cleanly.
-
-Not yet exercised in a live game: messaging, trade, and combat. All three require agents to meet
-one another, and no match has yet run long enough for that to happen.
-
-## Three invariants
+## Invariants
 
 **Fog of war is structural.** The extraction scripts refuse to read a plot's mutable state while
 it is fogged; `src/dump/merge.ts` fills it from the player's own earlier snapshot and stamps
-`last_seen`. Another agent's directory is not mounted, so it is unaddressable rather than merely
-unreadable. `test/leak.test.ts` guards this.
+`last_seen`. Each agent sees only its own directory, so another agent's state is unaddressable.
 
 **Parity cuts both ways.** Showing an agent less than the game's UI shows a human is as bad as
-showing it more: it silently measures our adapter coverage instead of the model. That is why the
+showing it more: it silently measures adapter coverage instead of the model. That is why the
 agent gets the whole ruleset database and the engine's own failure reasons.
 
-**Clean is not the same as admissible.** A match with no timeouts still fails admissibility if it
-was too short or had turns ended for it. Hygiene is printed beside every result, and an
-inadmissible match cannot move the leaderboard.
+**Admissibility is stricter than a clean run.** A match with no timeouts still fails
+admissibility if it was too short or had turns ended for it. Hygiene is printed beside every
+result, and an inadmissible match cannot move the leaderboard.
