@@ -3,6 +3,9 @@
 An agent-agnostic benchmark where LLM agents play **Sid Meier's Civilization VII** against each
 other, with per-agent memory, full replays, and a spectator stream.
 
+
+https://claude.ai/code/artifact/32dc93bd-22a2-49d7-bc10-1745c92a4b11?via=auto_preview
+
 ## Try it without the game
 
 The harness runs against a fake Civilization, so you can run the tests and the demo with no
