@@ -3,7 +3,7 @@
 // Coherent Gameface (libcohtml + libHttpServer) serves CDP over a WebSocket and embeds the
 // DevTools frontend. Each Gameface "view" is a separate CDP target, so the game's UI context
 // and any other views appear as distinct targets in /json/list.
-import { type Bridge, BridgeError, unwrap, wrapExpression } from "./bridge.ts";
+import { type Bridge, BridgeError, BridgeTimeout, unwrap, wrapExpression } from "./bridge.ts";
 import type { Json } from "../dump/types.ts";
 
 export type CdpTarget = { id: string; title: string; url: string; webSocketDebuggerUrl: string };
@@ -135,7 +135,7 @@ export class CdpBridge implements Bridge {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
-        reject(new BridgeError(`CDP ${method} timed out after ${timeoutMs}ms`));
+        reject(new BridgeTimeout(`CDP ${method} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       this.#pending.set(id, {
         resolve: (v) => {

@@ -19,8 +19,11 @@ import {
 import { EventLog, type Event } from "./events.ts";
 import { ChatChannel, renderMessages, MAX_MESSAGE_CHARS, type ChatMessage } from "./chat.ts";
 import type {
-  ChooseResult, CatalogueResult, WhatCanResult, DiplomacyResult, DealResult, CombatPreview, UnitState,
+  ChooseResult, CatalogueResult, WhatCanResult, DiplomacyResult, DealResult, CombatPreview, UnitState, StrikeOptions,
 } from "./results.ts";
+
+/** What choose.js returns when asked to answer a blocker on the agent's behalf. */
+type ForcedAnswer = ChooseResult & { answered?: string; picked?: string; what?: string; target?: string };
 
 export type AgentConfig = {
   slot: number;
@@ -28,6 +31,13 @@ export type AgentConfig = {
   name: string;
   actionsPerTurn: number;
   secondsPerTurn: number;
+};
+
+/** `civ resource` with no arguments: what is still unplaced, and where there is room. */
+export type ResourceListing = {
+  /** `canGo` holds the ids of the settlements the engine will accept the resource in. */
+  resources: Array<{ name: string; index: number; assigned?: boolean; class?: string | null; canGo?: string[] }>;
+  cities: Array<{ name: string; id: string; isTown?: boolean; assigned?: number | null; cap?: number | null; free?: number | null }>;
 };
 
 export type ActionRequest = {
@@ -272,6 +282,8 @@ export class MatchServer {
 
   /** Seats whose save-carried unit orders have been sanitized since this process started. */
   #sanitized = new Set<number>();
+  /** Units whose standing orders the harness cancelled at this seat's first turn, to tell it. */
+  #cancelledOrders = new Map<number, string[]>();
 
   /**
    * Cancel every queued unit operation this seat carried INTO the session — once, at its first
@@ -298,6 +310,7 @@ export class MatchServer {
         }))
         .catch(() => undefined);
       this.logCorrection(playerId, "CARRIED_ORDER_CANCELLED", `unit ${unit.id}`);
+      this.#cancelledOrders.set(playerId, [...(this.#cancelledOrders.get(playerId) ?? []), unit.id]);
     }
   }
 
@@ -360,6 +373,18 @@ export class MatchServer {
     );
     this.#memory.set(playerId, written.memory);
     this.#currentTurnDir.set(playerId, written.dir);
+    // A correction the agent was never told about: the log recorded 76 cancelled standing orders
+    // and delta.md said nothing, so agents found units idle with no idea why.
+    const cancelled = this.#cancelledOrders.get(playerId) ?? [];
+    if (cancelled.length > 0) {
+      this.#cancelledOrders.delete(playerId);
+      appendFileSync(
+        join(written.dir, "delta.md"),
+        `\nharness note: the standing orders on unit${cancelled.length === 1 ? "" : "s"} ${cancelled.join(", ")} were ` +
+          `cancelled when this session attached to the game (a carried-over order can crash it). ` +
+          `Re-issue any you still want.\n`,
+      );
+    }
     this.#lastTurnSeen.set(playerId, raw.header.turn);
     this.#lastCounts.set(playerId, written.counts);
 
@@ -545,13 +570,9 @@ export class MatchServer {
       .catch(() => undefined);
   }
 
-  /** Save this turn's reasoning next to the dump it was reading. */
-  writeTranscript(playerId: number, text: string): void {
-    const dir = this.#currentTurnDir.get(playerId);
-    if (!dir) return;
-    try {
-      writeFileSync(join(dir, "transcript.md"), text + "\n");
-    } catch { /* the turn directory may already be gone */ }
+  /** Where this seat's current turn is being written, once beginTurn has run. */
+  turnDir(playerId: number): string | undefined {
+    return this.#currentTurnDir.get(playerId);
   }
 
   /**
@@ -694,7 +715,8 @@ export class MatchServer {
 
   /** What you can do to another civilization, and doing it. */
   async diplomacy(playerId: number, other?: number, action?: string): Promise<DiplomacyResult> {
-    if (other === undefined || !action) {
+    // `respond <ID> <answer>` addresses a proposal, not a player.
+    if (!action || (other === undefined && !/^respond\b/i.test(action))) {
       return this.#adapter.run<DiplomacyResult>("diplomacy", playerId, {
         OTHER_PLAYER: other ?? null,
         ACTION: null,
@@ -703,8 +725,8 @@ export class MatchServer {
     return this.act(playerId, {
       kind: "diplomacy",
       actionType: action,
-      targetId: String(other),
-      args: { other, action },
+      targetId: other === undefined ? undefined : String(other),
+      args: { other: other ?? null, action },
     });
   }
 
@@ -734,6 +756,11 @@ export class MatchServer {
     // Verify a dismissal actually took. The engine applies it asynchronously, and a DECISION
     // notification ignores dismissal entirely — six "ok — dismissed" answers in a row once sent
     // an agent in circles for a whole turn while the notification stood. Poll briefly; if it is
+    // A decision refused up front by notify.js: name the command that answers it.
+    if (mode === "dismiss" && result.code === "NOT_DISMISSIBLE") {
+      const answer = answerFor(result.targetName ?? null)?.replace("<id>", result.targetId ?? "");
+      if (answer) result.hint = `answer it with \`${answer}\``;
+    }
     // still there, say so and name the command that answers it.
     if (mode === "dismiss" && result.ok && result.targetId) {
       const stillThere = async (): Promise<boolean> => {
@@ -856,6 +883,19 @@ export class MatchServer {
   }
 
   /** A unit's remaining movement right now, without settling. */
+  /** What a unit could hit with a ranged attack right now; `civ attack` asks before choosing. */
+  async strikeOptions(playerId: number, unitId: string): Promise<StrikeOptions | null> {
+    return this.#adapter
+      .run<StrikeOptions>("strike", playerId, { UNIT_ID: Number(unitId) })
+      .catch(() => null);
+  }
+
+  /** The treasury, so a purchase can be checked against it. */
+  async goldBalance(playerId: number): Promise<number | null> {
+    const read = await this.#adapter.run<{ gold: number | null }>("gold", playerId).catch(() => null);
+    return read?.gold ?? null;
+  }
+
   async unitMoves(playerId: number, unitId: string): Promise<number | null> {
     const seen = await this.#adapter
       .run<UnitState>("unitstate", playerId, { UNIT_ID: Number(unitId) })
@@ -976,16 +1016,27 @@ export class MatchServer {
    * calls "the only thing that survives between turns". This cannot overwrite.
    */
   /** The player's resources and the settlements that can take them (for NOTIFICATION_ASSIGN_NEW_RESOURCES). */
-  async resources(
-    playerId: number,
-  ): Promise<{ resources: Array<{ name: string; index: number }>; cities: Array<{ name: string; id: string }> }> {
+  async resources(playerId: number): Promise<ResourceListing> {
     return this.#adapter
-      .run<{ resources: Array<{ name: string; index: number }>; cities: Array<{ name: string; id: string }> }>(
-        "resource",
-        playerId,
-        { MODE: "list", RESOURCE: null, CITY: null },
-      )
+      .run<ResourceListing>("resource", playerId, { MODE: "list", RESOURCE: null, CITY: null })
       .catch(() => ({ resources: [], cities: [] }));
+  }
+
+  /** "I have looked at my resources" — what clears the prompt once every slot is full. */
+  async resourcesDone(playerId: number): Promise<ActionResult> {
+    const request: ActionRequest = { kind: "player_operation", actionType: "CONSIDER_ASSIGN_RESOURCE", args: {} };
+    const result = await this.#adapter
+      .run<ActionResult>("resource", playerId, { MODE: "done", RESOURCE: null, CITY: null })
+      .catch((err) => ({ ok: false, code: "ENGINE_INTERNAL", message: String(err).slice(0, 120) }));
+    this.#log.append({
+      turn: this.lastSnapshotTurn(),
+      player: playerId,
+      playerName: this.#nameOf(playerId),
+      kind: "action",
+      request,
+      result,
+    });
+    return result;
   }
 
   /** Assign one resource to a settlement. ASSIGN_RESOURCE is a player operation, logged as one. */
@@ -1315,7 +1366,8 @@ export class MatchServer {
     const wanted = [
       "Units", "Constructibles", "Buildings", "Improvements", "Yields", "Resources",
       "Terrains", "Biomes", "Features", "Civilizations", "Leaders", "Ages",
-      "ProgressionTreeNodes", "Traditions", "Projects", "LegacyPaths", "Victories",
+      // Governments: agents asked for /run/rules/Governments.json nine times in one night.
+      "ProgressionTreeNodes", "Traditions", "Governments", "Projects", "LegacyPaths", "Victories",
       "UnitOperations", "UnitCommands", "PlayerOperations", "DiplomacyActions",
       // The tables that make the ones above worth having. Without ProgressionTreeNodeUnlocks an
       // agent picks research blind; without Unit_Stats it cannot judge a fight without a combat
@@ -1328,6 +1380,9 @@ export class MatchServer {
     let tables = 0;
     let rows = 0;
 
+    // The columns of each table, for the README. Agents spent a command per table per night
+    // on `jq '.[0] | keys'` to learn a file's shape, then forgot it two turns later.
+    const columns: string[] = [];
     for (const table of wanted) {
       if (available.size > 0 && !available.has(table)) continue;
       const data = await this.#adapter.ruleTable(table).catch(() => null);
@@ -1335,6 +1390,8 @@ export class MatchServer {
       tables++;
       rows += data.rows.length;
       const cleaned = data.rows.map(stripMarkup);
+      const keys = Object.keys(cleaned[0] ?? {}).filter((k) => !k.startsWith("$")).slice(0, 12);
+      columns.push(`- ${table}.json (${cleaned.length} rows): ${keys.join(", ")}`);
       // One JSON file per table, plus a greppable text summary — the same text/JSON pairing the
       // dump uses (§6.1), for the same reason.
       for (const agent of this.#agents.values()) {
@@ -1365,7 +1422,19 @@ export class MatchServer {
         `# rules\n\nThe gameplay database of this build, one JSON file per table.\n` +
           `Exported once at the start of the match, so it matches the installed version and DLC.\n\n` +
           `Use jq: \`jq '.[] | select(.UnitType=="UNIT_SCOUT")' /run/rules/Units.json\`\n\n` +
-          `Tables: ${tables}, rows: ${rows}.\n`,
+          `Tables: ${tables}, rows: ${rows}.\n\n` +
+          `Before you read a file here, check whether a command already answers the question:\n` +
+          `- what a tech or civic unlocks: \`civ tech\` / \`civ civic\` print it beside each option\n` +
+          `- what a settlement can build or buy, with turns and price: \`civ build <city>\` / \`civ buy <city>\`\n` +
+          `- what earns legacy points: the legacy line of the status block says it per path\n` +
+          `- a unit's strength and moves: its line in /current/units.txt\n\n` +
+          `Columns per table (first row; \`jq '.[0]'\` shows one full row):\n${columns.join("\n")}\n\n` +
+          `Recipes:\n` +
+          `- a unit: \`jq '.[] | select(.UnitType=="UNIT_SETTLER") | {DisplayName, Cost, BaseMoves, DisplayDescription}' /run/rules/Units.json\`\n` +
+          `- what a node unlocks: \`jq -r '.[] | select(.ProgressionTreeNodeType=="NODE_TECH_AQ_POTTERY") | .TargetType' /run/rules/ProgressionTreeNodeUnlocks.json\`\n` +
+          `- a building's yields: \`jq -r '.[] | select(.ConstructibleType=="BUILDING_GRANARY") | [.YieldType, .YieldChange] | @tsv' /run/rules/Constructible_YieldChanges.json\`\n` +
+          `- buildings that give happiness: \`jq -r '.[] | select(.YieldType=="YIELD_HAPPINESS") | .ConstructibleType' /run/rules/Constructible_YieldChanges.json\`\n` +
+          `- legacy paths this Age: \`jq -r '.[] | select(.Age=="AGE_ANTIQUITY") | [.LegacyPathType, .DisplayDescription] | @tsv' /run/rules/LegacyPaths.json\`\n`,
       );
     }
     this.#log.append({ turn: 0, player: null, kind: "rules_exported", tables, rows });
@@ -1517,6 +1586,47 @@ export class MatchServer {
   }
 
   /**
+   * Answer a decision blocking a forced end-turn through the same table `civ <what>` uses.
+   *
+   * A forced clear can ANSWER a decision for the agent — a tech picked, a story closed. That is
+   * a game-state mutation and it belongs in the record: an unlogged one is exactly what
+   * notify()'s comment forbids, and the replay could not explain the changed state.
+   */
+  async #answerBlocker(playerId: number, blocking: string, skippedUnits: number | null): Promise<void> {
+    let answered = await this.#adapter
+      .run<ForcedAnswer>("choose", playerId, { WHAT: null, THING: null, TARGET_ID: null, BLOCKER: blocking })
+      .catch(() => undefined);
+    // A settlement- or unit-scoped decision: choose.js named the subject; list its options and
+    // take the first legal one. Any legal answer beats a stalled match.
+    if (answered?.code === "NEEDS_A_TARGET" && answered.what && answered.target) {
+      answered = await this.#answerFor(playerId, answered.what, answered.target);
+    }
+    this.#log.append({
+      turn: await this.#safeTurn(),
+      player: playerId,
+      playerName: this.#nameOf(playerId),
+      kind: "forced_answer",
+      blocking,
+      ok: answered?.ok ?? false,
+      code: answered?.code ?? null,
+      extra: { answered: answered?.answered ?? null, picked: answered?.picked ?? null, skippedUnits },
+    });
+  }
+
+  /** Answer a settlement- or unit-scoped decision for a seat with its first legal option. */
+  async #answerFor(playerId: number, what: string, target: string): Promise<ForcedAnswer> {
+    const listing = await this.#adapter
+      .run<ChooseResult>("choose", playerId, { WHAT: what, THING: null, TARGET_ID: target, BLOCKER: null, BUILD_PLOT: null })
+      .catch(() => undefined);
+    const first = (listing?.options ?? []).find((option) => option.available !== false);
+    if (!first) return { ok: false, code: "NO_OPTION_WORKED", what, target };
+    const sent = await this.#adapter
+      .run<ChooseResult>("choose", playerId, { WHAT: what, THING: first.name, TARGET_ID: target, BLOCKER: null, BUILD_PLOT: null })
+      .catch(() => undefined);
+    return { ...(sent ?? { ok: false, code: "ENGINE_INTERNAL" }), answered: `${what} for ${target}`, picked: first.name };
+  }
+
+  /**
    * Make a forced end-turn actually possible before sending it.
    *
    * Two things gate the end of a turn, and each one needed a fix the other did not.
@@ -1555,6 +1665,7 @@ export class MatchServer {
             code: done?.finished ? null : "AGE_FINISH_REFUSED",
             extra: { answered: "age transition", picked: done?.pickedCiv ?? null, skippedUnits: cleared.skipped ?? null },
           });
+          await this.#pressThroughScreens(playerId, cleared.blocking);
         } else if (cleared.blocking.startsWith("NOTIFICATION_ADVISOR_WARNING_")) {
           const acknowledged = await this.#adapter.run<ActionResult>(
             "notify", playerId, { MODE: "dismiss", TARGET_ID: null },
@@ -1565,35 +1676,50 @@ export class MatchServer {
             code: acknowledged.code ?? null, extra: { answered: "advisor warning" },
           });
         } else {
-          const answered = await this.#adapter
-            .run<ChooseResult & { answered?: string; picked?: string }>(
-              "choose", playerId, { WHAT: null, THING: null, TARGET_ID: null, BLOCKER: cleared.blocking },
-            )
-            .catch(() => undefined);
-          // A forced clear can ANSWER a decision for the agent — a tech picked, a story closed.
-          // That is a game-state mutation and it belongs in the record: an unlogged one is exactly
-          // what notify()'s comment forbids, and the replay could not explain the changed state.
-          this.#log.append({
-            turn: await this.#safeTurn(),
-            player: playerId,
-            playerName: this.#nameOf(playerId),
-            kind: "forced_answer",
-            blocking: cleared.blocking,
-            ok: answered?.ok ?? false,
-            code: answered?.code ?? null,
-            extra: {
-              // SAFETY: choose.js's blocker path returns { answered, picked } on success; both
-              // reads are optional, so any other shape contributes null to the record.
-              answered: (answered as { answered?: string } | undefined)?.answered ?? null,
-              picked: (answered as { picked?: string } | undefined)?.picked ?? null,
-              skippedUnits: cleared.skipped ?? null,
-            },
-          });
+          await this.#answerBlocker(playerId, cleared.blocking, cleared.skipped ?? null);
         }
       }
       // Let the engine apply the skips, the dismissal and the answer before reading or sending.
       await new Promise((resolve) => setTimeout(resolve, 900));
       if (!cleared.blocking) return;
+    }
+  }
+
+  /**
+   * Get past the screens an Age transition opens — dedications, then a confirmation dialog.
+   *
+   * agefinish.js submits the seat's choices, but the screen stood, the blocker stood with it,
+   * and one dead seat was "answered" 231 times in a run without ever finishing its transition.
+   * Press the obvious button, the way a human getting on with it would: Confirm when it is
+   * enabled, otherwise the first enabled choice that is not a way back out.
+   */
+  async #pressThroughScreens(playerId: number, blocking: string): Promise<void> {
+    type Control = { id: string; label: string; disabled?: boolean };
+    for (let step = 0; step < 6; step++) {
+      const read = await this.#adapter
+        .run<{ screens?: Array<{ id: string; controls?: Control[] }> }>("screen", playerId, { TARGET_ID: null, ARGS: {} })
+        .catch(() => null);
+      const screen = read?.screens?.at(-1);
+      if (!screen) return;
+      const usable = (screen.controls ?? []).filter((c) => !c.disabled);
+      const pick =
+        usable.find((c) => /^(confirm|ok|continue|accept|done|finish|close|yes)$/i.test(c.label.trim())) ??
+        usable.find((c) => !/view map|back|cancel|^no$/i.test(c.label.trim()));
+      if (!pick) return;
+      const pressed = await this.#adapter
+        .run<ActionResult>("screen", playerId, { TARGET_ID: screen.id, ARGS: { control: pick.id } })
+        .catch(() => null);
+      this.#log.append({
+        turn: await this.#safeTurn(),
+        player: playerId,
+        playerName: this.#nameOf(playerId),
+        kind: "forced_answer",
+        blocking,
+        ok: pressed?.ok ?? false,
+        code: pressed?.code ?? null,
+        extra: { answered: `screen ${screen.id}`, picked: pick.label },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 700));
     }
   }
 
@@ -1611,6 +1737,19 @@ export class MatchServer {
    * as a last resort (canStart-gated, so it is a no-op outside a transition), guaranteeing the
    * match cannot deadlock even if every agent idles.
    */
+  /**
+   * Agent seats the game no longer counts as alive but is still waiting on.
+   *
+   * Hotseat gives an eliminated human seat its turn — defeat screen up, turn active — and the
+   * round cannot move until that seat ends it. The living-only seat read never saw it.
+   */
+  async eliminatedSeats(seatIds: number[]): Promise<Array<{ id: number; active: boolean }>> {
+    const seats = await this.#adapter
+      .run<{ majors: Array<{ id: number; active: boolean; alive?: boolean }> }>("seats", 0, { SEAT_IDS: seatIds })
+      .catch(() => ({ majors: [] }));
+    return seats.majors.filter((m) => m.alive === false && seatIds.includes(m.id)).map((m) => ({ id: m.id, active: m.active }));
+  }
+
   async finishAgeTransitions(seatIds: number[]): Promise<number> {
     let finished = 0;
     for (const id of seatIds) {

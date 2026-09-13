@@ -287,6 +287,187 @@ function discoveryNear(id) {
   } catch { return null; }
 }
 
+/**
+ * Whether a unit holds the turn open: the game's own end-of-turn rule, in one place.
+ *
+ * SKIP_TURN is legal exactly for a unit the engine considers ready, and with the default
+ * unit-cycling setting only a unit that has not moved AT ALL blocks the end of the turn. Both
+ * the units dump and end-turn ask this, so the flag an agent reads at turn start and the refusal
+ * it gets at turn end cannot disagree. A unit on a standing order — auto-explore, a queued path —
+ * can still be ready: the order paused, and the engine wants a decision from it.
+ */
+function holdsTurnOpen(id) {
+  try {
+    const can = Game.UnitOperations.canStart(id, UnitOperationTypes.SKIP_TURN, {}, false);
+    if (!can?.Success) return false;
+    const unit = Units.get(id);
+    return Boolean(unit && unit.canMove && !unit.hasMoved);
+  } catch { return false; }
+}
+
+/**
+ * A unit the game's own unit-cycling stops on: awake, able to move, not moved at all, nothing
+ * queued. holdsTurnOpen() trusts SKIP_TURN, and the engine refuses that skip for a unit built
+ * this turn while NOTIFICATION_COMMAND_UNITS still waits on it — so the refusal named no unit,
+ * and `civ skip` on the right one answered "needs no skip": 68 nameless refusals across nine
+ * turns, three of them lost whole. Only a move ever cleared it.
+ */
+function awaitingOrders(id) {
+  try {
+    const unit = Units.get(id);
+    if (!unit || unit.canMove !== true || unit.hasMoved === true || unit.hasPendingOperations === true) return false;
+    if (typeof UnitActivityTypes === "undefined" || unit.activityType === undefined) return true;
+    return unit.activityType === UnitActivityTypes.AWAKE || unit.activityType === UnitActivityTypes.NONE;
+  } catch { return false; }
+}
+
+/** Whether what blocks the end of this player's turn is "a unit needs orders". */
+function waitingOnUnits(playerId) {
+  return /COMMAND_UNITS|MOVE_A_UNIT/.test(endTurnBlocker(playerId)?.name ?? "");
+}
+
+/**
+ * Give a unit the engine will not skip some other order it will take: sleep, fortify, or (when
+ * allowed) one step onto a neighbouring plot. Returns what was sent, or null when nothing was.
+ */
+function settleUnit(id, allowMove) {
+  for (const name of ["SLEEP", "FORTIFY"]) {
+    const op = UnitOperationTypes[name];
+    if (op === undefined) continue;
+    try {
+      if (Game.UnitOperations.canStart(id, op, {}, false)?.Success === true) {
+        Game.UnitOperations.sendRequest(id, op, {});
+        return name;
+      }
+    } catch { /* try the next */ }
+  }
+  if (!allowMove) return null;
+  const at = Units.get(id)?.location;
+  if (!at) return null;
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      if (dx === 0 && dy === 0) continue;
+      const args = { X: wrapX(at.x + dx), Y: at.y + dy };
+      if (args.Y < 0) continue;
+      try {
+        if (Game.UnitOperations.canStart(id, UnitOperationTypes.MOVE_TO, args, false)?.Success === true) {
+          Game.UnitOperations.sendRequest(id, UnitOperationTypes.MOVE_TO, args);
+          return `MOVE_TO ${args.X},${args.Y}`;
+        }
+      } catch { /* try the next */ }
+    }
+  }
+  return null;
+}
+
+/** The settlement this player just conquered and has not yet chosen to keep, raze or free. */
+function justConqueredCity(playerId) {
+  try {
+    for (const cid of Players.get(playerId)?.Cities?.getCityIds?.() ?? []) {
+      const city = Cities.get(cid);
+      if (city?.isJustConqueredFrom) return { id: String(cid.id ?? cid), name: locText(city.name ?? null) };
+    }
+  } catch { /* no cities */ }
+  return null;
+}
+
+/** The plots a settlement may put its new citizen on right now, as "x,y". */
+function expandPlots(cid) {
+  const plots = [];
+  const at = Cities.get(cid)?.location;
+  if (!at) return plots;
+  for (let dx = -3; dx <= 3; dx++) {
+    for (let dy = -3; dy <= 3; dy++) {
+      const x = wrapX(at.x + dx);
+      const y = at.y + dy;
+      if (y < 0) continue;
+      try {
+        if (Game.CityCommands.canStart(cid, CityCommandTypes.EXPAND, { X: x, Y: y }, false)?.Success === true) {
+          plots.push(`${x},${y}`);
+        }
+      } catch { /* not this plot */ }
+    }
+  }
+  return plots;
+}
+
+/** Another civilization's unit standing on a plot this player can see, or null. */
+function foreignUnitAt(playerId, x, y) {
+  try {
+    if (GameplayMap.getRevealedState(playerId, x, y) !== RevealedStates.VISIBLE) return null;
+    for (const cid of MapUnits.getUnits?.(x, y) ?? []) {
+      const unit = Units.get(cid);
+      if (unit && unit.owner !== playerId) {
+        return { owner: unit.owner, type: shortName(typeName("Units", unit.type)) };
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
+/**
+ * What a plot is, for a refusal that names it: "water, which a land unit cannot enter",
+ * "a mountain", "unexplored", or its terrain. Null when the map will not say.
+ */
+function plotDescription(playerId, x, y, from = null) {
+  try {
+    if (GameplayMap.getRevealedState(playerId, x, y) === RevealedStates.HIDDEN) return "unexplored";
+    if (GameplayMap.isWater(x, y)) return "water, which a land unit cannot enter";
+    if (GameplayMap.isMountain?.(x, y)) return "a mountain";
+    if (GameplayMap.isImpassable?.(x, y)) return "impassable terrain";
+    const terrain = shortName(typeName("Terrains", GameplayMap.getTerrainType(x, y))) ?? "land";
+    const feature = shortName(typeName("Features", GameplayMap.getFeatureType(x, y)));
+    const what = `${terrain}${feature ? ` with ${feature}` : ""}`;
+    // "19,36 is flat; the way there is impassable" — fifty-five refusals for an adjacent flat
+    // tile that reads as walkable. Cliffs block an edge, not a tile, and the engine knows
+    // which edges (isCliffCrossing false = a cliff there, as the game's own map code reads it).
+    if (from && GameplayMap.getPlotDistance?.(from.x, from.y, x, y) === 1 && typeof GameplayMap.isCliffCrossing === "function") {
+      const dir = GameplayMap.getDirectionToPlot?.({ x: from.x, y: from.y }, { x, y });
+      if (dir !== undefined && dir >= 0 && GameplayMap.isCliffCrossing(from.x, from.y, dir) === false) {
+        return `${what} behind a cliff — there is no crossing from ${from.x},${from.y}; go around`;
+      }
+    }
+    // Another civilization's land, with borders closed to a unit that is not at war with them.
+    const owner = GameplayMap.getOwner?.(x, y);
+    if (typeof owner === "number" && owner >= 0 && owner !== playerId) {
+      const them = Players.get(owner);
+      const atWar = Players.get(playerId)?.Diplomacy?.isAtWarWith?.(owner) === true;
+      if (them?.isMajor && !atWar) {
+        const name = locText(them.civilizationName ?? null) ?? `p${owner}`;
+        return `${what} inside ${name}'s borders, which are closed to you while you are at peace`;
+      }
+    }
+    return `${what}; the way there is impassable for this unit`;
+  } catch { return null; }
+}
+
+/** What sort of unit this is, for refusals: its name, and whether it is civilian or naval. */
+function unitKind(id) {
+  try {
+    const unit = Units.get(id);
+    const row = unit ? GameInfo.Units?.lookup?.(unit.type) : null;
+    if (!row) return null;
+    return {
+      name: shortName(row.UnitType) ?? "unit",
+      civilian: row.FormationClass === "FORMATION_CLASS_CIVILIAN",
+      naval: row.Domain === "DOMAIN_SEA",
+    };
+  } catch { return null; }
+}
+
+/** The game's own best settle spots near a settler, as "x,y", from the advisor the UI's lens uses. */
+function settleSuggestions(id) {
+  try {
+    const unit = Units.get(id);
+    const player = unit ? Players.get(unit.owner) : null;
+    const spots = player?.AI?.getBestSettleLocationsForSettler?.(3, unit.location) ?? [];
+    return spots
+      .map((s) => s?.location ?? s)
+      .filter((at) => at && at.x !== undefined)
+      .map((at) => `${at.x},${at.y}`);
+  } catch { return []; }
+}
+
 function subjectState(id) {
   try {
     const unit = Units.get(id);
@@ -312,7 +493,7 @@ function subjectState(id) {
   } catch { return null; }
 }
 
-function startOperation(api, id, type, rawArgs) {
+function startOperation(api, id, type, rawArgs, typeName = null) {
   // An operation this build does not define reads as `undefined`, and canStart happily accepts
   // it: the agent gets `ok`, the engine does nothing, and nothing anywhere says why. That is how
   // `civ tradition` reported twelve successful adoptions while the player held no traditions.
@@ -356,11 +537,36 @@ function startOperation(api, id, type, rawArgs) {
       const plot = discoveryNear(id);
       reason += plot
         ? ` — the game refuses to skip or automate a unit standing next to one. Move it onto ${plot} to collect it.`
-        : " — the game refuses to skip or automate a unit standing next to one. `grep discovery= /current/tiles.txt` finds them.";
+        : " — the game refuses to skip or automate a unit while a discovery is within its reach, even a distant one. `grep discovery= /current/tiles.txt` finds them.";
     }
     let finished = false;
+    const opName = String(typeName ?? "");
+    // Ten fortify orders in one turn went to settlers, merchants, migrants and cogs, and every
+    // one came back "no reason". Only a land combat unit takes a standing order like that.
+    const kind = unitKind(id);
+    if (!reason && kind && /SLEEP|FORTIFY|ALERT|SENTRY|HEAL/.test(opName) && (kind.civilian || kind.naval)) {
+      reason = `a ${kind.name} cannot do that — only land combat units take that order; ` +
+        `\`civ skip ${String(id?.id ?? id)}\` finishes it for this turn`;
+      finished = true;
+    }
+    // A settler refused where it stands. "No valid constructions for this location" is the
+    // engine's whole answer; the game's own advisor knows where it WOULD settle, so say that.
+    if (!reason && /FOUND_CITY/.test(opName)) {
+      const spots = settleSuggestions(id);
+      reason = `this unit cannot found a settlement on its plot` +
+        (spots.length > 0 ? ` — the game's own advisor recommends: ${spots.join(" ")}` : " — and the advisor has no nearby recommendation");
+    }
     if (!reason && state) {
-      if (state.canMove === false || state.moves === 0) {
+      if (state.hasMoved === true && /SLEEP|FORTIFY|ALERT|AUTOMATE|SENTRY|HEAL/.test(opName)) {
+        // 26 of 30 sleep orders in one run were refused "with no reason"; every one was a unit
+        // that had already moved. The engine takes a standing order only from a unit that has
+        // not moved yet this turn.
+        reason =
+          `this unit has already moved this turn (${state.moves ?? "?"} moves left), and the engine takes a ` +
+          `standing order only from a unit that has not moved yet — \`civ skip ${String(id?.id ?? id)}\` ` +
+          `finishes it for now; give the order next turn before moving it`;
+        finished = true;
+      } else if (state.canMove === false || state.moves === 0) {
         reason = "this unit has no moves left — it is finished for this turn";
         finished = true;
       } else if (state.busy) {
@@ -377,10 +583,35 @@ function startOperation(api, id, type, rawArgs) {
         finished = true;
       }
     }
+    // A target the engine will not take, or a target it was never given. Ask it, with no
+    // target, which plots it WOULD take, and name them: half of all ranged attacks in one run
+    // were refused this way with no reason, and a commander's deploy or focused attack sent
+    // with no plot at all got the same silence.
+    if (!reason) {
+      let probe = null;
+      try { probe = api.canStart(id, type, {}, false); } catch { probe = null; }
+      const plots = probe?.Plots ?? [];
+      if (plots.length > 0) {
+        const named = plots.map((index) => {
+          const at = GameplayMap.getLocationFromIndex(index);
+          return at ? `${at.x},${at.y}` : String(index);
+        });
+        const verb = opName.replace(/^UNIT(OPERATION|COMMAND)_/, "").toLowerCase().replace(/_/g, " ") || "do that on";
+        const list = `${named.slice(0, 12).join(" ")}${named.length > 12 ? ` and ${named.length - 12} more` : ""}`;
+        if (args && args.X !== undefined && args.Y !== undefined) {
+          if (!named.includes(`${args.X},${args.Y}`)) reason = `${args.X},${args.Y} is not a plot this unit can ${verb} right now — it can: ${list}`;
+        } else {
+          reason = `this needs a target plot (X,Y) — it can ${verb}: ${list}`;
+        }
+      }
+    }
     if (state) state.finished = finished;
     return {
       ok: false,
       code: "ILLEGAL_ACTION",
+      // A machine flag for "the engine gave no FailureReasons", so callers never match on
+      // the English below (which has changed before and silently broke an alias).
+      bare: !why,
       message: reason || "the game refused this action and gave no reason",
       state,
       hint: state?.busy
@@ -416,10 +647,40 @@ function endTurnBlocker(playerId) {
       return { id: null, name: name ?? String(type) };
     }
     const notification = Game.Notifications.find(id);
-    return { id, name: notification ? (Game.Notifications.getTypeName(notification.Type) ?? String(type)) : String(type) };
+    // The settlement the notification is about, when it is about one. A "choose a town focus"
+    // prompt names its town here; without it the agent was told to build "in <town>" — a
+    // placeholder — and guessed.
+    let city = null;
+    try {
+      const target = notification?.Target;
+      const found = target && typeof target === "object" ? Cities.get(target) : null;
+      if (found) city = { id: String(target.id ?? ""), name: locText(found.name ?? null) };
+    } catch { city = null; }
+    return { id, name: notification ? (Game.Notifications.getTypeName(notification.Type) ?? String(type)) : String(type), city };
   } catch {
     return null;
   }
+}
+
+/**
+ * The focus projects a town may start right now — what the game's own town-focus panel lists.
+ *
+ * Asked per project, the way production-chooser-helpers.ts does it, because the BUILD query by
+ * kind never returned a town's focus projects: a town's one real choice was invisible to agents.
+ */
+function townFocusChoices(city) {
+  const out = [];
+  for (const def of tableRows(GameInfo.Projects)) {
+    if (!def?.ProjectType || !def.TownOnly) continue;
+    let check = null;
+    try { check = Game.CityOperations.canStart(city.id, CityOperationTypes.BUILD, { ProjectType: def.$index }, false); }
+    catch { check = null; }
+    const req = check?.Requirements;
+    if (!check || check.Success !== true) continue;
+    if (req && (req.FullFailure || req.Obsolete || req.MeetsRequirements === false)) continue;
+    out.push(def.ProjectType);
+  }
+  return out;
 }
 
 /**

@@ -10,7 +10,7 @@ import type { Bridge } from "../adapter/bridge.ts";
 import { unwrap, wrapExpression } from "../adapter/bridge.ts";
 
 export type FakeUnit = { id: number; owner: number; type: number; x: number; y: number };
-export type FakeCity = { id: number; owner: number; name: string; x: number; y: number; isTown?: boolean };
+export type FakeCity = { id: number; owner: number; name: string; x: number; y: number; isTown?: boolean; justConquered?: boolean };
 
 export type FakeWorld = {
   width: number;
@@ -50,7 +50,10 @@ export type FakeWorld = {
    * dismissal clears it. A DECISION (place a citizen, answer a story) is blocking and NOT
    * dismissible — that asymmetry is the whole reason forced end-turn kept failing.
    */
-  notifications: Map<number, Array<{ id: number; name: string; typeHash: number; blocking: boolean; dismissible: boolean }>>;
+  notifications: Map<
+    number,
+    Array<{ id: number; name: string; typeHash: number; blocking: boolean; dismissible: boolean; target?: { id: number; owner: number } }>
+  >;
   /** Tradition row indices each player has adopted. */
   traditions: Map<number, number[]>;
   /** Diplomacy actions successfully started, as "OPERATION:ACTION" — proof the right one was picked. */
@@ -62,6 +65,12 @@ export type FakeWorld = {
   atWar: Set<string>;
   /** Each city's build queue, head first, as type hashes. */
   buildQueue: Map<number, number[]>;
+  /** Plots ("x,y") no unit can path to; a move there is refused before it is sent. */
+  unreachable: Set<string>;
+  /** Gold per player, spent by purchases; absent means the default balance. */
+  gold: Map<number, number>;
+  /** Every PURCHASE sent, with the arguments the engine was given. */
+  purchases: Array<{ city: number; args: OperationArgs }>;
   /** Victories CIV has claimed, as {team, victory-hash}. Drives Game.VictoryManager.getVictories. */
   victories: Array<{ team: number; victory: number }>;
   /** Whether the current age has ended (Game.AgeProgressManager.isAgeOver). */
@@ -78,6 +87,8 @@ export type FakeWorld = {
   resources: Record<number, Array<{ index: number; hash: number }>>;
   /** ASSIGN_RESOURCE sends recorded, so a test can assert a resource was placed. */
   resourceAssigns: Array<{ player: number; location: unknown; city: number }>;
+  /** Resource-to-settlement pairs ("index:cityId") the engine refuses, the way a town refuses a city resource. */
+  resourceRefused: Set<string>;
   /**
    * Units that already have standing orders this turn — skipping, asleep, fortified.
    *
@@ -87,12 +98,67 @@ export type FakeWorld = {
    * the game was perfectly happy to end the turn without.
    */
   unitOrdered: Set<number>;
+  /** Units part-way through a multi-turn operation (hasPendingOperations on the real unit). */
+  unitBusy: Set<number>;
+  /** Players the game has eliminated: out of getAlive(). */
+  dead: Set<number>;
+  /** Dead players the game is still handing a turn to (the defeat turn itself). */
+  deadTurnPending: Set<number>;
+  /** Beliefs the fake will let a player claim, by BeliefType name. */
+  claimableBeliefs: Set<string>;
+  /** ADD_BELIEF and FOUND_RELIGION sends recorded, as the argument objects the engine got. */
+  beliefRequests: Array<{ op: string; args: OperationArgs }>;
+  /** CITYCOMMAND_DESTROY sends: the fate chosen for a conquered settlement. */
+  captures: Array<{ city: number; directive: number }>;
+  /** Dedication cards on offer at an Age boundary (player.AdvancedStart.getAvailableCards). */
+  ageCards: Array<{ id: string; name: string; description: string; effects: Array<{ id: string; amount: number }> }>;
+  /** Cards added to the dedication deck, in order. */
+  deck: string[];
+  /** ADVANCED_START_USE_EFFECT sends, by effect id. */
+  effectsUsed: string[];
+  /** Whether the deck has been marked complete. */
+  deckComplete: boolean;
+  /** Combat values per unit: melee strength, and the plots RANGE_ATTACK would offer. */
+  unitCombat: Map<number, { melee: number; rangedPlots: number[] | null }>;
+  /** Players who have just met player 0 and await a greeting. */
+  greetingOwed: Set<number>;
+  /** Greetings sent: "other:TYPE". */
+  greetings: string[];
+  /** Diplomatic proposals waiting on player 0, by action id. */
+  proposals: Map<number, { actionType: number; initialPlayer: number }>;
+  /** RESPOND_DIPLOMATIC_ACTION sends: "id:TYPE". */
+  responses: string[];
+  /** Unspent promotion points per unit. */
+  promotionPoints: Map<number, number>;
+  /** Promotions held, as "unitId:PROMOTION_TYPE". */
+  promotionsTaken: Set<string>;
+  /** When true, a PROMOTE send is accepted and applied to nothing — the live engine's behaviour for a pick the tree forbids. */
+  promotionsStuck: boolean;
+  /** Water plots ("x,y"). The map is dry land unless a test says otherwise. */
+  water: Set<string>;
+  /** Plots ringed by cliffs ("x,y"): every crossing into them reads as a cliff. */
+  cliffs: Set<string>;
+  /**
+   * Where a constructible may go, as the engine reports it: urban plots with a free slot and
+   * rural plots it could turn urban. Null means the fake names no plots at all (the old shape).
+   * With a list, a BUILD sent WITHOUT a plot queues nothing — the live engine's behaviour.
+   */
+  buildPlots: { Plots: number[]; ExpandUrbanPlots: number[] } | null;
 };
 
 /** A small stable string hash, distinct per name. */
 /** Every name this fake game knows, so a hash can be turned back into the name it came from. */
 /** Constructibles and projects, BY ROW INDEX — which is how the engine addresses them. */
-const FAKE_CONSTRUCTIBLES = ["BUILDING_GRANARY", "PROJECT_TEST"];
+const FAKE_CONSTRUCTIBLES = ["BUILDING_GRANARY", "PROJECT_TEST", "PROJECT_TOWN_TEST"];
+
+/** One row of the game's UnitPromotionDisciplineDetails table. */
+type PromotionRow = { UnitPromotionType: string; UnitPromotionDisciplineType: string; PrereqUnitPromotion: string | null };
+
+/** A two-step promotion tree: TWO needs ONE first, the way the real disciplines chain. */
+const FAKE_PROMOTION_TREE: PromotionRow[] = [
+  { UnitPromotionType: "PROMOTION_TEST_ONE", UnitPromotionDisciplineType: "DISCIPLINE_TEST", PrereqUnitPromotion: null },
+  { UnitPromotionType: "PROMOTION_TEST_TWO", UnitPromotionDisciplineType: "DISCIPLINE_TEST", PrereqUnitPromotion: "PROMOTION_TEST_ONE" },
+];
 
 /** Units, BY ROW INDEX — the indices canStartQuery hands back. Sparse, like a real table. */
 const FAKE_UNITS: Record<number, string> = {
@@ -100,12 +166,13 @@ const FAKE_UNITS: Record<number, string> = {
   88: "UNIT_88",
   100: "UNIT_WARRIOR",
   101: "UNIT_SCOUT",
+  102: "UNIT_SETTLER",
 };
 
 
 const KNOWN_NAMES = [
   "UNIT_WARRIOR", "UNIT_SCOUT", "UNIT_77", "UNIT_88",
-  "BUILDING_GRANARY", "PROJECT_TEST",
+  "BUILDING_GRANARY", "PROJECT_TEST", "PROJECT_TOWN_TEST",
 ];
 
 /**
@@ -122,7 +189,7 @@ function reverseHash<T>(hash: number, prefix: string, build: (name: string) => T
   return null;
 }
 
-function hashOf(name: string): number {
+export function hashOf(name: string): number {
   let h = 0;
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
   return h;
@@ -158,17 +225,42 @@ export function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     storyAnswered: new Set(),
     traditions: new Map(),
     unitOrdered: new Set(),
+    unitBusy: new Set(),
+    dead: new Set(),
+    deadTurnPending: new Set(),
+    claimableBeliefs: new Set(),
+    beliefRequests: [],
+    captures: [],
+    ageCards: [],
+    deck: [],
+    effectsUsed: [],
+    deckComplete: false,
+    unitCombat: new Map(),
+    greetingOwed: new Set(),
+    greetings: [],
+    proposals: new Map(),
+    responses: [],
+    promotionPoints: new Map(),
+    promotionsTaken: new Set(),
+    promotionsStuck: false,
+    water: new Set(),
+    cliffs: new Set(),
+    buildPlots: null,
     diplomacyDone: [],
     dealItems: [],
     dealsSent: [],
     atWar: new Set(),
     buildQueue: new Map(),
+    unreachable: new Set(),
+    gold: new Map(),
+    purchases: [],
     victories: [],
     ageOver: false,
     finalAge: false,
     ageEndsAfterTurn: null,
     resources: {},
     resourceAssigns: [],
+    resourceRefused: new Set(),
     notifications: new Map(),
     ...overrides,
   };
@@ -212,7 +304,15 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
   const visOf = (playerId: number, x: number, y: number) =>
     world.revealed[playerId]?.[`${x},${y}`] ?? RevealedStates.HIDDEN;
 
-  const unitObj = (u: FakeUnit) => ({
+  const unitObj = (u: FakeUnit) => {
+    const combat = world.unitCombat.get(u.id);
+    const base = unitBase(u);
+    // Only for units a test gives combat values; the rest are civilians, as before.
+    return combat
+      ? { ...base, Combat: { canAttack: true, getMeleeStrength: () => combat.melee, rangedStrength: 0 } }
+      : base;
+  };
+  const unitBase = (u: FakeUnit) => ({
     id: { id: u.id, owner: u.owner },
     owner: u.owner,
     type: u.type,
@@ -232,7 +332,18 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     // read them from Movement, which is a different object on the real unit.
     get canMove() { return (world.unitMoves.get(u.id) ?? 2) > 0; },
     get hasMoved() { return world.unitMoves.has(u.id); },
-    Experience: { experiencePoints: 0 },
+    get hasPendingOperations() { return world.unitBusy.has(u.id); },
+    // The panel's gate (panel-unit-promotion.ts): points to spend, not held, tree allows it.
+    Experience: {
+      experiencePoints: 0,
+      get getStoredPromotionPoints() { return world.promotionPoints.get(u.id) ?? 0; },
+      get canPromote() { return (world.promotionPoints.get(u.id) ?? 0) > 0; },
+      hasPromotion: (_disc: string, promo: string) => world.promotionsTaken.has(`${u.id}:${promo}`),
+      canEarnPromotion: (_disc: string, promo: string) => {
+        const row = FAKE_PROMOTION_TREE.find((r) => r.UnitPromotionType === promo);
+        return !!row && (row.PrereqUnitPromotion === null || world.promotionsTaken.has(`${u.id}:${row.PrereqUnitPromotion}`));
+      },
+    },
     isCommanderUnit: false,
     armyId: null,
   });
@@ -242,6 +353,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     owner: c.owner,
     name: c.name,
     isTown: c.isTown ?? false,
+    isJustConqueredFrom: c.justConquered ?? false,
     isCapital: true,
     location: { x: c.x, y: c.y },
     population: 4,
@@ -261,18 +373,24 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       },
     },
     Happiness: { netHappinessPerTurn: 1, hasUnrest: false },
+    // What a purchase costs here, so `civ buy` can list a price.
+    Gold: { getUnitPurchaseCost: () => 60, getBuildingPurchaseCost: () => 120 },
+    Resources: { getAssignedResources: () => [], getTotalCountAssignedResources: () => 0, getAssignedResourcesCap: () => 2 },
     isBeingRazed: false,
     isDistantLands: false,
   });
 
   const playerObj = (id: number) => ({
     id,
-    // The fake has no hotseat rotation; every seat is always able to act.
-    // Every seat reads as active. Hotseat really has one at a time, but the fake has no turn
-    // order of its own and the multi-agent tests drive seats directly; making this exclusive
-    // made activeSeat() poll for its full timeout and hung the suite.
-    isTurnActive: true,
+    // A seat is active until it ends its turn, and every seat is active again once the round
+    // completes. The fake has no hotseat order of its own, so the multi-agent tests still drive
+    // seats directly; this only stops a seat that has ended from being offered the same turn
+    // twice, which is how the round loop can be attached mid-round.
+    get isTurnActive() { return world.dead.has(id) ? world.deadTurnPending.has(id) && !ended.has(id) : !ended.has(id); },
+    get isAlive() { return !world.dead.has(id); },
     civilizationName: `CIV_${id}`,
+    // The advisor the settler lens asks: the fake always recommends one spot east of the unit.
+    AI: { getBestSettleLocationsForSettler: (_n: number, at: { x: number; y: number }) => [{ location: { x: at.x + 2, y: at.y } }] },
     leaderName: `LEADER_${id}`,
     isMajor: true,
     team: id,
@@ -325,7 +443,18 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     Resources: {
       getResources: () => (world.resources[id] ?? []).map((r) => ({ value: r.index, uniqueResource: { resource: r.hash } })),
     },
-    Treasury: { goldBalance: 100 + id },
+    Treasury: {
+      get goldBalance() {
+        return world.gold.get(id) ?? 100 + id;
+      },
+    },
+    // The dedication deck at an Age boundary, the way dedications-model.ts reads it.
+    AdvancedStart: {
+      getAvailableCards: () => world.ageCards,
+      getCards: () => world.deck.map((cardId) => ({ info: world.ageCards.find((c) => c.id === cardId) ?? { id: cardId, effects: [] } })),
+      getLegacyPoints: () => [{ category: "CARD_CATEGORY_WILDCARD", value: Math.max(0, 3 - world.deck.length) }],
+      getPlacementComplete: () => world.deckComplete,
+    },
     Stats: {
       getNetYield: () => 5,
       numCities: world.cities.filter((c) => c.owner === id && !c.isTown).length,
@@ -388,6 +517,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     EndTurnBlockingTypes: { NONE: 0 },
     SaveTypes: { DEFAULT: 0, SINGLE_PLAYER: 1, HOTSEAT: 2, NETWORK_MULTIPLAYER: 3 },
     CityQueryType: { Unit: 0, Constructible: 1, Project: 2 },
+    CityOperationsParametersValues: { Exclusive: 1 },
     SaveLocations: { DEFAULT: 0, LOCAL_STORAGE: 1, FIRAXIS_CLOUD: 2 },
     SaveFileTypes: { GAME_STATE: 0, GAME_CONFIGURATION: 1, GAME_TRANSITION: 2 },
     SaveLocationCategories: { NORMAL: 0, AUTOSAVE: 1, QUICKSAVE: 2 },
@@ -399,19 +529,33 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       MOVE_TO: "UNITOPERATION_MOVE_TO",
       SKIP_TURN: "UNITOPERATION_SKIP_TURN",
       FOUND_CITY: "UNITOPERATION_FOUND_CITY",
+      RANGE_ATTACK: "UNITOPERATION_RANGE_ATTACK",
+      SLEEP: "UNITOPERATION_SLEEP",
+      FORTIFY: "UNITOPERATION_FORTIFY",
     },
     UnitCommandTypes: { PROMOTE: "UNITCOMMAND_PROMOTE" },
-    CityOperationTypes: { BUILD: "CITYOPERATION_BUILD" },
-    CityCommandTypes: { PURCHASE: "CITYCOMMAND_PURCHASE" },
+    CityOperationTypes: { BUILD: "CITYOPERATION_BUILD", CONSIDER_TOWN_PROJECT: "CITYOPERATION_CONSIDER_TOWN_PROJECT" },
+    CityCommandTypes: { PURCHASE: "CITYCOMMAND_PURCHASE", DESTROY: "CITYCOMMAND_DESTROY", EXPAND: "CITYCOMMAND_EXPAND" },
+    DirectiveTypes: { KEEP: 0, RAZE: 1, LIBERATE_FOUNDER: 2 },
     PlayerOperationTypes: {
       SET_TECH_TREE_NODE: "SET_TECH_TREE_NODE",
       ASSIGN_RESOURCE: "ASSIGN_RESOURCE",
+      ADD_BELIEF: "ADD_BELIEF",
+      FOUND_RELIGION: "FOUND_RELIGION",
       SET_CULTURE_TREE_NODE: "SET_CULTURE_TREE_NODE",
       CHOOSE_NARRATIVE_STORY_DIRECTION: "CHOOSE_NARRATIVE_STORY_DIRECTION",
       DECLARE_WAR: "DECLARE_WAR",
       CHANGE_TRADITION: "CHANGE_TRADITION",
       CHANGE_GOVERNMENT: "CHANGE_GOVERNMENT",
       CONSIDER_ASSIGN_TRADITIONS: "CONSIDER_ASSIGN_TRADITIONS",
+      CONSIDER_ASSIGN_ATTRIBUTE: "CONSIDER_ASSIGN_ATTRIBUTE",
+      SET_AGE_TRANSITION_DATA: "SET_AGE_TRANSITION_DATA",
+      ADVANCED_START_MODIFY_DECK: "ADVANCED_START_MODIFY_DECK",
+      ADVANCED_START_USE_EFFECT: "ADVANCED_START_USE_EFFECT",
+      ADVANCED_START_MARK_COMPLETED: "ADVANCED_START_MARK_COMPLETED",
+      SELECT_CAPITAL: "SELECT_CAPITAL",
+      RESPOND_DIPLOMATIC_FIRST_MEET: "RESPOND_DIPLOMATIC_FIRST_MEET",
+      RESPOND_DIPLOMATIC_ACTION: "RESPOND_DIPLOMATIC_ACTION",
       VIEWED_ADVISOR_WARNING: "VIEWED_ADVISOR_WARNING",
       // MAKE_PEACE does NOT end in DIPLOMATIC_ACTION. It was missing from the operation filter,
       // so an agent could declare war and had no way out of it for the rest of the match.
@@ -424,6 +568,13 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       DIPLOMACY_ACTION_MAKE_PEACE: 2,
       DIPLOMACY_ACTION_OPEN_BORDERS: 3,
     },
+    // The engine's own spelling of the first-meet enum, typo included.
+    DiplomacyPlayerFirstMeets: {
+      PLAYER_REALATIONSHIP_FIRSTMEET_FRIENDLY: 0,
+      PLAYER_REALATIONSHIP_FIRSTMEET_NEUTRAL: 1,
+      PLAYER_REALATIONSHIP_FIRSTMEET_UNFRIENDLY: 2,
+    },
+    DiplomaticResponseTypes: { DIPLOMACY_RESPONSE_ACCEPT: 0, DIPLOMACY_RESPONSE_REJECT: 1, DIPLOMACY_RESPONSE_SUPPORT: 2 },
     // Trade. Deals are a stateful builder addressed by an OBJECT, not by two player ids.
     DiplomacyDealDirection: { OUTGOING: 0, INCOMING: 1 },
     DiplomacyDealItemTypes: { ALL: 0, GOLD: 1, RESOURCES: 2, AGREEMENTS: 3 },
@@ -441,6 +592,19 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       YIELD_CULTURE: 5, YIELD_HAPPINESS: 6, YIELD_DIPLOMACY: 7,
     },
     Game: {
+      // The header of a pending diplomatic action, the way the reaction panel reads it.
+      Diplomacy: {
+        getDiplomaticEventData: (id: number) => {
+          const proposal = world.proposals.get(Number(id));
+          return proposal ? { actionType: proposal.actionType, initialPlayer: proposal.initialPlayer } : null;
+        },
+      },
+      // Religion, the way the belief picker asks: claimable beliefs and founded religions.
+      Religion: {
+      isBeliefClaimable: (belief: string | number) => world.claimableBeliefs.has(String(belief)),
+      hasBeenFounded: (religion: string) => world.beliefRequests.some((r) => r.op === "FOUND_RELIGION" && r.args?.ReligionType === hashOf(religion)),
+      getPlayerReligion: () => null,
+      },
       // A getter, not a snapshot: the turn advances when a player ends their turn, and the
       // extraction scripts must observe that the same way they would in the real game.
       get turn() {
@@ -471,6 +635,14 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
           if (type === "UNITOPERATION_SKIP_TURN") {
             return { Success: !world.unitOrdered.has(unitId), FailureReasons: [] };
           }
+          // A bare refusal for these, as the live engine gives: no FailureReasons at all.
+          if (type === "UNITOPERATION_FORTIFY" || type === "UNITOPERATION_FOUND_CITY") return { Success: false, FailureReasons: [] };
+          // The engine answers the ranged query for a naval melee unit too, with the plots it
+          // could shell — none, for a galley beside an enemy. That is the shape that misled attack.
+          if (type === "UNITOPERATION_RANGE_ATTACK") {
+            const plots = world.unitCombat.get(unitId)?.rangedPlots ?? null;
+            return plots ? { Success: true, FailureReasons: [], Plots: plots, Modifiers: [] } : { Success: false, FailureReasons: [] };
+          }
           return {
             Success: type === "UNITOPERATION_MOVE_TO",
             FailureReasons: ["LOC_FAKE_NOT_ALLOWED"],
@@ -498,11 +670,36 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
         },
       },
       UnitCommands: {
-        canStart: () => ({ Success: false, FailureReasons: ["LOC_FAKE_NOT_ALLOWED"] }),
-        sendRequest: () => {},
+        // PROMOTE reads as startable for any pairing, as the live engine does: canStart is not
+        // the promotion gate, the panel's Experience checks are.
+        canStart: (_id: ComponentRef, type: OperationType) =>
+          type === "UNITCOMMAND_PROMOTE"
+            ? { Success: true, FailureReasons: [] }
+            : { Success: false, FailureReasons: ["LOC_FAKE_NOT_ALLOWED"] },
+        sendRequest: (id: ComponentRef, type: OperationType, args?: OperationArgs) => {
+          if (type !== "UNITCOMMAND_PROMOTE" || world.promotionsStuck) return;
+          const unitId = refId(id);
+          const row = FAKE_PROMOTION_TREE.find((r) => hashOf(r.UnitPromotionType) === args?.PromotionType);
+          const points = world.promotionPoints.get(unitId) ?? 0;
+          const allowed = !!row && points > 0 && (row.PrereqUnitPromotion === null || world.promotionsTaken.has(`${unitId}:${row.PrereqUnitPromotion}`));
+          if (!allowed) return; // accepted, applied to nothing
+          world.promotionsTaken.add(`${unitId}:${row.UnitPromotionType}`);
+          world.promotionPoints.set(unitId, points - 1);
+        },
       },
       CityOperations: {
-        canStart: () => ({ Success: true, FailureReasons: [] }),
+        // With plots configured, the real contract: a bare query lists them, and a query WITH a
+        // plot succeeds only for one of them (interface-mode-place-building.ts commitPlot).
+        canStart: (_id: ComponentRef, _type: OperationType, args?: OperationArgs) => {
+          const plots = world.buildPlots;
+          if (!plots || typeof args?.ConstructibleType !== "number") return { Success: true, FailureReasons: [] };
+          if (typeof args.X === "number" && typeof args.Y === "number") {
+            const index = args.Y * world.width + args.X;
+            const legal = [...plots.Plots, ...plots.ExpandUrbanPlots].includes(index);
+            return { Success: legal, FailureReasons: legal ? [] : ["LOC_FAKE_BAD_PLOT"] };
+          }
+          return { Success: true, FailureReasons: [], Plots: plots.Plots, ExpandUrbanPlots: plots.ExpandUrbanPlots };
+        },
         // The real signature: an array of { index, result }, where index is a row index into
         // GameInfo.Units / Constructibles / Projects. Getting this wrong printed "[object
         // Object]" for every option in a live run, so the fake mirrors it exactly.
@@ -516,7 +713,14 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
                 },
               ]
             : [],
-        sendRequest: (id: ComponentRef, _type: OperationType, args: OperationArgs) => {
+        sendRequest: (id: ComponentRef, type: OperationType, args: OperationArgs) => {
+          // "I have considered this town's project" is what clears the town-focus prompt, the
+          // way the game's production chooser sends it when it opens for a town.
+          if (type === "CITYOPERATION_CONSIDER_TOWN_PROJECT") {
+            const owner = world.cities.find((c) => c.id === refId(id))?.owner ?? 0;
+            world.notifications.set(owner, (world.notifications.get(owner) ?? []).filter((n) => n.name !== "NOTIFICATION_CHOOSE_TOWN_PROJECT"));
+            return;
+          }
           world.cityRequests.push(args);
           // The engine's encoding rule, enforced.
           //
@@ -540,6 +744,8 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
           for (const key of ["ConstructibleType", "ProjectType"] as const) {
             const index = args[key];
             if (typeof index !== "number") continue;
+            // A building sent without its plot: the live engine accepts and queues nothing.
+            if (key === "ConstructibleType" && world.buildPlots && typeof args.X !== "number") return;
             const row = FAKE_CONSTRUCTIBLES[index];
             // A hash here is the bug: it will not match any row index, so nothing is queued.
             if (row) queue(hashOf(row));
@@ -548,11 +754,66 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
         },
       },
       CityCommands: {
-        canStart: () => ({ Success: true, FailureReasons: [] }),
-        sendRequest: () => {},
+        // A conquest's fate: keep and raze are open; liberating needs a founder to give it to,
+        // which this fake's settlements never have.
+        canStart: (_id: ComponentRef, type: OperationType, args?: OperationArgs) =>
+          type === "CITYCOMMAND_DESTROY" && args?.Directive === 2
+            ? { Success: false, FailureReasons: ["LOC_FAKE_NO_FOUNDER"] }
+            : { Success: true, FailureReasons: [] },
+        // A purchase offers the same row shape as a build query; here one unit, by row index.
+        canStartQuery: (_id: ComponentRef, type: OperationType, query: number) =>
+          type === "CITYCOMMAND_PURCHASE" && query === 0
+            ? [{ index: 100, result: { Success: true, FailureReasons: [] } }]
+            : [],
+        sendRequest: (id: ComponentRef, type: OperationType, args: OperationArgs) => {
+          if (type === "CITYCOMMAND_DESTROY") {
+            const city = world.cities.find((c) => c.id === refId(id));
+            if (!city) return;
+            world.captures.push({ city: city.id, directive: Number(args.Directive) });
+            city.justConquered = false;
+            world.notifications.set(city.owner, (world.notifications.get(city.owner) ?? []).filter((n) => n.name !== "NOTIFICATION_CONSIDER_RAZE_CITY"));
+            return;
+          }
+          if (type !== "CITYCOMMAND_PURCHASE") return;
+          const cityId = refId(id);
+          world.purchases.push({ city: cityId, args });
+          // The treasury moves, which is how the CLI knows a purchase took.
+          const owner = world.cities.find((c) => c.id === cityId)?.owner ?? 0;
+          world.gold.set(owner, (world.gold.get(owner) ?? 100 + owner) - 60);
+        },
       },
       PlayerOperations: {
+        // eslint-disable-next-line complexity -- a test double covering many operations by design; each op is a short flat branch.
         canStart: (pid: number, type: OperationType, args?: OperationArgs) => {
+          if (type === "ADD_BELIEF") {
+            const legal = [...world.claimableBeliefs].some((b) => hashOf(b) === args?.BeliefType);
+            return { Success: legal, FailureReasons: legal ? [] : [] };
+          }
+          if (type === "FOUND_RELIGION") return { Success: true, FailureReasons: [] };
+          if (type === "SET_AGE_TRANSITION_DATA") return { Success: false, FailureReasons: [] };
+          if (type === "RESPOND_DIPLOMATIC_FIRST_MEET") {
+            const owed = world.greetingOwed.has(Number(args?.Player2)) && args?.Type !== undefined;
+            return { Success: owed, FailureReasons: owed ? [] : [] };
+          }
+          if (type === "RESPOND_DIPLOMATIC_ACTION") {
+            const waiting = world.proposals.has(Number(args?.ID)) && args?.Type !== undefined;
+            return { Success: waiting, FailureReasons: waiting ? [] : [] };
+          }
+          if (type === "ADVANCED_START_MODIFY_DECK") {
+            const id = String(args?.ID ?? "");
+            const legal = args?.Type === "REMOVE"
+              ? world.deck.includes(id)
+              : world.ageCards.some((c) => c.id === id) && !world.deck.includes(id) && world.deck.length < 3;
+            return { Success: legal, FailureReasons: legal ? [] : ["LOC_FAKE_DECK"] };
+          }
+          if (type === "ADVANCED_START_MARK_COMPLETED") return { Success: !world.deckComplete, FailureReasons: [] };
+          if (type === "ASSIGN_RESOURCE") {
+            // SAFETY: the resource script builds Location from getLocationFromIndex, an {x, y}.
+            const at = args?.Location as { x: number; y: number } | undefined;
+            const index = at ? at.y * world.width + at.x : -1;
+            const refused = world.resourceRefused.has(`${index}:${Number(args?.City)}`);
+            return { Success: !refused, FailureReasons: refused ? [] : [] };
+          }
           if (type === "VIEWED_ADVISOR_WARNING") {
             const valid = args?.Target?.owner === pid && (world.notifications.get(pid) ?? []).some(
               n => n.id === args?.Target?.id && n.name.startsWith("NOTIFICATION_ADVISOR_WARNING_"),
@@ -588,6 +849,10 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
             world.resourceAssigns.push({ player: pid, location: args?.Location, city: Number(args?.City) });
             return;
           }
+          if (type === "ADD_BELIEF" || type === "FOUND_RELIGION") {
+            world.beliefRequests.push({ op: String(type), args });
+            return;
+          }
           if (type === "CHOOSE_NARRATIVE_STORY_DIRECTION") {
             world.storyAnswered.add(pid);
             return;
@@ -613,6 +878,37 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
                 (n) => n.name !== "NOTIFICATION_TRADITIONS_AVAILABLE",
               ),
             );
+            return;
+          }
+          if (type === "ADVANCED_START_MODIFY_DECK") {
+            const id = String(args?.ID ?? "");
+            if (args?.Type === "REMOVE") world.deck = world.deck.filter((c) => c !== id);
+            else if (!world.deck.includes(id)) world.deck.push(id);
+            return;
+          }
+          if (type === "ADVANCED_START_USE_EFFECT") { world.effectsUsed.push(String(args?.ID ?? "")); return; }
+          if (type === "RESPOND_DIPLOMATIC_FIRST_MEET") {
+            const target = Number(args?.Player2);
+            world.greetings.push(`${target}:${args?.Type}`);
+            world.greetingOwed.delete(target);
+            world.notifications.set(pid, (world.notifications.get(pid) ?? []).filter((n) => n.name !== "NOTIFICATION_PLAYER_MET"));
+            return;
+          }
+          if (type === "RESPOND_DIPLOMATIC_ACTION") {
+            const id = Number(args?.ID);
+            world.responses.push(`${id}:${args?.Type}`);
+            world.proposals.delete(id);
+            world.notifications.set(pid, (world.notifications.get(pid) ?? []).filter((n) => !(n.name === "NOTIFICATION_DIPLOMATIC_RESPONSE_REQUIRED" && n.target?.id === id)));
+            return;
+          }
+          if (type === "ADVANCED_START_MARK_COMPLETED") {
+            world.deckComplete = true;
+            world.notifications.set(pid, (world.notifications.get(pid) ?? []).filter((n) => n.name !== "NOTIFICATION_ADVANCED_START"));
+            return;
+          }
+          // The attribute screen's "considered" signal, sent when it closes; clears the prompt.
+          if (type === "CONSIDER_ASSIGN_ATTRIBUTE") {
+            world.notifications.set(pid, (world.notifications.get(pid) ?? []).filter((n) => n.name !== "NOTIFICATION_CAN_BUY_ATTRIBUTE_SKILL"));
             return;
           }
           if (type === "CHANGE_TRADITION") {
@@ -677,7 +973,8 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
           const wanted = refId(cid);
           for (const list of world.notifications.values()) {
             const hit = list.find((n) => n.id === wanted);
-            if (hit) return { id: hit.id, Type: hit.typeHash };
+            // Target is the settlement (or unit) the notification is about, as the real API has it.
+            if (hit) return { id: hit.id, Type: hit.typeHash, Target: hit.target };
           }
           return null;
         },
@@ -753,7 +1050,12 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       hasSentTurnComplete: () => ended.has(currentPlayer()),
       sendTurnComplete: () => {
         ended.add(currentPlayer());
-        if (ended.size >= world.seats) {
+        // The defeat turn is offered once; after it the dead seat is out of the rotation.
+        if (world.dead.has(currentPlayer())) world.deadTurnPending.delete(currentPlayer());
+        // The engine advances once every seat that still gets a turn has ended: the living, plus
+        // a dead seat on its defeat turn. A dead seat with no turn to end never holds the round.
+        const expected = world.players.filter((id) => !world.dead.has(id) || world.deadTurnPending.has(id)).length;
+        if (ended.size >= Math.min(world.seats, expected)) {
           world.unitMoves.clear(); // a new turn restores every unit's moves
           world.unitOrdered.clear(); // ...and clears their standing orders
           ended.clear();
@@ -761,7 +1063,19 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
         }
       },
     },
+    Database: { makeHash: hashOf },
     GameInfo: {
+      UnitPromotionDisciplineDetails: FAKE_PROMOTION_TREE,
+      Beliefs: [
+        { BeliefType: "BELIEF_TEST_TITHE", BeliefClassType: "BELIEF_CLASS_FOUNDER", Name: "Tithe", Description: "gold per follower" },
+        { BeliefType: "BELIEF_TEST_LOCKED", BeliefClassType: "BELIEF_CLASS_FOUNDER", Name: "Locked", Description: "not yet" },
+        { BeliefType: "BELIEF_TEST_PANTHEON", BeliefClassType: "BELIEF_CLASS_PANTHEON", Name: "Pantheon", Description: "a pantheon belief" },
+      ],
+      Religions: [
+        { ReligionType: "RELIGION_TEST_ONE", Name: "One" },
+        { ReligionType: "RELIGION_TEST_TWO", Name: "Two" },
+      ],
+      UnitPromotions: { lookup: (h: number) => { const row = FAKE_PROMOTION_TREE.find((r) => hashOf(r.UnitPromotionType) === h); return row ? { Name: row.UnitPromotionType, Description: `does ${row.UnitPromotionType}` } : null; } },
       Terrains: { lookup: (h: number) => ({ TerrainType: `TERRAIN_${h}` }) },
       Victories: { lookup: (h: number) => ({ VictoryType: `VICTORY_${h}` }) },
       // The leaders an agent may pick at setup. RANDOM is a placeholder the list script filters out.
@@ -772,7 +1086,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       ]),
       Biomes: { lookup: (h: number) => ({ BiomeType: `BIOME_${h}` }) },
       Features: { lookup: () => null },
-      Resources: { lookup: (h: number) => ({ ResourceType: `RESOURCE_${h}` }) },
+      Resources: { lookup: (h: number) => ({ ResourceType: `RESOURCE_${h}`, ResourceClassType: "RESOURCECLASS_CITY" }) },
       Continents: { lookup: (h: number) => ({ ContinentType: `CONTINENT_${h}` }) },
       // These reverse the SAME hash Types.lookup produces, so a thing chosen by name reads back
       // as that name. Returning `UNIT_${h}` for any hash meant a queued UNIT_WARRIOR read back as
@@ -781,16 +1095,20 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       // hands it a HASH. The real table accepts both, so the fake must too — and must return null
       // for a hash it does not own, or callers can never fall through to the next table.
       Units: {
+        // The classes the refusal text reads: a settler is civilian, the rest are land combat.
         lookup: (key: number) =>
           FAKE_UNITS[key] !== undefined
-            ? { UnitType: FAKE_UNITS[key] }
+            ? { UnitType: FAKE_UNITS[key], FormationClass: FAKE_UNITS[key] === "UNIT_SETTLER" ? "FORMATION_CLASS_CIVILIAN" : "FORMATION_CLASS_LAND_COMBAT", Domain: "DOMAIN_LAND" }
             : reverseHash(key, "UNIT_", (n) => ({ UnitType: n })),
       },
       // Iterable AND indexable, like the real table: `civ build` walks it to turn a name into
       // the ROW INDEX the engine wants. A lookup-only stub meant the walk found nothing and the
       // build silently never happened.
+      // Buildings only. Projects have their own table below; one shared list put the town focus
+      // in here too, and `civ build <town> PROJECT_TOWN_X` went out as a constructible.
       Constructibles: Object.assign(
-        table(FAKE_CONSTRUCTIBLES.map((name, index) => ({ ConstructibleType: name, $index: index }))),
+        table(FAKE_CONSTRUCTIBLES.map((name, index) => ({ ConstructibleType: name, $index: index }))
+          .filter((row) => row.ConstructibleType.startsWith("BUILDING_"))),
         {
           lookup: (key: number) =>
             FAKE_CONSTRUCTIBLES[key] !== undefined
@@ -798,8 +1116,13 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
               : reverseHash(key, "BUILDING_", (n) => ({ ConstructibleType: n })),
         },
       ),
+      // Only the projects, by the row index sendRequest expects. A town-only focus project sits
+      // beside a city project so the listing's town/city split can be tested.
       Projects: Object.assign(
-        table(FAKE_CONSTRUCTIBLES.map((name, index) => ({ ProjectType: name, $index: index }))),
+        table([
+          { ProjectType: "PROJECT_TEST", $index: 1, CityOnly: true, TownOnly: false },
+          { ProjectType: "PROJECT_TOWN_TEST", $index: 2, CityOnly: false, TownOnly: true },
+        ]),
         { lookup: (h: number) => reverseHash(h, "PROJECT_", (n) => ({ ProjectType: n })) },
       ),
       // Reverses the same hash Types.lookup produces, so a node chosen by name reads back as
@@ -859,7 +1182,12 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
             UNIT_77: "KIND_UNIT",
             UNIT_88: "KIND_UNIT",
             BUILDING_GRANARY: "KIND_CONSTRUCTIBLE",
+            BELIEF_TEST_TITHE: "KIND_BELIEF",
+            BELIEF_TEST_LOCKED: "KIND_BELIEF",
+            RELIGION_TEST_ONE: "KIND_RELIGION",
+            RELIGION_TEST_TWO: "KIND_RELIGION",
             PROJECT_TEST: "KIND_PROJECT",
+            PROJECT_TOWN_TEST: "KIND_PROJECT",
           };
           const kind = known[name];
           // Distinct per NAME, not per length. The old `name.length * -7919` gave every
@@ -872,7 +1200,7 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     Locale: { compose: (s: string) => s },
     Players: {
       get: (id: number) => (world.players.includes(id) ? playerObj(id) : null),
-      getAlive: () => world.players.map(playerObj),
+      getAlive: () => world.players.filter((id) => !world.dead.has(id)).map(playerObj),
       isHuman: () => true,
     },
     // Built on demand, from the live record.
@@ -881,11 +1209,17 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
     // which is once per FakeBridge. Every unit's position was frozen at match start, so a test
     // could not tell a unit that moved from one that did not, and the harness bug where the
     // engine accepts a move order and does nothing was invisible here.
+    MapUnits: {
+      getUnits: (x: number, y: number) => world.units.filter((u) => u.x === x && u.y === y).map((u) => u.id),
+    },
     Units: {
       get: (ref: ComponentRef) => {
         const found = world.units.find((u) => u.id === refId(ref));
         return found ? { ...unitObj(found), id: found.id } : undefined;
       },
+      // The real shape: a list of plots, empty when there is no way there.
+      getPathTo: (_ref: ComponentRef, to: { x: number; y: number }) =>
+        world.unreachable.has(`${to.x},${to.y}`) ? { plots: [], turns: [] } : { plots: [to], turns: [1] },
     },
     Cities: { get: byId(world.cities.map(cityObj).map((c, i) => ({ ...c, id: world.cities[i]!.id }))) },
     GameplayMap: {
@@ -897,7 +1231,12 @@ function buildGlobals(world: FakeWorld): FakeGlobals {
       getBiomeType: () => 2,
       getFeatureType: () => -1,
       getResourceType: () => -1,
-      isWater: () => false,
+      isWater: (x: number, y: number) => world.water.has(`${x},${y}`),
+      isImpassable: () => false,
+      getPlotDistance: (x1: number, y1: number, x2: number, y2: number) => Math.max(Math.abs(x1 - x2), Math.abs(y1 - y2)),
+      getDirectionToPlot: (_from: { x: number; y: number }, to: { x: number; y: number }) => (world.cliffs.has(`${to.x},${to.y}`) ? 1 : 0),
+      // Direction 1 is the fake's "into a cliff plot" edge; 0 is open ground.
+      isCliffCrossing: (_x: number, _y: number, direction: number) => direction !== 1,
       isNavigableRiver: () => false,
       isMountain: () => false,
       getContinentType: () => 3,

@@ -27,15 +27,19 @@ function screenDisabled(el) {
 
 function screenInventory() {
   if (typeof document === "undefined" || GameContext.localPlayerID !== PLAYER_ID) return [];
-  // Weak keys retain identity across reads without retaining closed screens. A replaced button
-  // gets a new id, so a stale command cannot accidentally choose its replacement.
-  const registry = globalThis.__civbenchScreens ??= { ids: new WeakMap(), next: 1 };
-  const idFor = (el, prefix, label = "") => {
-    const previous = registry.ids.get(el);
-    if (!previous || previous.label !== label) {
-      registry.ids.set(el, { id: `${prefix}:${registry.next++}`, label });
-    }
-    return registry.ids.get(el).id;
+  // Ids come from what a control SAYS, not from which DOM node it is. Gameface re-renders a
+  // screen freely, so a read can hand back fresh elements for the same buttons, and ids tied to
+  // node identity went stale between one read and the next command: 56 of 83 activations in one
+  // run failed as CONTROL_STALE on a single screen, and the seat never got through its Age
+  // transition. A label is what a human would click, and it survives a re-render. Duplicate
+  // labels count up: Empty_Slot, Empty_Slot#2, Empty_Slot#3.
+  const slug = (text) => String(text ?? "").trim().replace(/\s+/g, "_").replace(/[^\w.'()#-]/g, "").slice(0, 40) || "control";
+  const seen = new Map();
+  const idFor = (prefix, label) => {
+    const base = `${prefix}:${slug(label)}`;
+    const n = (seen.get(base) ?? 0) + 1;
+    seen.set(base, n);
+    return n === 1 ? base : `${base}#${n}`;
   };
   // ContextManager also mounts choosers in named layout slots. Popup roots overlay them.
   const roots = [...document.querySelectorAll('[id^="target-slot-"]'), ...document.querySelectorAll(".fxs-popups")];
@@ -53,7 +57,7 @@ function screenInventory() {
         screenText(button.closest(".advisor-card") ?? button) || button.getAttribute("data-name") || button.tagName.toLowerCase();
       controls.push({
         element: button,
-        id: idFor(button, "control", label),
+        id: idFor("control", label),
         label: label.replace(/LOC_[A-Z0-9_]+/g, (key) => Locale.compose(key)),
         disabled: screenDisabled(button),
         selected: button.getAttribute("aria-checked") ?? button.getAttribute("aria-selected") ?? button.getAttribute("selected"),
@@ -68,7 +72,7 @@ function screenInventory() {
     }
     const text = screenText(el);
     if (!text) gaps.push("screen text missing");
-    screens.push({ layer: root.classList.contains("fxs-popups") ? "popup" : "panel", element: el, id: idFor(el, `screen:${tag}`), tag, text, controls, gaps });
+    screens.push({ layer: root.classList.contains("fxs-popups") ? "popup" : "panel", element: el, id: idFor("screen", tag), tag, text, controls, gaps });
   }
   return screens;
 }

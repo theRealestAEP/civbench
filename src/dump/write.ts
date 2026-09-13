@@ -120,6 +120,7 @@ function entityLine(kind: string, record: Record<string, Scalar | null | undefin
  */
 const DISPLAY = new Map<string, string>(Object.entries({
   canFoundHere: "can_found_here",
+  needsOrders: "needs_orders",
   Combat_attacksRemaining: "attacks_left",
   Combat_canAttack: "can_attack",
   Combat_defenseStrength: "defense",
@@ -161,6 +162,7 @@ function unitRecord(u: OwnUnit | ForeignUnit): DumpRecord {
   // never when it was dark, and spammed illegal FOUND_CITY for a dozen turns. Keep it visible for
   // founders in both states. Other units keep the old behavior (no can_found_here=no noise).
   const isFounder = /settler|found/i.test(u.type ?? "");
+  const canPromote = Object.entries(u).some(([k, v]) => k === "Experience_canPromote" && v === true);
   for (const [key, value] of Object.entries(u)) {
     if (value === undefined || value === null) continue;
     if (key === "id" || key === "x" || key === "y") continue;
@@ -173,7 +175,9 @@ function unitRecord(u: OwnUnit | ForeignUnit): DumpRecord {
       const name = DISPLAY.get(key) ?? key;
       // A field that does not apply is left out, the way the UI leaves out its row.
       const empty = value === false || value === 0 || value === "";
-      const keepAnyway = KEEP_ZERO.has(name) || (name === "can_found_here" && isFounder);
+      // A commander shown as promotable with no points beside it read as a bug; keep the zero.
+      const promotable = name === "Experience_getStoredPromotionPoints" && canPromote;
+      const keepAnyway = KEEP_ZERO.has(name) || (name === "can_found_here" && isFounder) || promotable;
       if (!empty || keepAnyway) out[name] = value;
     }
   }
@@ -228,10 +232,18 @@ export function settlementLines(own: OwnSettlement[], foreign: MergedSettlement[
         ["urban", s.urbanPopulation],
         ["rural", s.ruralPopulation],
         ["building", s.building],
-        ["prod_turns_left", s.productionTurnsLeft],
-        ["queue_empty", s.queueEmpty],
+        // The extractor sends `productionTurns`; this line read a field that never existed, so
+        // "turns left" never printed for any settlement in any run.
+        ["prod_turns_left", s.productionTurns],
+        // A town has no build queue: it has a FOCUS. "queue_empty=yes" on every town line read
+        // as a settlement needing orders when nothing could be done for it.
+        ["focus", s.kind === "town" ? s.projectType ?? s.growthType : null],
+        ["queue_empty", s.kind === "town" ? null : s.queueEmpty],
         ["happiness", s.happiness],
         ["unrest", s.hasUnrest],
+        // The revolt countdown the city banner shows. The flag alone said "unrest" with no sense
+        // of how many turns were left before the settlement flipped.
+        ["unrest_turns", s.unrestTurns],
         ["razing", s.beingRazed],
         ["distant", s.distantLands],
       ]),

@@ -15,7 +15,8 @@ const ageProgress = (() => {
     max: m.getMaxAgeProgressionPoints?.() ?? null,
     isFinalAge: m.isFinalAge ?? null,
     isAgeOver: m.isAgeOver ?? null,
-    canTransition: m.canTransitionToNextAge?.() ?? null,
+    // Takes the player id (screen-legends-report.ts); called bare it was null every turn.
+    canTransition: m.canTransitionToNextAge?.(PLAYER_ID) ?? null,
     countdownStarted: m.ageCountdownStarted ?? null,
   };
 })();
@@ -28,6 +29,18 @@ const ageProgress = (() => {
  * The total comes the same way model-age-rankings.ts computes it: sum the progression points of
  * every milestone on that path.
  */
+/** VICTORY_DOMINATION for its hash. The table's lookup did not answer by hash here; its rows do. */
+function victoryName(hash) {
+  const direct = typeName("Victories", hash);
+  if (direct) return direct;
+  try {
+    for (const row of GameInfo.Victories ?? []) {
+      if (row?.$hash === hash) return row.VictoryType;
+    }
+  } catch { /* fall through */ }
+  return String(hash);
+}
+
 const legacy = (() => {
   // Iterate GameInfo.LegacyPaths, the way the game's own victory manager does.
   //
@@ -56,7 +69,9 @@ const legacy = (() => {
           break;
         }
       } catch { target = null; }
-      out.push({ type: shortName(type), score, target });
+      // What earns points, in the game's words ("Build 7 World Wonders."). Agents reasoned
+      // about this in 40 turns and read LegacyPaths.json 32 times.
+      out.push({ type: shortName(type), score, target, does: locText(path.Description ?? null) || null });
     }
   } catch { return []; }
   return out;
@@ -110,6 +125,9 @@ return {
   leader: locText(p.leaderName ?? p.leaderType ?? null),
   isHuman: Players.isHuman?.(PLAYER_ID) ?? null,
   gold: p.Treasury?.goldBalance ?? null,
+  // The influence STOCKPILE the top bar shows (panel-yield-banner.ts: DiplomacyTreasury). The
+  // header carried only the per-turn yield, and every diplomatic action spends the stockpile.
+  influence: p.DiplomacyTreasury?.diplomacyBalance ?? null,
   yields: {
     food: yieldOf("YIELD_FOOD"),
     production: yieldOf("YIELD_PRODUCTION"),
@@ -144,6 +162,18 @@ return {
   religionFounded: (() => { try { return p.Religion?.hasCreatedReligion?.() ?? null; } catch { return null; } })(),
   tradeRoutes: (() => { try { return p.Trade?.countPlayerTradeRoutes?.() ?? null; } catch { return null; } })(),
   legacy,
+  // The victory manager's own progress for this team (victory-manager.ts getVictoryProgress).
+  // Legacy paths were disabled for a whole night's match and every legacy score read 0 while
+  // domination stood at 8 of 13 settlements; this is the number that actually decides the game.
+  victories: (() => {
+    try {
+      const team = p.team ?? PLAYER_ID;
+      return (Game.VictoryManager?.getVictoryProgress?.() ?? [])
+        .filter((v) => v?.team === team)
+        .map((v) => ({ type: victoryName(v.victory), current: v.current ?? 0, total: v.total ?? 0 }))
+        .filter((v) => v.total > 0);
+    } catch { return []; }
+  })(),
   // The name. getGovernmentType returns a hash, and it was reaching header.json unresolved.
   government: typeName("Governments", p.Culture?.getGovernmentType?.()) ?? null,
 };

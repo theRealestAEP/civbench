@@ -92,7 +92,7 @@ export function renderDelta(
 
   lines.push("", `your settlements: ${raw.settlements.own.length}`);
   for (const s of raw.settlements.own) {
-    lines.push(`  ${s.name ?? s.id} (${s.kind}) at ${s.x},${s.y} pop ${s.population ?? "?"}${s.queueEmpty ? "  BUILD QUEUE EMPTY" : ""}`);
+    lines.push(`  ${s.name ?? s.id} (${s.kind}) at ${s.x},${s.y} pop ${s.population ?? "?"}${s.queueEmpty && s.kind !== "town" ? "  BUILD QUEUE EMPTY" : ""}`);
   }
 
   if (raw.pending.items.length > 0) {

@@ -20,7 +20,19 @@ export type ChoiceOption = {
   available?: boolean;
   active?: boolean;
   kind?: string;
+  /** Gold, for `civ buy`. */
+  cost?: number | null;
   why?: string | null;
+};
+
+/** `civ attack` asks this before choosing a ranged attack over a melee move. */
+export type StrikeOptions = {
+  ranged: boolean;
+  /** It can also attack by moving onto the enemy, the way a galley or a warrior does. */
+  melee?: boolean;
+  canStrikeNow: boolean;
+  plots: Array<{ at: string; what: string | null }>;
+  error?: string;
 };
 
 /** `civ <decision>` with no value lists; with a value it acts. */
@@ -49,9 +61,13 @@ export type WhatCanResult = {
 /** `civ diplomacy` — who you have met, or what you may do to one of them. */
 export type DiplomacyResult = ActionResult & {
   listing?: boolean;
-  players?: Array<{ player: string; civ: string | null; atWar: boolean }>;
+  players?: Array<{ player: string; civ: string | null; atWar: boolean; greetingOwed?: boolean }>;
   target?: string;
   offers?: Array<{ operation: string; action: string }>;
+  /** Whether this civ has just met you and waits on a greeting. */
+  greetingOwed?: boolean;
+  /** Proposals from other civs waiting on accept/reject. */
+  proposals?: Array<{ id: string; from: string | null; action: string | null }>;
 };
 
 /** One item either side could put on a trade deal. */

@@ -36,6 +36,7 @@ type Header = {
   civ?: string;
   leader?: string;
   legacy?: Array<{ type: string; score?: number; target?: number }>;
+  victories?: Array<{ type: string; current?: number; total?: number }>;
 };
 
 // One broadcast color per seat, assigned by roster order. Distinct hues that read at stream bitrate.
@@ -101,7 +102,12 @@ function buildData() {
   const seats = agents().map((a, i) => {
     const found = latestHeader(a.name);
     const h = found?.header ?? {};
-    const score = (h.legacy ?? []).reduce((s, l) => s + (l.score ?? 0), 0);
+    // Legacy scores when the match has legacy paths; otherwise the victory manager's own
+    // progress, which read 8/13 on domination while every legacy score was 0.
+    const legacyScore = (h.legacy ?? []).reduce((s, l) => s + (l.score ?? 0), 0);
+    const victories = (h.victories ?? []).filter((v) => (v.total ?? 0) > 0);
+    const lead = [...victories].sort((a, b) => (b.current ?? 0) / (b.total ?? 1) - (a.current ?? 0) / (a.total ?? 1))[0];
+    const score = legacyScore > 0 ? legacyScore : (lead?.current ?? 0);
     return {
       name: a.name,
       model: a.model,
@@ -113,7 +119,9 @@ function buildData() {
       civ: h.civ ?? "",
       leader: (h.leader ?? "").split(",")[0]!.trim(),
       score,
-      closest: closestVictory(h.legacy),
+      closest: closestVictory(h.legacy) ?? (lead && (lead.current ?? 0) > 0
+        ? { label: lead.type.replace(/^VICTORY_/, "").replace(/_/g, " "), score: lead.current ?? 0, target: lead.total ?? 0 }
+        : null),
       economy: n(h.gold),
       economyRate: n(h.yields?.gold),
       science: n(h.yields?.science),

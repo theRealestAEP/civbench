@@ -11,9 +11,9 @@
 import { existsSync, readFileSync, readdirSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadEnv } from "../src/config/env.ts";
-import { readTurns, milestonesOf, shouldSpeak, type CompleteTurn } from "../src/commentary/brief.ts";
+import { readTurns, milestonesOf, shouldSpeak, inProgressTurn, liveSnapshot, type CompleteTurn } from "../src/commentary/brief.ts";
 import {
-  commentateTurn, monologueTurn, hasCommentary, newMemory, writeCommentary,
+  commentateTurn, monologueTurn, commentateLive, hasCommentary, newMemory, writeCommentary,
 } from "../src/commentary/commentate.ts";
 import { modelSpeaker } from "../src/commentary/speak.ts";
 import { createVoicePool } from "../src/commentary/voice.ts";
@@ -31,6 +31,11 @@ const args = process.argv.slice(2);
 const follow = args.includes("--follow");
 const aloud = args.includes("--speak");
 const monologue = args.includes("--monologue");
+// Live play-by-play between finished turns: a line every LIVE_EVERY_MS while a seat is mid-turn,
+// from its streaming transcript and the actions it has taken so far. Turns run several minutes,
+// and the per-turn segment left all of that as dead air. On by default when following.
+const live = args.includes("--live") || (args.includes("--follow") && !args.includes("--no-live"));
+const LIVE_EVERY_MS = 45_000;
 const site = args.includes("--site");
 const portArg = args.indexOf("--port");
 const sitePort = portArg >= 0 ? Number(args[portArg + 1]) : 7667;
@@ -257,10 +262,44 @@ let last = latest?.turn ?? 0;
 // Swings measure against the state where we joined, not against nothing.
 prevSpoken = latest;
 console.log(`following ${runDir} from turn ${last + 1}`);
+// Live state: when the caster last spoke mid-turn, how far into each seat-turn's record it has
+// read, and the reasoning it last saw (so a silent tick with nothing new stays silent).
+let lastLiveAt = 0;
+const liveSeq = new Map<string, number>();
+const liveSeen = new Map<string, string>();
+const liveMemory = newMemory();
+
+async function liveTick(): Promise<void> {
+  if (!live || Date.now() - lastLiveAt < LIVE_EVERY_MS) return;
+  const current = inProgressTurn(runDir);
+  if (!current) return;
+  const key = `${current.turn}:${current.seat}`;
+  const snap = liveSnapshot(runDir, current.seat, current.turn, liveSeq.get(key) ?? 0);
+  const nothingNew = snap.did.length === 0 && snap.mistakes.length === 0 && snap.thinking === liveSeen.get(key);
+  liveSeq.set(key, snap.lastSeq);
+  liveSeen.set(key, snap.thinking);
+  // A seat that thinks in one long silent call gives the caster nothing for minutes. Past two
+  // intervals of silence, say so — the silence is the story — rather than leaving dead air.
+  const silentFor = Math.round((Date.now() - lastLiveAt) / 1000);
+  if (nothingNew && silentFor < (2 * LIVE_EVERY_MS) / 1000) return;
+  if (nothingNew) snap.mistakes.push(`has taken no action for about ${silentFor} seconds — still reading and deliberating`);
+  lastLiveAt = Date.now();
+  try {
+    const { legend, roster } = buildLegend(runDir);
+    const line = await commentateLive(snap, speak, liveMemory, legend, roster);
+    console.log(`  ${current.seat} live — ${line.text}`);
+    appendFileSync(join(runDir, "commentary", "live.md"), `- t${current.turn} ${current.seat}: ${line.text}\n`);
+    emit("live", line.text, casterVoiceId, `live:${key}`);
+  } catch (err) {
+    console.error(`  (live line skipped: ${String(err instanceof Error ? err.message : err)})`);
+  }
+}
+
 while (true) {
   const finished = readTurns(runDir).filter((t) => t.turn > last && !hasCommentary(runDir, t.turn));
   const newest = finished.at(-1);
   if (!newest) {
+    await liveTick();
     await sleep(POLL_MS);
     continue;
   }

@@ -40,6 +40,20 @@ export function createBroadcast(opts: {
   const feed: BroadcastLine[] = [];
   const feedPath = join(opts.runDir, "broadcast.jsonl");
   let seq = 0;
+  // Continue the run's own feed rather than starting a new one. A restarted narrator used to
+  // serve an empty feed, and the page — which only appends past the length it already holds —
+  // sat on the old last line until someone refreshed the browser source.
+  if (existsSync(feedPath)) {
+    for (const line of readFileSync(feedPath, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        // SAFETY: this run's own feed file, one BroadcastLine per line, written by this function.
+        const entry = JSON.parse(line) as BroadcastLine;
+        feed.push(entry);
+        seq = Math.max(seq, Number(entry.seq) || 0);
+      } catch { /* a torn last line; the rest of the feed still counts */ }
+    }
+  }
 
   // Synthesize strictly in call order, so the feed reads and plays in the order lines were spoken.
   let chain: Promise<void> = Promise.resolve();
@@ -165,6 +179,13 @@ const card=document.getElementById('card'), dotEl=document.getElementById('dot')
 let items=[], nextPlay=0, playingSeq=-1, timer=null;
 async function poll(){
   try{ const d=await fetch('/feed.json',{cache:'no-store'}).then(r=>r.json());
+    // A shorter feed, or a different first entry, is a NEW run behind this page — the narrator
+    // was restarted on another run directory. The page used to append only past its old length,
+    // so it sat on the previous run's last line until the new feed outgrew it (or someone hit
+    // refresh). Start over instead.
+    if(d.length<items.length || (d.length && items.length && d[0].seq!==items[0].seq)){
+      items=[]; nextPlay=0; playingSeq=-1; if(timer){clearTimeout(timer); timer=null;} au.pause();
+    }
     for(let i=items.length;i<d.length;i++) items.push(d[i]); pump(); }catch(e){}
 }
 function show(it){

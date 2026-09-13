@@ -6,7 +6,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GameAdapter } from "../src/adapter/game.ts";
-import { FakeBridge, makeWorld } from "../src/test-support/fake-game.ts";
+import { FakeBridge, makeWorld, hashOf } from "../src/test-support/fake-game.ts";
 import { MatchServer } from "../src/server/match.ts";
 import { createAgentSandbox } from "../src/agent/sandbox.ts";
 
@@ -988,6 +988,107 @@ test("a seat the game offers twice gets its turn ended, not waited on", async ()
 // showed only `currentProductionTypeHash` and answered "build set to X", so an agent that queued
 // a granary behind a scout saw the scout, concluded the order had not stuck, and queued the
 // granary again — three times in one turn, in a run where every one of those orders had worked.
+// A town builds nothing but its focus. One seat, told only `civ build <town>`, queued seventeen
+// scouts across two towns in a single turn against a prompt that only a focus answers.
+test("a town offers only its focus, refuses units in plain words, and sends the focus exclusive", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-town-"));
+  const world = makeWorld();
+  world.cities.push({ id: 50, owner: 0, name: "Ajaccio", x: 2, y: 2, isTown: true });
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  const town = await session.exec("civ build 50");
+  assert.match(town.stdout, /civ build 50 PROJECT_TOWN_TEST/, "the focus is offered as a runnable command");
+  assert.doesNotMatch(town.stdout, /UNIT_|BUILDING_|PROJECT_TEST\b/, "nothing a town cannot build is listed");
+  assert.match(town.stdout, /this is a town/, "and the listing says why in plain words");
+
+  const city = await session.exec("civ build 30");
+  assert.match(city.stdout, /PROJECT_TEST/, "a city keeps its own projects");
+  assert.doesNotMatch(city.stdout, /PROJECT_TOWN_TEST/, "and never a town's focus");
+
+  const unit = await session.exec("civ build 50 UNIT_WARRIOR");
+  assert.notEqual(unit.exitCode, 0, "a unit in a town is refused");
+  assert.match(unit.stdout, /Ajaccio is a town/, "with the reason, not 'no such build'");
+
+  const focus = await session.exec("civ build 50 PROJECT_TOWN_TEST");
+  assert.equal(focus.exitCode, 0, focus.stdout);
+  const sent = world.cityRequests.at(-1)!;
+  assert.equal(sent.ProjectType, 2, "the project goes by row index");
+  assert.equal(sent.InsertMode, 1, "and replaces the queue, as the game's own chooser sends it");
+});
+
+test("a move with no path is refused before it is sent, with the reason", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-path-"));
+  const world = makeWorld();
+  world.unreachable.add("7,7");
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  const refused = await session.exec("civ move 10 7,7");
+  assert.notEqual(refused.exitCode, 0, "no path means no order");
+  assert.match(refused.stdout, /NO_PATH/);
+  assert.match(refused.stdout, /no path from 1,1 to 7,7/, "it says where from and where to");
+  assert.equal(world.unitMoves.size, 0, "nothing reached the engine");
+
+  const fine = await session.exec("civ move 10 2,1");
+  assert.equal(fine.exitCode, 0, fine.stdout);
+});
+
+test("a town buys with gold: the list prices it, the purchase is sent, and the treasury proves it", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-buy-"));
+  const world = makeWorld();
+  world.cities.push({ id: 50, owner: 0, name: "Ajaccio", x: 2, y: 2, isTown: true });
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  const listing = await session.exec("civ buy 50");
+  assert.match(listing.stdout, /civ buy 50 UNIT_WARRIOR\s+# 60 gold/, "the price sits beside the runnable command");
+  assert.match(listing.stdout, /100 gold in the treasury/);
+
+  const bought = await session.exec("civ buy 50 UNIT_WARRIOR");
+  assert.equal(bought.exitCode, 0, bought.stdout);
+  assert.match(bought.stdout, /bought UNIT_WARRIOR for 60 gold; 40 gold left/);
+  assert.equal(world.purchases.length, 1, "one purchase reached the engine");
+  assert.ok(Number.isInteger(world.purchases[0]!.args.UnitType), "a unit goes by its type hash, as the game's chooser sends it");
+});
+
+test("a town-focus blocker names the town and the focus choices when the turn is refused", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-focus-"));
+  const world = makeWorld();
+  world.cities.push({ id: 50, owner: 0, name: "Ajaccio", x: 2, y: 2, isTown: true });
+  world.notifications.set(0, [
+    { id: 503, name: "NOTIFICATION_CHOOSE_TOWN_PROJECT", typeHash: 77001, blocking: true, dismissible: false, target: { id: 50, owner: 0 } },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  await session.exec("civ skip 10");
+  const refused = await session.exec("civ end-turn");
+  assert.notEqual(refused.exitCode, 0, "the focus prompt blocks the turn");
+  assert.match(refused.stdout, /Ajaccio has grown enough to choose its town focus/, "the town is named in plain words");
+  assert.match(refused.stdout, /civ build 50 PROJECT_TOWN_TEST/, "and the answer is a runnable command");
+});
+
 test("civ build says it joined a queue, and shows the queue", async () => {
   const { session } = await setup();
   const first = await session.exec("civ build 30 UNIT_WARRIOR");
@@ -1356,7 +1457,9 @@ test("a dismissal the game ignores is called out, with the command that answers 
 
   const result = await session.exec("civ dismiss");
   assert.notEqual(result.exitCode, 0, "an ignored dismissal must not report ok");
-  assert.match(result.stdout, /ignored the dismissal/);
+  // Refused up front now (NOT_DISMISSIBLE); the post-hoc "ignored the dismissal" path still
+  // backs it for decision types the up-front list does not know.
+  assert.match(result.stdout, /NOT_DISMISSIBLE|ignored the dismissal/);
   assert.match(result.stdout, /civ tech/);
   assert.doesNotMatch(result.stdout, /civ dismiss/);
   assert.match(hud, /civ tech/);
@@ -1543,4 +1646,624 @@ test("forced end-turn uses the advisor acknowledgment and records it", async () 
   assert.deepEqual(world.notifications.get(0), []);
   const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
   assert.match(events, /"kind":"forced_answer".*"ok":true.*"answered":"advisor warning"/);
+});
+
+// One agent sent its slinger at an enemy scout's tile three times in a turn. The path exists,
+// the engine accepts the order, nothing moves, and DID_NOT_MOVE names no reason — while the
+// scout stood in plain sight on the agent's own map.
+test("a move onto another civilization's unit is refused up front, naming the unit", async () => {
+  const { session, world } = await setup();
+  world.units.push({ id: 21, owner: 1, type: 101, x: 2, y: 1 }); // 2,1 is visible to p0
+
+  const refused = await session.exec("civ move 10 2,1");
+  assert.notEqual(refused.exitCode, 0, "the tile is taken");
+  assert.match(refused.stdout, /TILE_OCCUPIED/);
+  assert.match(refused.stdout, /2,1 holds a scout of p1/, "it says who is standing there");
+  assert.match(refused.stdout, /not at war/, "and whether attacking is an option");
+  assert.equal(world.unitMoves.size, 0, "nothing reached the engine");
+
+  world.atWar.add("0-1");
+  const atWar = await session.exec("civ move 10 2,1");
+  assert.match(atWar.stdout, /civ attack 10 2,1/, "at war, the hint is the attack command");
+});
+
+test("a unit hidden by fog is not named by the occupancy check", async () => {
+  const { session, world } = await setup();
+  // 1,2 is only REVEALED to p0, not visible: what stands there is not p0's to know.
+  world.units.push({ id: 22, owner: 1, type: 101, x: 1, y: 2 });
+  const result = await session.exec("civ move 10 1,2");
+  assert.doesNotMatch(result.stdout, /TILE_OCCUPIED|holds a/, "fog stays fog");
+});
+
+// Six of one run's thirteen NO_PATH refusals were the same move retried. The message named
+// "water, mountains, or a tile it may not enter" — every possibility — when the map knew.
+test("a move with no path names what the destination tile is", async () => {
+  const { session, world } = await setup();
+  world.unreachable.add("2,1");
+  world.water.add("2,1");
+  const refused = await session.exec("civ move 10 2,1");
+  assert.match(refused.stdout, /NO_PATH/);
+  assert.match(refused.stdout, /2,1 is water/, "the tile is named for what it is");
+  assert.doesNotMatch(refused.stdout, /water for a land unit, mountains, or/, "not the list of guesses");
+});
+
+// A saw pit was ordered twice, reported ok twice, and queued nothing either time. The city's
+// urban tiles were full, so the engine offered only ExpandUrbanPlots — rural tiles the building
+// could turn urban — and the harness read only Plots, sent the order with no plot, and the
+// engine accepted it and did nothing.
+test("a building goes on an expandable rural tile when every urban slot is full", async () => {
+  const { session, world } = await setup();
+  world.buildPlots = { Plots: [], ExpandUrbanPlots: [1 * world.width + 2] }; // plot 2,1
+
+  const built = await session.exec("civ build 30 BUILDING_GRANARY");
+  assert.equal(built.exitCode, 0, built.stdout);
+  const sent = world.cityRequests.at(-1)!;
+  assert.equal(sent.X, 2, "the order carries the rural plot");
+  assert.equal(sent.Y, 1);
+  assert.equal(world.buildQueue.get(30)?.length, 1, "and it queued");
+});
+
+test("a building with no legal plot at all is refused before it is sent", async () => {
+  const { session, world } = await setup();
+  world.buildPlots = { Plots: [], ExpandUrbanPlots: [] };
+  const before = world.cityRequests.length;
+  const refused = await session.exec("civ build 30 BUILDING_GRANARY");
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stdout, /NO_PLOT/);
+  assert.equal(world.cityRequests.length, before, "nothing reached the engine");
+});
+
+// 23 of one run's 46 turns ended with "unit X is busy with an operation — it should not be
+// blocking; cancel it". The unit was a scout on auto-explore that the engine listed as ready
+// (its order had paused), the dump had called it busy, and the agent cancelled and re-issued
+// the order every turn. The engine's end-of-turn rule decides both the flag and the hint.
+test("a unit on a paused standing order shows needs_orders and end-turn says to skip it", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-ready-"));
+  const world = makeWorld();
+  world.unitBusy.add(10); // hasPendingOperations, and the engine still allows SKIP_TURN
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  const units = readFileSync(join(runDir, "agents/alpha/turns/t0042/units.txt"), "utf8");
+  const line = units.split("\n").find((l) => l.includes("engine_id=10")) ?? "";
+  assert.match(line, /needs_orders=yes/, "the flag is on the line at turn start");
+  assert.doesNotMatch(line, /busy=yes/, "a unit the engine wants a decision from is not 'busy'");
+
+  const refused = await session.exec("civ end-turn");
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stdout, /civ skip 10/, "the one-command answer");
+  assert.doesNotMatch(refused.stdout, /should not be blocking|UNITCOMMAND_CANCEL/);
+
+  const skipped = await session.exec("civ skip 10");
+  assert.equal(skipped.exitCode, 0, skipped.stdout);
+  const ended = await session.exec("civ end-turn");
+  assert.equal(ended.exitCode, 0, ended.stdout);
+});
+
+test("a unit that is busy and NOT ready keeps busy=yes and no needs_orders", async () => {
+  const { runDir, world } = await setup();
+  // Re-dump with the unit both mid-operation and already ordered this turn.
+  world.unitBusy.add(10);
+  world.unitOrdered.add(10);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(0);
+  const units = readFileSync(join(runDir, "agents/alpha/turns/t0042/units.txt"), "utf8");
+  const line = units.split("\n").find((l) => l.includes("engine_id=10")) ?? "";
+  assert.match(line, /busy=yes/);
+  assert.doesNotMatch(line, /needs_orders/);
+});
+
+// A listing that counted free slots sent an agent into five refusals and a search of the rules
+// files — its turn ran out with the prompt still open. The engine is asked per settlement, so the
+// listing says where each resource CAN go, a refusal says why and where else, and a settlement can
+// be named as the listing prints it.
+test("civ resource lists where each resource can go and explains a refusal", async () => {
+  // Built by hand: the fake's settlement list is fixed when the bridge is made, so the town
+  // must exist before setup.
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-resource-"));
+  const world = makeWorld();
+  world.resources[0] = [{ index: 5, hash: 999 }];
+  world.cities.push({ id: 31, owner: 0, name: "Cleveland", x: 2, y: 2, isTown: true });
+  world.resourceRefused.add("5:31"); // a city resource in a town
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  const list = await session.exec("civ resource");
+  assert.match(list.stdout, /RESOURCE_999 \(city resource\)  -> Waset city:30/, list.stdout);
+  assert.doesNotMatch(list.stdout, /Cleveland city:31/, "the town is not offered for a city resource");
+  assert.match(list.stdout, /towns \(no city resources\): Cleveland/);
+
+  const refused = await session.exec("civ resource RESOURCE_999 31");
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stdout, /city resource and Cleveland is a town/, "the reason, not 'slots may be full'");
+  assert.match(refused.stdout, /it can go to: Waset \(city:30\)/, "and where it can go");
+  assert.equal(world.resourceAssigns.length, 0);
+
+  const byName = await session.exec('civ resource RESOURCE_999 "waset"');
+  assert.equal(byName.exitCode, 0, byName.stdout);
+  assert.equal(world.resourceAssigns.at(-1)?.city, 30, "a settlement can be named");
+});
+
+test("civ resource says to finish when nothing can be placed anywhere", async () => {
+  const { session, world } = await setup();
+  world.resources[0] = [{ index: 5, hash: 999 }];
+  world.resourceRefused.add("5:30");
+  const list = await session.exec("civ resource");
+  assert.match(list.stdout, /RESOURCE_999 \(city resource\)  -> nowhere right now/);
+  assert.match(list.stdout, /civ resource done/);
+  const refused = await session.exec("civ resource RESOURCE_999 30");
+  assert.match(refused.stdout, /no settlement can take RESOURCE_999 right now/);
+});
+
+// Bruno's turns 70 and 71 each ran the 480s clock down on "the game is waiting on
+// NOTIFICATION_COMMAND_UNITS" with a placeholder hint, seven and eleven times. The unit the game
+// wanted had moved part-way and still had moves: skippable, so the engine counted it, but not
+// "never moved", so the harness named it only when another unit was waiting too.
+test("a lone unit that moved part-way is still named when units block the turn", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-loneunit-"));
+  const world = makeWorld();
+  world.unitMoves.set(10, 1); // moved this turn, one move left, no standing order
+  world.notifications.set(0, [
+    { id: 902, name: "NOTIFICATION_COMMAND_UNITS", typeHash: 9002, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(0);
+  const refused = await server.endTurn(0);
+  assert.equal(refused.ok, false);
+  assert.match(String(refused.message), /unit 10\b/, "the unit is named even though it already moved");
+  assert.doesNotMatch(String(refused.hint), /<unit>/, "no placeholder");
+  assert.match(String(refused.hint), /civ skip 10/);
+});
+
+// Ada's turn 79 ran the clock down on an unspent promotion: eleven `civ promote` calls all said
+// "ok — promote set to X", the engine applied none, and the point stayed unspent. canStart says
+// yes to nearly any pairing; the game's own panel gates on Experience.canEarnPromotion, and the
+// tree forbade every pick Ada made. The listing, the pick, and the "ok" now follow that gate.
+test("civ promote lists only what the tree allows, refuses the rest, and verifies the point was spent", async () => {
+  const { session, world } = await setup();
+  world.promotionPoints.set(10, 1);
+
+  const list = await session.exec("civ promote 10");
+  assert.match(list.stdout, /PROMOTION_TEST_ONE/, list.stdout);
+  assert.doesNotMatch(list.stdout, /PROMOTION_TEST_TWO/, "a promotion behind a prerequisite is not offered");
+  assert.match(list.stdout, /1 promotion point/);
+
+  const locked = await session.exec("civ promote 10 PROMOTION_TEST_TWO");
+  assert.notEqual(locked.exitCode, 0, "the pick the tree forbids is refused, not 'ok'");
+  assert.match(locked.stdout, /not a promotion this unit can take now; it can take: PROMOTION_TEST_ONE/);
+  assert.equal(world.promotionPoints.get(10), 1, "nothing was spent");
+
+  const taken = await session.exec("civ promote 10 PROMOTION_TEST_ONE");
+  assert.equal(taken.exitCode, 0, taken.stdout);
+  assert.equal(world.promotionPoints.get(10), 0, "the point was spent");
+  assert.ok(world.promotionsTaken.has("10:PROMOTION_TEST_ONE"));
+});
+
+test("civ promote reports NOT_PROMOTED when the engine accepts a pick and applies nothing", async () => {
+  const { session, world } = await setup();
+  world.promotionPoints.set(10, 1);
+  world.promotionsStuck = true;
+  const stuck = await session.exec("civ promote 10 PROMOTION_TEST_ONE");
+  assert.notEqual(stuck.exitCode, 0);
+  assert.match(stuck.stdout, /NOT_PROMOTED/, stuck.stdout);
+  assert.match(stuck.stdout, /still unspent/);
+});
+
+// Ten fortify orders in one turn went to settlers, merchants and cogs and came back "the game
+// refused this action and gave no reason". Only a land combat unit takes a standing order.
+test("fortifying a civilian unit is refused with the reason, not silence", async () => {
+  const { world } = await setup();
+  world.units.push({ id: 11, owner: 0, type: 102, x: 1, y: 1 });
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), mkdtempSync(join(tmpdir(), "civbench-fort-")), [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(0);
+  const refused = await server.act(0, { kind: "unit_operation", targetId: "11", actionType: "UNITOPERATION_FORTIFY" });
+  assert.equal(refused.ok, false);
+  assert.match(String(refused.message), /a settler cannot do that — only land combat units/, String(refused.message));
+  assert.match(String(refused.message), /civ skip 11/);
+});
+
+// A settler refused where it stood got "no valid constructions for this location" three times
+// and then a bare "no reason" on the adjacent-plot variant. The game's own advisor knows where
+// it would settle; the refusal now says so.
+test("a refused founding names the advisor's recommended plots", async () => {
+  const { world } = await setup();
+  world.units.push({ id: 12, owner: 0, type: 102, x: 3, y: 3 });
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), mkdtempSync(join(tmpdir(), "civbench-found-")), [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(0);
+  const refused = await server.act(0, { kind: "unit_operation", targetId: "12", actionType: "UNITOPERATION_FOUND_CITY" });
+  assert.equal(refused.ok, false);
+  assert.match(String(refused.message), /cannot found a settlement on its plot — the game's own advisor recommends: 5,3/, String(refused.message));
+});
+
+// NOTIFICATION_CHOOSE_BELIEF blocked a whole turn while an agent drove the game's own picker
+// through the generic screen reader, whose belief cards carry no names. `civ belief` lists what
+// the religion may claim, with what each does, and claims one with ADD_BELIEF the way the
+// game's own panel does; `civ religion` founds one with FOUND_RELIGION.
+test("civ belief lists claimable beliefs with what they do and claims one", async () => {
+  const { session, world } = await setup();
+  world.claimableBeliefs.add("BELIEF_TEST_TITHE");
+  const list = await session.exec("civ belief");
+  assert.equal(list.exitCode, 0, list.stdout);
+  assert.match(list.stdout, /BELIEF_TEST_TITHE/, list.stdout);
+  assert.match(list.stdout, /gold per follower/, "what it does rides on the line");
+  assert.doesNotMatch(list.stdout, /BELIEF_TEST_LOCKED/, "an unclaimable belief is not offered");
+  assert.doesNotMatch(list.stdout, /BELIEF_TEST_PANTHEON/, "pantheon beliefs belong to civ pantheon");
+
+  const claim = await session.exec("civ belief BELIEF_TEST_TITHE");
+  assert.equal(claim.exitCode, 0, claim.stdout);
+  const sent = world.beliefRequests.at(-1);
+  assert.equal(sent?.op, "ADD_BELIEF");
+  assert.equal(sent?.args?.BeliefType, hashOf("BELIEF_TEST_TITHE"), "the belief goes by hash, as the game's own panel sends it");
+});
+
+test("civ religion lists unfounded religions and founds one", async () => {
+  const { session, world } = await setup();
+  const list = await session.exec("civ religion");
+  assert.match(list.stdout, /RELIGION_TEST_ONE/, list.stdout);
+  const found = await session.exec("civ religion RELIGION_TEST_TWO");
+  assert.equal(found.exitCode, 0, found.stdout);
+  assert.equal(world.beliefRequests.at(-1)?.op, "FOUND_RELIGION");
+  const again = await session.exec("civ religion");
+  assert.doesNotMatch(again.stdout, /RELIGION_TEST_TWO/, "a founded religion is no longer offered");
+});
+
+// "the game is waiting on NOTIFICATION_NEW_POPULATION" named no settlement and `civ expand` alone
+// printed usage; an agent expanded the wrong town and the block stayed for a 480s turn. With no
+// city given, expand now names every settlement with a citizen to place and where it can go.
+test("civ expand with no city names the settlements that must place a citizen", async () => {
+  const { session } = await setup();
+  const listing = await session.exec("civ expand");
+  assert.equal(listing.exitCode, 0, listing.stdout);
+  assert.match(listing.stdout, /Waset \(city:30\) has a citizen to place: civ expand 30 \d+,\d+/, listing.stdout);
+});
+
+// A decision cannot be dismissed. Dismissing one used to report "ok", the game ignored it, and
+// the agent learned that from a later correction. And ids are renumbered within a turn while the
+// type name is stable, so a notification can be named by type.
+test("civ dismiss refuses a decision up front and names the answering command", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-dismiss-"));
+  const world = makeWorld();
+  world.notifications.set(0, [
+    { id: 701, name: "NOTIFICATION_NEW_POPULATION", typeHash: 442844772, blocking: true, dismissible: false },
+    { id: 702, name: "NOTIFICATION_LEGACY_COMPLETED", typeHash: 99887766, blocking: false, dismissible: true },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 10, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  const refused = await session.exec("civ dismiss NOTIFICATION_NEW_POPULATION");
+  assert.notEqual(refused.exitCode, 0, refused.stdout);
+  assert.match(refused.stdout, /NOT_DISMISSIBLE/);
+  assert.match(refused.stdout, /civ expand/, "the command that answers it");
+  assert.equal((world.notifications.get(0) ?? []).length, 2, "nothing was dismissed");
+
+  const byName = await session.exec("civ dismiss NOTIFICATION_LEGACY_COMPLETED");
+  assert.equal(byName.exitCode, 0, byName.stdout);
+  assert.equal((world.notifications.get(0) ?? []).length, 1, "the alert went, by type name");
+});
+
+// Fifty-five NO_PATH refusals in one night read "X,Y is flat; the way there is impassable" for
+// an adjacent tile that looked walkable. Cliffs block an edge, not a tile; say so.
+test("a move blocked by a cliff names the cliff", async () => {
+  const { session, world } = await setup();
+  world.unreachable.add("2,1");
+  world.cliffs.add("2,1");
+  const refused = await session.exec("civ move 10 2,1");
+  assert.match(refused.stdout, /NO_PATH/);
+  assert.match(refused.stdout, /behind a cliff — there is no crossing from 1,1/, refused.stdout);
+});
+
+// The engine refuses SKIP_TURN for a unit built this turn while NOTIFICATION_COMMAND_UNITS still
+// waits on it. The refusal named nobody, `civ skip` on the right unit said "needs no skip", and
+// only a move ever cleared it: 68 nameless refusals across nine turns, three of them lost whole.
+test("a unit the engine will not skip is still named, and skip says to move it", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-unskippable-"));
+  const world = makeWorld();
+  world.unitOrdered.add(10); // SKIP refused with no reason; awake, unmoved, moves left
+  world.notifications.set(0, [
+    { id: 700, name: "NOTIFICATION_COMMAND_UNITS", typeHash: 7001, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 8, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+
+  const line = await session.exec("grep 'engine_id=10 ' /current/units.txt");
+  assert.match(line.stdout, /needs_orders=yes/, "the units dump flags the unit the engine waits on");
+
+  const refused = await session.exec("civ end-turn");
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stdout, /unit 10 .*still needs orders/, "the refusal names the unit");
+  assert.match(refused.stdout, /civ move 10 <x,y>/, "and says a move is what clears it");
+
+  const skip = await session.exec("civ skip 10");
+  assert.notEqual(skip.exitCode, 0, "a skip the engine refuses is not reported as done");
+  assert.match(skip.stdout, /SKIP_REFUSED/);
+  assert.match(skip.stdout, /civ move 10/);
+
+  const moved = await session.exec("civ move 10 2,1");
+  assert.equal(moved.exitCode, 0, moved.stderr);
+});
+
+test("a forced end-turn steps a unit the engine will not skip", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-unskippable-forced-"));
+  const world = makeWorld();
+  world.unitOrdered.add(10);
+  world.notifications.set(0, [
+    { id: 700, name: "NOTIFICATION_COMMAND_UNITS", typeHash: 7001, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(0);
+  await server.endTurn(0, true);
+  const unit = world.units.find((u) => u.id === 10);
+  assert.ok(unit && !(unit.x === 1 && unit.y === 1), "the stuck unit was given a real order");
+});
+
+// NOTIFICATION_CAN_BUY_ATTRIBUTE_SKILL is cleared by the attribute screen's "considered" signal
+// when it closes, buying or not. The harness could buy a node and never send that signal, so an
+// agent that wanted to bank its points had no way out: 30 blocks, 24 never resolved.
+test("civ attribute done clears the attribute prompt, and a forced end-turn sends it too", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-attribute-"));
+  const world = makeWorld();
+  world.notifications.set(0, [
+    { id: 710, name: "NOTIFICATION_CAN_BUY_ATTRIBUTE_SKILL", typeHash: 7101, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  assert.match(hud, /civ attribute done/, "the turn-start requirement names the closing command");
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+  await session.exec("civ skip 10");
+  assert.notEqual((await session.exec("civ end-turn")).exitCode, 0, "blocked until considered");
+  const done = await session.exec("civ attribute done");
+  assert.equal(done.exitCode, 0, done.stderr);
+  const ended = await session.exec("civ end-turn");
+  assert.equal(ended.exitCode, 0, ended.stderr);
+
+  // And the forced path answers it the same way when the agent never did.
+  const runDir2 = mkdtempSync(join(tmpdir(), "civbench-attribute-forced-"));
+  const world2 = makeWorld();
+  world2.notifications.set(0, [
+    { id: 710, name: "NOTIFICATION_CAN_BUY_ATTRIBUTE_SKILL", typeHash: 7101, blocking: true, dismissible: false },
+  ]);
+  const server2 = new MatchServer(new GameAdapter(new FakeBridge(world2)), runDir2, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server2.beginTurn(0);
+  const forced = await server2.endTurn(0, true);
+  assert.equal(forced.ok, true, "the forced end-turn clears the attribute prompt");
+  assert.equal((world2.notifications.get(0) ?? []).length, 0);
+});
+
+// A conquered settlement must be kept, razed or freed before the turn ends. The game's chooser
+// is a HUD panel `civ screen` cannot see, and nothing here could send the command — in a
+// domination match this fires on every conquest.
+test("civ capture decides a conquered settlement's fate, and the refusal names it", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-capture-"));
+  const world = makeWorld();
+  world.cities.push({ id: 60, owner: 0, name: "Thebes", x: 3, y: 3, justConquered: true });
+  world.notifications.set(0, [
+    { id: 720, name: "NOTIFICATION_CONSIDER_RAZE_CITY", typeHash: 7201, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 6, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+  await session.exec("civ skip 10");
+  const refused = await session.exec("civ end-turn");
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stdout, /Thebes was just conquered/, "the settlement is named");
+  assert.match(refused.stdout, /civ capture 60 keep/, "and the command that answers it");
+
+  const listing = await session.exec("civ capture 60");
+  assert.equal(listing.exitCode, 0, listing.stderr);
+  assert.match(listing.stdout, /keep/);
+  assert.match(listing.stdout, /raze/);
+  assert.match(listing.stdout, /liberate.*(no|not|—)/, "liberate is listed as unavailable, with its reason");
+
+  const kept = await session.exec("civ capture 60 keep");
+  assert.equal(kept.exitCode, 0, kept.stderr);
+  assert.deepEqual(world.captures, [{ city: 60, directive: 0 }]);
+  const ended = await session.exec("civ end-turn");
+  assert.equal(ended.exitCode, 0, ended.stderr);
+});
+
+// Every settlement- or unit-scoped blocker used to come back NEEDS_A_TARGET on the forced path,
+// so the seat stalled on a citizen to place or a town focus until the harness gave up with "?".
+test("a forced end-turn answers a town focus and a citizen placement for the seat", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-forced-target-"));
+  const world = makeWorld();
+  world.cities.push({ id: 50, owner: 0, name: "Ajaccio", x: 2, y: 2, isTown: true });
+  world.notifications.set(0, [
+    { id: 503, name: "NOTIFICATION_CHOOSE_TOWN_PROJECT", typeHash: 77001, blocking: true, dismissible: false, target: { id: 50, owner: 0 } },
+    { id: 501, name: "NOTIFICATION_NEW_POPULATION", typeHash: 442844772, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(0);
+  const forced = await server.endTurn(0, true);
+  const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
+  assert.match(events, /"kind":"forced_answer".*"blocking":"NOTIFICATION_CHOOSE_TOWN_PROJECT".*"ok":true.*"answered":"build for 50".*"picked":"PROJECT_TOWN_TEST"/);
+  assert.match(events, /"kind":"forced_answer".*"blocking":"NOTIFICATION_NEW_POPULATION".*"ok":true.*"answered":"expand for 30".*"picked":"\d+,\d+"/);
+  assert.equal(forced.ok, true, "both blockers answered, the turn ends");
+});
+
+// The Age boundary's second step. The new Age's dedications are a deck of cards the game's
+// screen fills by drag-and-drop; nothing here could add a card or mark the deck complete, so
+// `civ age` printed nothing while end-turn demanded `civ age finish`, and agents drove the
+// screen by hand with truncated control labels.
+test("civ age lists the new Age's dedications, picks one, and done closes the deck", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-dedication-"));
+  const world = makeWorld();
+  world.ageCards = [
+    { id: "CARD_PLUS_CULTURE", name: "Patrons", description: "more culture", effects: [{ id: "EFFECT_CULTURE", amount: 1 }] },
+    { id: "CARD_PLUS_GOLD", name: "Merchants", description: "more gold", effects: [{ id: "EFFECT_GOLD", amount: 2 }] },
+  ];
+  world.notifications.set(0, [
+    { id: 730, name: "NOTIFICATION_ADVANCED_START", typeHash: 7301, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 8, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  assert.match(hud, /civ age <CARD>/, "the requirement names the dedication step, not `civ age finish`");
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+  await session.exec("civ skip 10");
+
+  const finish = await session.exec("civ age finish");
+  assert.notEqual(finish.exitCode, 0, "the transition is already submitted");
+  assert.match(finish.stdout, /dedications are what is waiting/, "and the refusal points at the deck");
+
+  const listing = await session.exec("civ age");
+  assert.equal(listing.exitCode, 0, listing.stderr);
+  assert.match(listing.stdout, /civ age CARD_PLUS_CULTURE/);
+  assert.match(listing.stdout, /Patrons/, "with the card's name, not only its id");
+  assert.doesNotMatch(listing.stdout, /civ age finish/, "finish is not offered when the engine will refuse it");
+
+  const picked = await session.exec("civ age CARD_PLUS_GOLD");
+  assert.equal(picked.exitCode, 0, picked.stderr);
+  assert.deepEqual(world.deck, ["CARD_PLUS_GOLD"]);
+  const dropped = await session.exec("civ age -CARD_PLUS_GOLD");
+  assert.equal(dropped.exitCode, 0, dropped.stderr);
+  assert.deepEqual(world.deck, []);
+  await session.exec("civ age CARD_PLUS_CULTURE");
+
+  const done = await session.exec("civ age done");
+  assert.equal(done.exitCode, 0, done.stderr);
+  assert.deepEqual(world.effectsUsed, ["EFFECT_CULTURE"], "every effect of the deck is used on done");
+  assert.equal(world.deckComplete, true);
+  const ended = await session.exec("civ end-turn");
+  assert.equal(ended.exitCode, 0, ended.stderr);
+});
+
+test("a forced end-turn fills and closes the dedication deck for the seat", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-dedication-forced-"));
+  const world = makeWorld();
+  world.ageCards = [{ id: "CARD_ONLY", name: "Only", description: "the one card", effects: [] }];
+  world.notifications.set(0, [
+    { id: 730, name: "NOTIFICATION_ADVANCED_START", typeHash: 7301, blocking: true, dismissible: false },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(0);
+  const forced = await server.endTurn(0, true);
+  assert.equal(forced.ok, true);
+  assert.deepEqual(world.deck, ["CARD_ONLY"]);
+  assert.equal(world.deckComplete, true);
+});
+
+// A galley's attack is a melee move onto the enemy, yet the engine answers the ranged query for
+// it too — so `civ attack` refused every naval attack as OUT_OF_RANGE while combat-preview said
+// "melee, possible". Eight turns of naval war went to that.
+test("a unit that can melee attacks by moving when the plot is not a ranged target", async () => {
+  const { session, world } = await setup();
+  world.unitCombat.set(10, { melee: 25, rangedPlots: [] });
+  const attack = await session.exec("civ attack 10 2,1");
+  assert.equal(attack.exitCode, 0, attack.stdout + attack.stderr);
+  assert.doesNotMatch(attack.stdout, /OUT_OF_RANGE/);
+  const unit = world.units.find((u) => u.id === 10);
+  assert.deepEqual([unit?.x, unit?.y], [2, 1], "the attack went out as a move onto the plot");
+});
+
+// The harness cancels carried-over standing orders when it attaches (they can crash the game),
+// logged 76 times as a correction the agent never saw: delta.md said nothing, so units sat idle
+// with no explanation.
+test("an order the harness cancelled at attach is explained in delta.md", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-cancelled-"));
+  const world = makeWorld();
+  world.unitBusy.add(10);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 5, secondsPerTurn: 60 },
+  ]);
+  await server.beginTurn(0);
+  const delta = readFileSync(join(runDir, "agents/alpha/turns/t0042/delta.md"), "utf8");
+  assert.match(delta, /standing orders on unit 10 were cancelled/);
+});
+
+// A civ that has just found you waits on a greeting, and an AI's proposal waits on an answer.
+// Both operations take argument shapes the generic diplomacy path never built, so neither was
+// reachable: NOTIFICATION_PLAYER_MET blocked three turns with nothing to answer it.
+test("civ diplomacy greets a civ that just met you and answers a proposal", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-greet-"));
+  const world = makeWorld();
+  world.met[0] = [1];
+  world.greetingOwed.add(1);
+  world.proposals.set(9001, { actionType: 3, initialPlayer: 1 });
+  world.notifications.set(0, [
+    { id: 740, name: "NOTIFICATION_PLAYER_MET", typeHash: 7401, blocking: true, dismissible: false },
+    { id: 741, name: "NOTIFICATION_DIPLOMATIC_RESPONSE_REQUIRED", typeHash: 7411, blocking: true, dismissible: false, target: { id: 9001, owner: 1 } },
+  ]);
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 8, secondsPerTurn: 60 },
+  ]);
+  const hud = await server.beginTurn(0);
+  assert.match(hud, /civ diplomacy <player> greet/, "the requirement names the greeting command");
+  const notesDir = join(runDir, "notes", "alpha");
+  mkdirSync(notesDir, { recursive: true });
+  const session = createAgentSandbox(server, 0, notesDir, () => hud);
+  await session.exec("civ skip 10");
+
+  const who = await session.exec("civ diplomacy");
+  assert.equal(who.exitCode, 0, who.stderr);
+  assert.match(who.stdout, /p1 .*owes a greeting: civ diplomacy p1 greet/);
+  assert.match(who.stdout, /proposal 9001 from p1: DIPLOMACY_ACTION_OPEN_BORDERS +-> civ diplomacy respond 9001 accept/);
+
+  const greeted = await session.exec("civ diplomacy p1 greet friendly");
+  assert.equal(greeted.exitCode, 0, greeted.stderr);
+  assert.deepEqual(world.greetings, ["1:0"]);
+  const answered = await session.exec("civ diplomacy respond 9001 reject");
+  assert.equal(answered.exitCode, 0, answered.stderr);
+  assert.deepEqual(world.responses, ["9001:1"]);
+  const ended = await session.exec("civ end-turn");
+  assert.equal(ended.exitCode, 0, ended.stderr);
+});
+
+// Agents read "still needs orders" as something wrong with the unit and searched for a fix.
+// Skipping is a normal order; the refusal and the resource listing both say so in plain words.
+test("the end-turn refusal says skipping is a normal choice, and civ resource explains slots", async () => {
+  const { session } = await setup();
+  const refused = await session.exec("civ end-turn");
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stdout, /has not been given one this turn/);
+  assert.match(refused.stdout, /civ skip 10.*normal, valid choice/);
+  const resources = await session.exec("civ resource");
+  assert.equal(resources.exitCode, 0, resources.stderr);
+  assert.match(resources.stdout, /how slots work|every resource you have is already placed/);
 });

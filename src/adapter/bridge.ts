@@ -29,6 +29,18 @@ export class BridgeError extends Error {
 }
 
 /**
+ * A request the game never answered. The socket is still open, so nothing reports it dead —
+ * but a connection the game's inspector has stopped reading never answers again either. A
+ * caller that can reconnect should treat this as a dead socket unless the game itself is gone.
+ */
+export class BridgeTimeout extends BridgeError {
+  constructor(message: string) {
+    super(message);
+    this.name = "BridgeTimeout";
+  }
+}
+
+/**
  * Wrap an expression so the game serialises it for us.
  *
  * The game's own API returns BigInt in places (unit ids, plot indices), which JSON.stringify

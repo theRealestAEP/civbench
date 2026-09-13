@@ -8,7 +8,7 @@
 // runs/<id>/commentary/, outside every sandbox mount, and no part of the match loop calls it.
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { CompleteTurn, TurnBrief } from "./brief.ts";
+import type { CompleteTurn, TurnBrief, LiveSnapshot } from "./brief.ts";
 import type { Speak } from "./speak.ts";
 
 const VOICE = `You are the color commentator for CivBench — three AI civilizations clawing at one
@@ -83,6 +83,28 @@ harness — none of that exists to you. No markdown, no engine names, and NEVER 
 coordinate — speak of places by cardinal direction (north, to the southeast) as a person would. Say
 "the horsemen", never a unit number; "studying writing", never a code. Do not repeat a thought you
 have already voiced in your recent lines.`;
+
+const LIVE_VOICE = `You are the color commentator for CivBench — three AI civilizations clawing at one
+world — and right now ONE seat is mid-turn while the others wait. Turns run several minutes, so you
+fill the air the way a live caster does: what this seat is doing right now, what it seems to be
+thinking, and whether the last thing it did was smart or a blunder.
+
+Say ONE sentence, under 25 words. Dry, fast, a little sarcastic; tease the play, never the player.
+Seats are chairs: call them "they".
+
+You are given what it did since your last line, its own latest reasoning, and any mistakes — in
+game terms ("ordered a unit somewhere it cannot go"). Call a mistake a mistake and a good move a
+good move. A repeated mistake is the story. If nothing happened since your last line, say what it
+is weighing instead, from its reasoning.
+
+What is NOT a mistake, ever: putting idle units on hold at the end of a turn (that is routine
+housekeeping — a big standing army gets skipped every turn), reading the map before acting, or
+answering a decision the game asked for. Only the list marked "Mistakes" counts as one; do not
+invent blunders from the did-lines. When in doubt, describe the play.
+
+Rules: only what the record shows. Never the console — no commands, codes, menus, errors, the
+harness. Plain prose, no lists, no coordinates or tile numbers, no unit id numbers, no engine
+names. Never repeat one of your recent lines.`;
 
 /** How often the caster steps back and calls the race. */
 export const STANDINGS_EVERY = 5;
@@ -215,6 +237,36 @@ export function standingsPromptFor(turn: CompleteTurn, recent: string[] = []): s
     parts.push("", "Your recent standings calls:", ...recent);
   }
   return parts.join("\n");
+}
+
+/** The live prompt: one seat, mid-turn, since the caster's last look. */
+export function livePromptFor(snap: LiveSnapshot, recent: string[] = [], legend?: Map<number, string>, roster?: Roster): string {
+  const parts: string[] = [...rosterLines(roster)];
+  parts.push(`Turn ${snap.turn}. ${snap.seat} is mid-turn, ${snap.elapsedSec}s in.`);
+  const did = gameVisible(snap.did);
+  parts.push("", "Since your last line it did:", did.length > 0 ? did.join("\n") : "(nothing new)");
+  if (snap.mistakes.length > 0) parts.push("", "Mistakes since your last line:", ...snap.mistakes.map((m) => `- ${m}`));
+  const stats = statsLine(snap.stats);
+  if (stats) parts.push("", `Where it stands: ${stats}`);
+  if (snap.notes) parts.push(`Its own journal (its plan, in its own words): ${snap.notes}`);
+  if (snap.thinking) parts.push("", "Its latest reasoning:", snap.thinking);
+  if (recent.length > 0) parts.push("", `Your last ${recent.length} live lines (say what CHANGED, never repeat one):`, ...recent);
+  return nameIds(parts.join("\n"), legend);
+}
+
+/** One live line for the seat mid-turn. */
+export async function commentateLive(
+  snap: LiveSnapshot,
+  speak: Speak,
+  memory: Memory = newMemory(),
+  legend?: Map<number, string>,
+  roster?: Roster,
+): Promise<Line> {
+  const key = `live:${snap.seat}`;
+  const recent = memory.get(key) ?? [];
+  const text = flatten(await speak(LIVE_VOICE, livePromptFor(snap, recent, legend, roster)));
+  remember(memory, key, text);
+  return { seat: "live", text };
 }
 
 /** One line of commentary. `seat` is the segment label ("play-by-play" or "standings"). */

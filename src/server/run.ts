@@ -3,11 +3,12 @@
 // Every safety control lives here or in the Match Server, never in the harness. A brain that
 // hangs, crashes, or refuses to end its turn must not be able to stall the match, because a
 // 25-hour game cannot be babysat.
-import { mkdirSync } from "node:fs";
+import { mkdirSync, appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { MatchServer, AgentConfig } from "./match.ts";
-import type { Brain } from "../agent/brain.ts";
+import type { Brain, ThreadEntry } from "../agent/brain.ts";
 import { createAgentSandbox } from "../agent/sandbox.ts";
+import { BRIEFING } from "../agent/briefing.ts";
 import { findGamePids } from "../adapter/discover.ts";
 
 export type Seat = { config: AgentConfig; brain: Brain };
@@ -166,6 +167,26 @@ async function runBrainTurn(
   // heartbeat reports how long since the model last produced anything.
   let lastSignal = Date.now();
   let signals = 0;
+  // The turn's record on disk, appended to as the brain thinks and acts. The path is fixed here,
+  // so a brain still finishing a thought after its turn is over writes into its own turn, never
+  // the next seat's.
+  const transcriptDir = server.turnDir(activeId);
+  const appendTo = (file: string, text: string) => {
+    if (!transcriptDir) return;
+    try {
+      appendFileSync(join(transcriptDir, file), text);
+    } catch { /* the turn directory may already be gone */ }
+  };
+  // transcript.md is the readable digest; thread.jsonl is the conversation itself, one message
+  // per line exactly as the model sent or received it. The system prompt is briefing.md at the
+  // run root, the same for every seat and turn.
+  const log = (entry: string) => appendTo("transcript.md", entry + "\n\n");
+  const thread = (message: ThreadEntry) =>
+    appendTo("thread.jsonl", JSON.stringify({ at: new Date().toISOString(), ...message }) + "\n");
+  // Set once this turn is over, however it ended. The clock races the brain but never cancels
+  // it, so a timed-out brain keeps streaming — and used to keep painting the overlay while the
+  // next seat played, the two flickering over each other on screen.
+  let over = false;
   const heartbeat = setInterval(() => {
     const quiet = Math.round((Date.now() - lastSignal) / 1000);
     if (quiet < HEARTBEAT_SECONDS) return;
@@ -183,10 +204,13 @@ async function runBrainTurn(
         playerId: String(activeId),
         exec: session.exec,
         report: (update) => {
+          if (over) return;
           lastSignal = Date.now();
           signals++;
           server.showOnScreen(activeId, seat.config.name, update);
         },
+        log,
+        thread,
       }),
       seat.config.secondsPerTurn * 1000,
     );
@@ -200,10 +224,19 @@ async function runBrainTurn(
         `  t${gameTurn} ${seat.config.name.padEnd(10)} ` +
           (signals === 0 ? "TIMED OUT — never produced any output" : "TIMED OUT while working"),
       );
+      log(
+        `--- turn over ---\ntimed out after ${seat.config.secondsPerTurn}s. The harness ends the turn ` +
+          `here; any command after this line was refused.`,
+      );
+      thread({ event: "turn_over", reason: "timeout", secondsPerTurn: seat.config.secondsPerTurn });
     } else {
       outcome.commands += report.commands;
       outcome.inputTokens += report.inputTokens ?? 0;
       outcome.outputTokens += report.outputTokens ?? 0;
+      for (const error of report.errors ?? []) {
+        onProgress(`  t${gameTurn} ${seat.config.name.padEnd(10)} MODEL ERROR ${error.slice(0, 120)}`);
+        server.logBrainError(activeId, error);
+      }
       onProgress(
         `  t${gameTurn} ${seat.config.name.padEnd(10)} ${String(report.commands).padStart(3)} cmds ` +
           `${((Date.now() - started) / 1000).toFixed(0).padStart(4)}s  ${report.notes ?? ""}`,
@@ -215,16 +248,12 @@ async function runBrainTurn(
     const message = (err as Error).message ?? String(err);
     onProgress(`  t${gameTurn} ${seat.config.name.padEnd(10)} ERROR ${message.slice(0, 120)}`);
     server.logBrainError(activeId, message);
+    log(`--- turn over ---\nbrain error: ${message}`);
+    thread({ event: "turn_over", reason: "error", message });
   } finally {
+    over = true;
     clearInterval(heartbeat);
     session.close();
-    // Park the reasoning beside the state it was reasoning about, so the two can be compared.
-    // SAFETY: only PiBrain records a transcript; ScriptedBrain has none. The field is
-    // optional here precisely so the absent case reads as absent rather than as an error.
-    const brain = seat.brain as { lastTranscript?: string };
-    if (brain.lastTranscript) {
-      server.writeTranscript(activeId, brain.lastTranscript);
-    }
   }
 }
 
@@ -251,10 +280,43 @@ export async function runMatch(
       },
     ]),
   );
+  // The system prompt every model seat plays under, so a thread on disk can be read in full.
+  writeFileSync(join(runDir, "briefing.md"), BRIEFING);
   /** `${gameTurn}:${playerId}` for every turn actually played, across the whole match. */
   const playedTurns = new Set<string>();
   /** Consecutive rounds where the game could not be read at all (see trackUnreadable). */
   let unreadable = 0;
+  const eliminated = new Set<number>();
+  /**
+   * End the turn of any agent seat the game has eliminated but still hands a turn to.
+   *
+   * Cleo lost her last settlement at turn 58. Hotseat gave her seat the turn anyway, defeat
+   * screen up, and waited for its end-turn; the living-only seat read saw no active seat, and
+   * the loop saved and waited for forty minutes. Returns how many seats were ended.
+   */
+  //
+  // Every dead seat is dropped, active or not. Marking only the ACTIVE dead seat left Cleo a
+  // candidate on the rounds the game no longer offered her a turn, and each of those rounds
+  // waited the full two-minute seat timeout for her: 121s of dead air per round for hours.
+  // Returns whether the seat list changed, so the round can re-plan without the dropped seat.
+  const endEliminatedSeats = async (): Promise<boolean> => {
+    const dead = await server.eliminatedSeats(seats.map((s) => s.config.playerId)).catch(() => []);
+    let changed = false;
+    for (const { id, active } of dead) {
+      const name = seats.find((s) => s.config.playerId === id)?.config.name ?? `p${id}`;
+      if (!eliminated.has(id)) {
+        onProgress(`  ${name} has been eliminated — it plays no more turns`);
+        eliminated.add(id);
+        changed = true;
+      }
+      // Whenever the game does hand the dead seat a turn (the defeat turn, at least), end it.
+      if (active) {
+        onProgress(`  ${name}'s seat is active — ending its turn so the game moves on`);
+        await server.endTurn(id, true).catch(() => undefined);
+      }
+    }
+    return changed;
+  };
   let gameGone = false;
 
   /**
@@ -280,8 +342,14 @@ export async function runMatch(
     // Per-turn chat quotas reset here. Nothing called this before, so "five messages per turn"
     // was five per MATCH: after the fifth send a seat was refused for the rest of the game.
     server.startChatTurn();
-    const playedThisRound = new Set<number>();
-    const seatIds = seats.map((s) => s.config.playerId);
+    // Each seat that has played this round, with the GAME turn it played. Keyed by turn because
+    // a harness attached mid-round sees the seats before it on one turn and the seats after it
+    // on the next: keyed by seat alone, that read as a full round after the first seat, and the
+    // loop saved and then waited 60s for a turn advance that two seats still had to play.
+    const playedThisRound = new Map<number, number>();
+    // Seats the game has eliminated play no more turns; the game still hands them one, which
+    // the loop ends for them below.
+    const seatIds = seats.map((s) => s.config.playerId).filter((id) => !eliminated.has(id));
 
     // Hotseat decides the order, so ask the game whose turn it is rather than assuming ours.
     // Iterating seats in a fixed order deadlocks: the loop waits for seat 0 while the game waits
@@ -300,6 +368,9 @@ export async function runMatch(
       const candidates = seatIds.filter((id) => !playedThisRound.has(id));
       if (candidates.length === 0) break;
 
+      // Before waiting up to two minutes for a living seat: a seat the game has eliminated and
+      // is waiting on will never show up in that wait. End its turn now and re-plan the round.
+      if (await endEliminatedSeats()) break;
       const activeId = await server.activeSeat(candidates);
       if (activeId === null) {
         // No seat is active. This is NORMAL during an Age TRANSITION: the game waits for every seat
@@ -311,6 +382,9 @@ export async function runMatch(
           onProgress(`  age transition — finished ${finishedSeats} seat(s), continuing into the next age`);
           continue;
         }
+        // An eliminated seat the game is waiting on: end it for them and start the next round
+        // without it.
+        if (await endEliminatedSeats()) break;
         // The server knows which of the three this was — a failed read, a seat that has already
         // played, or a genuinely idle game. They used to print identically, and an hour of a live
         // run was spent reading "the game may be waiting on something" at a healthy game whose
@@ -322,9 +396,10 @@ export async function runMatch(
       unreadable = 0;
       const seat = seats.find((s) => s.config.playerId === activeId)!;
       const outcome = outcomes.get(activeId)!;
-      playedThisRound.add(activeId);
-
       const gameTurn = await server.currentTurn().catch(() => 0);
+      // A seat recorded on an earlier game turn has not played this one.
+      for (const [id, turn] of playedThisRound) if (turn < gameTurn) playedThisRound.delete(id);
+      playedThisRound.set(activeId, gameTurn);
 
 
       // Never let a seat play the same game turn twice.
@@ -382,6 +457,8 @@ export async function runMatch(
     // not on a fresh query that can fail while the engine is busy.
     const playedTurn = server.lastSnapshotTurn();
 
+    // The game may still be waiting on an eliminated seat before it will advance the turn.
+    await endEliminatedSeats();
     await autosaveRound(server, runDir, playedTurn, onProgress);
 
     // Unguarded, this ended a match three turns in.

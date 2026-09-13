@@ -69,14 +69,17 @@ export type CompleteTurn = { turn: number; seats: TurnBrief[] };
 /** How much of the seat's reasoning to carry. The opening states the plan; the rest is grep output. */
 const REASONING_CHARS = 1200;
 
-function readEvents(runDir: string): Event[] {
+/** An event as the log wrote it: the server's record plus its sequence number and timestamp. */
+type LoggedEvent = Event & { seq?: number; at?: string };
+
+function readEvents(runDir: string): LoggedEvent[] {
   const path = join(runDir, "events.jsonl");
   if (!existsSync(path)) return [];
   // SAFETY: this file is written by the match server in this same run, one Event per line.
   return readFileSync(path, "utf8")
     .split("\n")
     .filter((line) => line.trim().length > 0)
-    .map((line) => JSON.parse(line) as Event);
+    .map((line) => JSON.parse(line) as LoggedEvent);
 }
 
 /**
@@ -398,6 +401,131 @@ function readReasoning(runDir: string, seat: string, turn: number): string {
   // where the seat states its plan, before the dump reading buries it.
   const block = readFileSync(path, "utf8").split("--- thinking ---")[1] ?? "";
   return scrubPlumbing(block.split("--- ran ---")[0]!.trim()).slice(0, REASONING_CHARS);
+}
+
+/** The seat whose turn is open right now: the last turn_begin with no end-turn that took. */
+export function inProgressTurn(runDir: string): { seat: string; turn: number; beganAt: string } | null {
+  let current: { seat: string; turn: number; beganAt: string } | null = null;
+  for (const event of readEvents(runDir)) {
+    const seat = event.playerName;
+    if (!seat) continue;
+    if (event.kind === "turn_begin") current = { seat, turn: event.turn, beganAt: event.at ?? "" };
+    else if ((event.kind === "turn_end" || event.kind === "turn_end_forced") && event.ok !== false &&
+      current && current.seat === seat && current.turn === event.turn) current = null;
+  }
+  return current;
+}
+
+/** What a viewer would call a failure, in game terms. The code never reaches the caster. */
+const MISTAKES: Array<[RegExp, string]> = [
+  [/NO_PATH/, "ordered a unit somewhere it cannot go"],
+  [/TILE_OCCUPIED/, "marched a unit onto a tile another civilization's unit already holds"],
+  [/DID_NOT_MOVE|DEAD_ORDER/, "gave a move order that went nowhere"],
+  [/OUT_OF_RANGE/, "tried an attack from out of range"],
+  [/NOT_PROMOTED|NOT_AVAILABLE/, "tried to give a commander a promotion it cannot take"],
+  [/NOT_QUEUED|NO_PLOT/, "ordered a building with nowhere to put it"],
+  [/NOT_BOUGHT/, "tried to buy something the treasury could not cover"],
+  [/CANNOT_END_TURN|END_TURN_REFUSED/, "tried to end the turn with a decision still waiting"],
+  [/ILLEGAL_ACTION/, "tried something the game refused"],
+];
+
+/**
+ * How many times a glossed failure must repeat before it counts as a mistake. A refused
+ * end-turn is the game asking for one more decision — routine, answered on the next command —
+ * and a lone bare refusal is noise; the live caster called both blunders.
+ */
+const MISTAKE_THRESHOLD = new Map<string, number>(Object.entries({
+  "tried to end the turn with a decision still waiting": 3,
+  "tried something the game refused": 2,
+}));
+
+function glossMistake(code: string): string {
+  for (const [re, text] of MISTAKES) if (re.test(code)) return text;
+  return "tried something the game refused";
+}
+
+/** A seat's turn as it stands right now, for live play-by-play between finished turns. */
+export type LiveSnapshot = {
+  seat: string;
+  turn: number;
+  /** Seconds since the seat's turn began. */
+  elapsedSec: number;
+  /** What it did since the last look, in the brief's did-line form (successes only). */
+  did: string[];
+  /** Its failures since the last look, glossed for a viewer, repeats counted. */
+  mistakes: string[];
+  /** Its most recent reasoning, scrubbed, from the streaming transcript. */
+  thinking: string;
+  stats: SeatStats | null;
+  notes: string;
+  /** The last event sequence number folded in; pass it back next time. */
+  lastSeq: number;
+};
+
+/** How much of the latest reasoning the live caster sees. */
+const LIVE_THINKING_CHARS = 700;
+
+/** The failure a logged event represents, glossed for a viewer, or null when it is not one. */
+function mistakeOf(event: LoggedEvent): string | null {
+  if (event.kind === "action" && event.result?.ok === false) return glossMistake(event.result.code ?? "");
+  if (event.kind === "action_correction") return glossMistake(String(event.code ?? ""));
+  if ((event.kind === "turn_end" || event.kind === "turn_end_forced") && event.ok === false) return glossMistake("CANNOT_END_TURN");
+  return null;
+}
+
+/** The seat's did-lines and glossed mistakes since `sinceSeq`, with the turn's start and the last seq seen. */
+function liveEventsSince(runDir: string, seat: string, turn: number, sinceSeq: number) {
+  const did: string[] = [];
+  const failures = new Map<string, number>();
+  let skipped = 0;
+  let lastSeq = sinceSeq;
+  let beganAt: string | null = null;
+  for (const event of readEvents(runDir)) {
+    if (event.playerName !== seat || event.turn !== turn) continue;
+    if (event.kind === "turn_begin") beganAt = event.at ?? "";
+    const seq = event.seq ?? 0;
+    if (seq <= sinceSeq) continue;
+    lastSeq = Math.max(lastSeq, seq);
+    const mistake = mistakeOf(event);
+    if (mistake) {
+      failures.set(mistake, (failures.get(mistake) ?? 0) + 1);
+      continue;
+    }
+    // Skips are end-of-turn housekeeping for idle units — one line for all of them, or the
+    // caster reads twenty of them as twenty decisions and scores each one.
+    if (event.kind === "action" && event.result?.ok && /SKIP_TURN/.test(String(event.request?.actionType))) {
+      skipped++;
+      continue;
+    }
+    const line = event.kind === "action" || event.kind === "message" ? describe(event) : null;
+    if (line) did.push(line);
+  }
+  if (skipped > 0) did.push(`ok put ${skipped} idle unit${skipped === 1 ? "" : "s"} on hold for the turn (routine housekeeping, not a decision)`);
+  const mistakes = [...failures]
+    .filter(([gloss, n]) => n >= (MISTAKE_THRESHOLD.get(gloss) ?? 1))
+    .map(([gloss, n]) => (n > 1 ? `${gloss} (${n} times)` : gloss));
+  return { did, mistakes, lastSeq, beganAt };
+}
+
+/** The tail of the seat's latest reasoning block, scrubbed, from its streaming transcript. */
+function latestThinking(runDir: string, seat: string, turn: number): string {
+  const dir = `t${String(turn).padStart(4, "0")}`;
+  const path = join(runDir, "agents", seat, "turns", dir, "transcript.md");
+  if (!existsSync(path)) return "";
+  const last = readFileSync(path, "utf8").split("--- thinking ---").at(-1) ?? "";
+  return scrubPlumbing(last.split("--- ran ---")[0]!.trim()).slice(-LIVE_THINKING_CHARS);
+}
+
+export function liveSnapshot(runDir: string, seat: string, turn: number, sinceSeq = 0): LiveSnapshot {
+  const { did, mistakes, lastSeq, beganAt } = liveEventsSince(runDir, seat, turn, sinceSeq);
+  const elapsedSec = beganAt ? Math.max(0, Math.round((Date.now() - Date.parse(beganAt)) / 1000)) : 0;
+  return {
+    seat, turn, elapsedSec, did, mistakes,
+    thinking: latestThinking(runDir, seat, turn),
+    stats: readStats(runDir, seat, turn),
+    notes: readNotesTail(runDir, seat),
+    lastSeq,
+  };
 }
 
 /**

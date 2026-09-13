@@ -84,6 +84,8 @@ export type HeaderSnapshot = {
   leader: string | null;
   isHuman: boolean | null;
   gold: number | null;
+  /** The influence stockpile, which diplomatic actions spend. */
+  influence?: number | null;
   yields: Record<string, number | null>;
   happiness: { net: number | null; hasUnrest: boolean | null; turnsOfUnrest: number | null };
   settlements: {
@@ -94,9 +96,15 @@ export type HeaderSnapshot = {
     population: number | null;
   };
   unitCount: number;
-  legacy: Array<{ type: string; score: number | null; target?: number | null }>;
-  researching?: { node: string; progress: number | null } | null;
-  adopting?: { node: string; progress: number | null } | null;
+  legacy: Array<{ type: string; score: number | null; target?: number | null; does?: string | null }>;
+  /**
+   * The game's own victory progress for this player's team: VICTORY_DOMINATION 8/13 and so on.
+   * Legacy paths can be disabled for a match (they were, all night, and every legacy score read
+   * 0 while Ada held 8 of the 13 settlements domination needs).
+   */
+  victories?: Array<{ type: string; current: number; total: number }>;
+  researching?: { node: string; progress: number | null; turnsLeft?: number | null } | null;
+  adopting?: { node: string; progress: number | null; turnsLeft?: number | null } | null;
   government: string | number | null;
 };
 
@@ -120,6 +128,8 @@ export type OwnUnit = {
   orders?: string | null;
   /** On a multi-turn operation. It will refuse new orders until it finishes. */
   busy?: boolean;
+  /** Holds the turn open: the engine wants an order from it before the turn can end. */
+  needsOrders?: boolean;
   armyId: string | null;
 };
 
@@ -137,7 +147,7 @@ export type OwnSettlement = {
   growthType: number | string | null;
   currentFood: number | null;
   projectType: number | string | null;
-  productionTurnsLeft: number | null;
+  productionTurns: number | null;
   productionHash: number | string | null;
   /** What the city is building, by name. The hash above is never shown to an agent. */
   building: string | null;
@@ -149,6 +159,8 @@ export type OwnSettlement = {
   queueEmpty: boolean | null;
   happiness: number | null;
   hasUnrest: boolean | null;
+  /** Turns of unrest queued: the revolt countdown the city banner shows. */
+  unrestTurns?: number | null;
   beingRazed: boolean;
   distantLands: boolean;
 };

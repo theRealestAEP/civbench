@@ -6,6 +6,8 @@
 //
 // Macros matter here. `civ move u12 14,22` is one agent decision; ten adjacent-tile moves would
 // be ten decisions and ten times the tokens (§6.2).
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { MatchServer, ActionRequest, ActionResult } from "../server/match.ts";
 import { tilesNear } from "./near.ts";
 
@@ -50,17 +52,27 @@ const USAGE = `civ — act on the game. Reading is done with the shell; this is 
   civ inbox                                what other civs have said to you
   civ build <city> [THING] [x,y]           what that settlement can build, or build one
                                            (a building takes a plot; omit it and the game picks)
-  civ expand <city> [x,y]                  where a grown city can put its new citizen
+  civ buy <city> [THING] [x,y]             what that settlement can buy with gold, or buy one
+                                           (a town buys; it builds nothing but its focus)
+  civ expand [city] [x,y]                  which settlements must place a citizen; where one can go
+  civ capture <city> [keep|raze|liberate]  decide the fate of a settlement you just conquered
+  civ religion [TYPE]                      the religions you could found, or found one
+  civ belief [BELIEF]                      the beliefs your religion can claim, or claim one
   civ tech [NODE]                          your research: what you can pick, or pick one
   civ civic [NODE]                         your civics: what you can adopt, or adopt one
   civ government [TYPE]                    your government: what you can adopt, or adopt one
   civ story [ANSWER]                       the narrative event waiting on you, or answer it
   civ tradition [TYPE]                     the social policies you can adopt, or adopt one
+  civ age                                  the Age transition step waiting on you: finish, or the dedications on offer
   civ age finish                           tell the game you are done with the Age transition
+  civ age <CARD> | -<CARD> | done          pick (or drop) a dedication for the new Age; done closes the choice
   civ celebration [TYPE]                   pick what a Celebration gives you
   civ pantheon [BELIEF]                    found a pantheon
   civ attribute [NODE]                     spend an attribute point
+  civ attribute done                       say you are finished with attribute points (clears the prompt)
   civ diplomacy [player] [ACTION]          who you have met, what you can do to them, or do it
+  civ diplomacy <player> greet friendly|neutral|unfriendly   answer a civ that has just met you
+  civ diplomacy respond <ID> accept|reject|support           answer a proposal another civ sent you
   civ deal items <player>                  what each side could put on the table
   civ deal offer <player> <KIND> [AMOUNT]  put one thing on the table
   civ deal send <player>                   propose the deal you have built
@@ -70,6 +82,7 @@ const USAGE = `civ — act on the game. Reading is done with the shell; this is 
   civ deal accept <player>                 accept the deal they sent you
   civ deal reject <player>                 turn it down
   civ resource [<resource> <city>]         assign a new resource to a settlement, or list both
+  civ resource done                        say you are finished placing resources
   civ screen [screen-id] [control-id]      read open popup text and controls, or activate one
   civ dismiss [id]                         clear a notification; with no id, the one blocking you
   civ open <id>                            open a notification that wants a decision
@@ -156,15 +169,40 @@ function renderResult(result: ActionResult): CommandOutput {
   return fail(lines.join("\n") + "\n");
 }
 
-// eslint-disable-next-line complexity -- a CLI dispatcher: one switch case per command, each flat. Splitting it per-case would satisfy the metric without helping the reader.
+/**
+ * Run one `civ` command and stamp the turn clock on its output.
+ *
+ * Not one agent in 394 turns ever ran `civ time`; eighteen turns ran the 480s budget out, one
+ * with 75 KB of reading and no actions, and seventeen commands landed after the turn was over.
+ * A clock the agent has to ask for is no clock. It rides on every reply instead, and shouts
+ * when the end is near.
+ */
 export async function runCivCommand(
   server: MatchServer,
   playerId: number,
   argv: string[],
   lastHud: () => string,
 ): Promise<CommandOutput> {
-  const [command, ...rest] = argv;
+  const out = await dispatchCivCommand(server, playerId, argv, lastHud);
+  // `help` never touches the server (tests pass none), and `time` already is the clock.
+  if (argv[0] === "time" || argv[0] === "help" || !server) return out;
+  const clock = server.turnClock(playerId);
+  if (!clock) return out;
+  const left = Math.round(clock.remainingSec);
+  const trailer = left <= 90
+    ? `[clock: ${left}s LEFT of ${clock.budgetSec}s — run \`civ end-turn\` now; unfinished work is lost when it hits zero]`
+    : `[clock: ${Math.round(clock.elapsedSec)}s used, ${left}s left]`;
+  return { ...out, stdout: `${out.stdout.replace(/\n?$/, "\n")}${trailer}\n` };
+}
 
+// eslint-disable-next-line complexity -- a CLI dispatcher: one switch case per command, each flat. Splitting it per-case would satisfy the metric with no gain in clarity.
+async function dispatchCivCommand(
+  server: MatchServer,
+  playerId: number,
+  argv: string[],
+  lastHud: () => string,
+): Promise<CommandOutput> {
+  const [command, ...rest] = argv;
   switch (command) {
     case undefined:
     case "help":
@@ -273,24 +311,39 @@ export async function runCivCommand(
     }
 
     case "diplomacy": {
+      // `civ diplomacy respond <ID> accept|reject|support` answers a proposal rather than naming a player.
+      if (rest[0] === "respond") {
+        if (!rest[1] || !rest[2]) return fail("usage: civ diplomacy respond <ID> accept|reject|support\n");
+        return renderResult(await server.diplomacy(playerId, undefined, `respond ${rest[1]} ${rest[2]}`));
+      }
       const other = rest[0] === undefined ? undefined : Number(String(rest[0]).replace(/^p/i, ""));
-      if (rest[0] !== undefined && Number.isNaN(other)) return fail("usage: civ diplomacy [player] [ACTION]\n");
-      const r = await server.diplomacy(playerId, other, rest[1]);
+      if (rest[0] !== undefined && Number.isNaN(other)) return fail("usage: civ diplomacy [player] [ACTION]   |   civ diplomacy <player> greet friendly|neutral|unfriendly   |   civ diplomacy respond <ID> accept|reject\n");
+      // `greet friendly` is two words; the rest of the actions are one.
+      const action = rest[1] === "greet" && rest[2] ? `greet ${rest[2]}` : rest[1];
+      const r = await server.diplomacy(playerId, other, action);
       if (!r.listing) return renderResult(r);
+      const proposalLines = (r.proposals ?? []).map((p) =>
+        `  proposal ${p.id}${p.from ? ` from ${p.from}` : ""}${p.action ? `: ${p.action}` : ""}   -> civ diplomacy respond ${p.id} accept | reject`);
+      const waiting = proposalLines.length > 0 ? `proposals waiting on your answer:\n${proposalLines.join("\n")}\n` : "";
       if (r.players) {
-        if (r.players.length === 0) return ok("you have met nobody yet\n");
+        if (r.players.length === 0) return ok(waiting + "you have met nobody yet\n");
         return ok(
-          "civilizations you have met:\n" +
+          waiting + "civilizations you have met:\n" +
             r.players
-              .map((p) => `  ${p.player}  ${p.civ ?? "?"}${p.atWar ? "  (at war with you)" : ""}   -> civ diplomacy ${p.player}`)
+              .map((p) => `  ${p.player}  ${p.civ ?? "?"}${p.atWar ? "  (at war with you)" : ""}` +
+                (p.greetingOwed ? `  (just met — owes a greeting: civ diplomacy ${p.player} greet friendly|neutral|unfriendly)` : "") +
+                `   -> civ diplomacy ${p.player}`)
               .join("\n") +
             "\n",
         );
       }
-      if ((r.offers ?? []).length === 0) return ok(`nothing you can do to ${r.target} right now\n`);
+      const greeting = r.greetingOwed
+        ? `  civ diplomacy ${r.target} greet friendly|neutral|unfriendly   (they have just met you and wait on this)\n`
+        : "";
+      if ((r.offers ?? []).length === 0 && !greeting) return ok(`nothing you can do to ${r.target} right now\n`);
       // Every line is the command that does it, listed only if the engine accepts it.
       return ok(
-        `what you can do to ${r.target}:\n` +
+        `what you can do to ${r.target}:\n` + greeting +
           (r.offers ?? []).map((o) => `  civ diplomacy ${r.target} ${o.action}`).join("\n") +
           "\n",
       );
@@ -313,9 +366,41 @@ export async function runCivCommand(
       const unit = parseUnit(server, playerId, rest[0]);
       const plot = parsePlot(rest[1]);
       if (!unit || !plot) return fail(`usage: civ ${command} <unit> <x,y>\n`);
+      // A ranged unit attacks with RANGE_ATTACK on a plot the engine will take, the way the
+      // game's own ranged-attack mode does. Sending a slinger's attack as a melee move, or a
+      // RANGE_ATTACK at a plot out of reach, was refused with no reason half the time.
+      if (command === "attack") {
+        const strike = await server.strikeOptions(playerId, unit);
+        const asked = `${plot.X},${plot.Y}`;
+        // A unit that can melee too — a galley — attacks the plot by moving onto it when it is
+        // not a ranged target; refusing that as OUT_OF_RANGE cost eight turns of naval war.
+        if (strike?.ranged && !(strike.melee && !strike.plots.some((p) => p.at === asked))) {
+          if (!strike.plots.some((p) => p.at === asked)) {
+            const targets = strike.plots.map((p) => `${p.at}${p.what ? ` (${p.what})` : ""}`).join(", ");
+            return fail(
+              `failed: OUT_OF_RANGE\n` +
+                `unit ${unit} attacks at range, and ${asked} is not a plot it can strike right now.\n` +
+                (targets
+                  ? `hint: it can strike: ${targets}\n`
+                  : `hint: nothing is in its range; move closer first, or \`civ what-can ${unit}\`\n`),
+            );
+          }
+          const shot = await server.act(playerId, {
+            kind: "unit_operation",
+            targetId: unit,
+            actionType: "UNITOPERATION_RANGE_ATTACK",
+            args: { X: plot.X, Y: plot.Y },
+          });
+          return renderResult(
+            shot.ok ? { ...shot, note: shot.note ?? `ranged attack on ${asked} sent; /current/units.txt shows the result` } : shot,
+          );
+        }
+      }
       const args: EngineArgs = { ...plot };
       // An attack in Civ 7 is a MOVE_TO carrying the attack modifier, not a separate operation.
-      if (command === "attack") args.Modifiers = "ATTACK";
+      // A plain move carries the modifier the game's own move mode sends for a human, so a
+      // destination still under fog is accepted: exploring is walking into the unexplored.
+      args.Modifiers = command === "attack" ? "ATTACK" : "MOVE_IGNORE_UNEXPLORED_DESTINATION";
       // Where it was, so we can tell whether it actually went anywhere.
       //
       // The engine ACCEPTS a move order it cannot carry out — an unreachable plot, a blocked
@@ -375,7 +460,11 @@ export async function runCivCommand(
               : left != null
                 ? ` — ${left} movement left`
                 : "";
-          moved.note = `${base}${spent}`;
+          // SAFETY: act.js adds `eta` to a successful move when the engine gave a path length; the
+          // field is optional and read only here.
+          const eta = (moved as ActionResult & { eta?: number }).eta;
+          const arrival = eta && eta > 1 ? ` — ${eta} turns to ${asked}` : "";
+          moved.note = `${base}${spent}${arrival}`;
         }
       }
       return renderResult(moved);
@@ -391,18 +480,56 @@ export async function runCivCommand(
       // Answers NOTIFICATION_ASSIGN_NEW_RESOURCES. No args = list the resources and the settlements
       // that can take them; `civ resource <resource> <city>` assigns one.
       const which = rest[0];
+      if (which === "done") return renderResult(await server.resourcesDone(playerId));
       if (!which) {
         const { resources, cities } = await server.resources(playerId);
-        if (resources.length === 0) return ok("you have no resources to assign right now\n");
-        const lines = ["resources you can assign:"];
-        for (const r of resources) lines.push(`  ${r.name}`);
-        lines.push("settlements that can take one:");
-        for (const c of cities) lines.push(`  ${c.name}  city:${c.id}`);
-        lines.push("assign with: civ resource <resource> <city>");
+        if (resources.length === 0) {
+          return ok("every resource you have is already placed — if the game still asks, `civ resource done` tells it you are finished\n");
+        }
+        // Per resource, where the ENGINE will take it. A free-slot count is not the rule: a city
+        // resource never goes to a town, and a settlement never holds the same resource twice.
+        const byId = new Map(cities.map((c) => [c.id, c]));
+        const lines = ["resources waiting to be placed, and where each can go:"];
+        let placeable = 0;
+        for (const r of resources) {
+          const where = (r.canGo ?? []).map((id) => byId.get(id)).filter((c) => c !== undefined);
+          const kind = r.class ? ` (${r.class} resource)` : "";
+          if (where.length === 0) {
+            lines.push(`  ${r.name}${kind}  -> nowhere right now`);
+            continue;
+          }
+          placeable++;
+          lines.push(`  ${r.name}${kind}  -> ${where.map((c) => `${c.name} city:${c.id}`).join("  |  ")}`);
+        }
+        const towns = cities.filter((c) => c.isTown).map((c) => c.name);
+        if (towns.length > 0) lines.push(`towns (no city resources): ${towns.join(", ")}`);
+        lines.push(
+          placeable > 0
+            ? "place one with: civ resource <resource> <city id or name>"
+            : "nothing can be placed now — `civ resource done` tells the game you are finished",
+        );
+        // How slots arise. "-> nowhere right now" sent agents into the rules files for 35 turns
+        // asking "how do I get slots?"; the answer is a few buildings and policies.
+        lines.push(
+          "how slots work: each settlement holds a fixed number of resources (its resource capacity).",
+          "  more slots: build a Market (+1) or Lighthouse (+2, coast); the Colossus (+3) and Monks Mound (+4) wonders;",
+          "  the Merchant Class and Commodities policies. City resources go only to cities, never towns;",
+          "  empire and bonus resources go to any settlement with room; no settlement holds the same resource twice.",
+        );
         return ok(lines.join("\n") + "\n");
       }
-      const city = parseId(rest[1]);
-      if (!city) return fail("usage: civ resource <resource> <city>   (run `civ resource` to list both)\n");
+      // A settlement by id, or by name as the listing prints it — with or without quotes, and
+      // "Washington,_D.C." for "Washington, D.C.". Five name forms in one turn all got the usage
+      // line while only the id was accepted, and nothing said so.
+      const asked = rest.slice(1).join(" ").trim();
+      let city = parseId(rest[1]);
+      if (!city && asked) {
+        const key = (t: string) => t.toLowerCase().replace(/[^a-z0-9]/g, "");
+        const { cities } = await server.resources(playerId);
+        city = cities.find((c) => key(c.name) === key(asked))?.id ?? null;
+        if (!city) return fail(`no settlement of yours is called "${asked}" — run \`civ resource\` to see them by name and id\n`);
+      }
+      if (!city) return fail("usage: civ resource <resource> <city id or name>   (run `civ resource` to list both)\n");
       return renderResult(await server.assignResource(playerId, which, city));
     }
 
@@ -469,7 +596,9 @@ export async function runCivCommand(
     // One case for every "pick a thing" decision. They differ only in the argument shape the
     // engine wants, and that lives in one table game-side rather than in a case each here.
     case "build":
+    case "buy":
     case "expand":
+    case "capture":
     case "tech":
     case "civic":
     case "story":
@@ -478,19 +607,75 @@ export async function runCivCommand(
     case "age":
     case "celebration":
     case "pantheon":
+    case "belief":
+    case "religion":
     case "attribute":
     case "government": {
       const what = command;
-      const isCity = what === "build" || what === "expand" || what === "promote";
+      const isCity = what === "build" || what === "buy" || what === "expand" || what === "capture" || what === "promote";
       const targetId = isCity ? parseUnit(server, playerId, rest[0]) ?? undefined : undefined;
+      if (isCity && !targetId && what === "expand") {
+        // Which settlement? "the game is waiting on NOTIFICATION_NEW_POPULATION" named nothing,
+        // and `civ expand` alone printed only usage — an agent expanded the wrong town and the
+        // block stayed for a whole 480s turn. List every settlement with a citizen to place.
+        const lines: string[] = [];
+        for (const city of ownSettlements(server, playerId)) {
+          const listing = await server.choose(playerId, "expand", undefined, city.id);
+          const plots = (listing.options ?? []).filter((o) => o.available !== false);
+          if (plots.length === 0) continue;
+          lines.push(`  ${city.name} (city:${city.id}) has a citizen to place: ` +
+            plots.slice(0, 4).map((o) => `civ expand ${city.id} ${o.name}`).join("  |  ") + (plots.length > 4 ? "  ..." : ""));
+        }
+        return ok(lines.length > 0
+          ? `settlements that must place a citizen:\n${lines.join("\n")}\n`
+          : "no settlement has a citizen to place right now\n");
+      }
       if (isCity && !targetId) {
         return fail(`usage: civ ${command} <${command === "promote" ? "unit" : "city"}> [value]\n`);
       }
       const value = rest[isCity ? 1 : 0];
       // `civ build <city> <THING> [x,y]` — a building needs a plot, and the engine picks a legal
       // one when the agent does not name it. `civ build <city>` lists the plots each item may go on.
-      const plot = what === "build" ? rest[2] : undefined;
+      const plot = what === "build" || what === "buy" ? rest[2] : undefined;
+      // A purchase is checked against the treasury afterwards: "ok" from the engine is not
+      // evidence that anything was bought, any more than it is for a build.
+      const goldBefore = what === "buy" && value ? await server.goldBalance(playerId) : null;
+      // A promotion is checked the same way: the point must be spent, or nothing happened.
+      const pointsBefore = what === "promote" && value && targetId ? await promotionPoints(server, playerId, targetId) : null;
       const r = await server.choose(playerId, what, value, targetId, plot);
+      if (r.ok && !r.listing && what === "promote" && value && targetId && pointsBefore !== null) {
+        let after: number | null = pointsBefore;
+        for (let attempt = 0; attempt < 8 && after === pointsBefore; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          after = await promotionPoints(server, playerId, targetId);
+        }
+        if (after !== null && after >= pointsBefore) {
+          server.logCorrection(playerId, "NOT_PROMOTED", `${value} — promotion points unchanged at ${pointsBefore}`);
+          return fail(
+            `failed: NOT_PROMOTED\n` +
+              `the engine accepted ${value} and the unit's promotion point is still unspent.\n` +
+              `hint: \`civ promote ${targetId}\` lists the promotions it can take right now\n`,
+          );
+        }
+      }
+      if (r.ok && !r.listing && what === "buy" && value) {
+        let after = goldBefore;
+        for (let attempt = 0; attempt < 8 && goldBefore !== null && after === goldBefore; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          after = await server.goldBalance(playerId);
+        }
+        if (goldBefore !== null && (after === null || after >= goldBefore)) {
+          server.logCorrection(playerId, "NOT_BOUGHT", `${value} — treasury unchanged at ${goldBefore}`);
+          return fail(
+            `failed: NOT_BOUGHT\n` +
+              `the engine accepted the purchase but the treasury did not change — nothing was bought.\n` +
+              `hint: run \`civ buy ${targetId}\` to see what this settlement can buy and what it costs\n`,
+          );
+        }
+        if (goldBefore !== null && after !== null) {
+          r.note = `bought ${value} for ${Math.round(goldBefore - after)} gold; ${Math.floor(after)} gold left`;
+        }
+      }
       if (!r.listing) {
         // A build joins a queue rather than replacing what is in progress, so say what the queue
         // holds now. Without this an agent sees "ok", looks, still sees the previous item at the
@@ -523,6 +708,10 @@ export async function runCivCommand(
             );
           }
           r.note = r.note ? `${r.note}; ${queue}` : queue;
+          // The same item ordered again this turn is usually the first order thought lost — 33
+          // times in one run. Say what the queue holds, so a second copy is a choice, not a mistake.
+          const copies = queue.split(value).length - 1;
+          if (copies >= 2) r.note += ` — that is ${copies} of ${value} in the queue now; the earlier order had already taken`;
         }
         return renderResult(r);
       }
@@ -530,15 +719,17 @@ export async function runCivCommand(
       // arguments is what cost 25 failed guesses in one turn.
       const prefix = `civ ${command}${isCity ? ` ${targetId}` : ""}`;
       const lines = [`${what} now: ${r.current ?? "nothing"}`];
+      if (r.note) lines.push(r.note);
       const open = (r.options ?? []).filter((o) => o.available !== false);
       const shut = (r.options ?? []).filter((o) => o.available === false);
       // What the option IS, beside the command that picks it. A bare id list forced agents to
       // cross-reference by hand — one expanded onto the wrong tile that way.
-      const describe = (o: { turns?: number | null; title?: string | null; does?: string | null }): string => {
+      const describe = (o: { turns?: number | null; cost?: number | null; title?: string | null; does?: string | null }): string => {
         const parts = [
+          o.cost !== null && o.cost !== undefined ? `${o.cost} gold` : null,
           o.turns ? `${o.turns} turns` : null,
           o.title ?? null,
-          o.does ? String(o.does).slice(0, 100) : null,
+          o.does ? String(o.does).slice(0, 160) : null,
         ].filter(Boolean);
         return parts.length > 0 ? `    # ${parts.join(" — ")}` : "";
       };
@@ -612,3 +803,28 @@ export async function runCivCommand(
       return fail(`unknown command: ${command}\n\n${USAGE}\n`);
   }
 }
+
+/** A unit's unspent promotion points, from the promote listing's status line, or null. */
+async function promotionPoints(server: MatchServer, playerId: number, unit: string): Promise<number | null> {
+  const listing = await server.choose(playerId, "promote", undefined, unit);
+  const match = /(\d+) promotion point/.exec(String(listing.current ?? ""));
+  return match ? Number(match[1]) : null;
+}
+
+/** The seat's own settlements as {id, name}, from the turn's settlements dump. */
+function ownSettlements(server: MatchServer, playerId: number): Array<{ id: string; name: string }> {
+  const dir = server.currentTurnDir(playerId);
+  if (!dir) return [];
+  try {
+    // SAFETY: this run's own settlements dump, one OwnSettlement per line, written by the snapshot writer.
+    return readFileSync(join(dir, "settlements.jsonl"), "utf8")
+      .split("\n")
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as { id: string; name?: string | null; owner?: number | string })
+      .filter((s) => s.owner === undefined || s.owner === playerId || s.owner === "self")
+      .map((s) => ({ id: String(s.id), name: s.name ?? String(s.id) }));
+  } catch {
+    return [];
+  }
+}
+

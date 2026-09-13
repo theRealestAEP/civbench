@@ -17,8 +17,27 @@ function findId(wanted) {
   for (const id of ids) {
     if (String(id?.id ?? id) === String(wanted)) return id;
   }
+  // By TYPE NAME too. Ids are renumbered as notifications come and go within a turn, and an
+  // agent that read "NOTIFICATION_ASSIGN_NEW_RESOURCES" off its pending list and passed that
+  // name got "you have no notification NOTIFICATION_ASSIGN_NEW_RESOURCES" — 19 times in one
+  // night. The name is stable; take it.
+  if (/^NOTIFICATION_/.test(String(wanted))) {
+    for (const id of ids) {
+      try {
+        const n = Game.Notifications.find(id);
+        if (n && Game.Notifications.getTypeName(n.Type) === String(wanted)) return id;
+      } catch { /* not this one */ }
+    }
+  }
   return null;
 }
+
+/**
+ * Notifications the game will not dismiss: decisions it needs answered. Dismissing one reported
+ * "ok", the game ignored it, and the agent learned that only from a later correction — twelve
+ * times in one night. Refuse up front and name the command that answers it (match.ts adds it).
+ */
+const DECISION = /CHOOSE_|TRADITIONS_AVAILABLE|NEW_POPULATION|ASSIGN_NEW_RESOURCES|AGE_TRANSITION|COMMAND_UNITS|UNIT_PROMOTION|CRISIS|NARRATIVE|TOWN_PROJECT|BELIEF|PANTHEON|GOLDEN_AGE|CELEBRATION/;
 
 // No id given: act on whatever is blocking the end of the turn, which is what a human's end-turn
 // button does when the game refuses it.
@@ -66,6 +85,16 @@ const name = (() => {
     return n ? Game.Notifications.getTypeName(n.Type) : null;
   } catch { return null; }
 })();
+
+if (MODE === "dismiss" && name && DECISION.test(name)) {
+  return {
+    ok: false,
+    code: "NOT_DISMISSIBLE",
+    message: `${name} is a decision the game will not dismiss — it has to be answered`,
+    targetId: String(target?.id ?? target),
+    targetName: name,
+  };
+}
 
 try {
   if (MODE === "activate") Game.Notifications.activate(target);

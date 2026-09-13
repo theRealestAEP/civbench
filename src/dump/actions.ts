@@ -56,7 +56,12 @@ const COMMANDS: Array<[RegExp, (id: string) => string]> = [
   [/^CHOOSE_GOLDEN_AGE$/, () => "civ celebration <TYPE>"],
   [/^FOUND_PANTHEON$/, () => "civ pantheon <BELIEF>"],
   [/^BUY_ATTRIBUTE_TREE_NODE$/, () => "civ attribute <NODE>"],
+  [/^CONSIDER_ASSIGN_ATTRIBUTE$/, () => "civ attribute done"],
+  [/^CITYCOMMAND_DESTROY$/, (id) => `civ capture ${id} keep|raze|liberate`],
+  [/^CITYOPERATION_CONSIDER_TOWN_PROJECT$/, (id) => `civ build ${id} PROJECT_TOWN_<FOCUS>`],
   [/^SET_AGE_TRANSITION_DATA$/, () => "civ age finish"],
+  [/^ADVANCED_START_MODIFY_DECK$/, () => "civ age <CARD>"],
+  [/^ADVANCED_START_MARK_COMPLETED$/, () => "civ age done"],
   [/^DECLARE_WAR$|^MAKE_PEACE$|^FORM_ALLIANCE$|DIPLOMATIC_ACTION$/, () => "civ diplomacy <player> <ACTION>"],
 ];
 

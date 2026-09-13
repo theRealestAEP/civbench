@@ -75,12 +75,42 @@ const describe = (unit, own) => {
       }
     }
   } catch { activity = null; }
-  const busy = activity === "operation" || unit.hasPendingOperations === true;
+  // A standing order can PAUSE. Auto-explore stops beside a discovery and a queued path stops when
+  // it is blocked, and the engine then asks for a decision from that unit exactly as it would
+  // from an idle one. The dump called such a unit busy — "does not need orders from you" — so
+  // agents read past it, and end-turn was refused on it in 23 of one run's 46 turns. The engine's
+  // own end-of-turn rule decides: a unit that holds the turn open needs orders, busy or not.
+  // Plus the unit the engine will not skip but still waits on — awake, unmoved, built this turn
+  // (awaitingOrders) — only while the end of the turn is actually blocked on a unit.
+  const needsOrders = holdsTurnOpen(unit.id) || (turnWaitsOnUnits && awaitingOrders(unit.id));
+  const busy = (activity === "operation" || unit.hasPendingOperations === true) && !needsOrders;
 
   let canFound = false;
   try {
     canFound = Game.UnitOperations.canStart(unit.id, UnitOperationTypes.FOUND_CITY, {}, false)?.Success === true;
   } catch { canFound = false; }
+
+  // Commanders and the units packed into them, read the way the army-commander flag reads
+  // them (army-commander-flags.ts): the army's count against its capacity, and who is in it.
+  // armyId is a component id, which describeAll drops, so the line said nothing about armies.
+  const army = {};
+  try {
+    const self = String(unit.id?.id ?? unit.id);
+    if (unit.isCommanderUnit === true) {
+      army.commander = true;
+      const a = unit.armyId ? Armies.get(unit.armyId) : null;
+      if (a) {
+        army.army_units = Math.max(0, (a.unitCount ?? 1) - 1);
+        army.army_capacity = a.combatUnitCapacity ?? null;
+        const members = (a.getUnitIds?.() ?? []).map((c) => String(c?.id ?? c)).filter((i) => i !== self);
+        if (members.length > 0) army.army_members = members.join(";");
+      }
+    } else if (unit.armyId) {
+      const a = Armies.get(unit.armyId);
+      const commander = (a?.getUnitIds?.() ?? []).map((c) => Units.get(c)).find((u) => u?.isCommanderUnit === true);
+      if (commander) army.packed_in = String(commander.id?.id ?? commander.id);
+    }
+  } catch { /* no army API in this build */ }
   return {
     ...base,
     name: locText(unit.name ?? null),
@@ -90,12 +120,15 @@ const describe = (unit, own) => {
     // busy unit will refuse everything until it finishes, and does not need orders from you.
     orders: activity && activity !== "awake" && activity !== "none" ? activity : null,
     busy,
+    needsOrders,
     canFoundHere: canFound,
+    ...army,
   };
 };
 
 const own = [];
 const player = Players.get(PLAYER_ID);
+const turnWaitsOnUnits = waitingOnUnits(PLAYER_ID);
 for (const id of player?.Units?.getUnitIds?.() ?? []) {
   const unit = Units.get(id);
   if (unit) own.push(describe(unit, true));

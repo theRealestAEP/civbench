@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Bridge } from "./bridge.ts";
+import { type Bridge, BridgeTimeout } from "./bridge.ts";
 import type { Json } from "../dump/types.ts";
 import type {
   HeaderSnapshot,
@@ -31,7 +31,7 @@ function readGameJs(name: string): string {
 function loadScript(name: string): string {
   let source = scriptCache.get(name);
   if (source === undefined) {
-    const screens = name === "pending" || name === "screen" ? readGameJs("_screens") : "";
+    const screens = name === "pending" || name === "screen" || name === "choose" ? readGameJs("_screens") : "";
     source = `${readGameJs("_prelude")}\n${screens}\n${readGameJs(name)}`;
     scriptCache.set(name, source);
   }
@@ -42,6 +42,8 @@ export class GameAdapter {
   #bridge: Bridge;
   /** How to get a fresh bridge when this one dies. Absent for the fake, which cannot die. */
   #reconnect?: () => Promise<Bridge>;
+  /** The reconnect in progress, so six reads that stalled together open one socket, not six. */
+  #reopening: Promise<Bridge> | null = null;
 
   constructor(bridge: Bridge, reconnect?: () => Promise<Bridge>) {
     this.#bridge = bridge;
@@ -68,11 +70,24 @@ export class GameAdapter {
       .map(([k, v]) => `const ${k} = ${JSON.stringify(v)};`)
       .join("\n");
     const js = `${consts}\n${loadScript(script)}`;
+    const used = this.#bridge;
     try {
-      return await this.#bridge.eval<T>(js);
+      return await used.eval<T>(js);
     } catch (err) {
-      if (!this.#reconnect || this.#bridge.alive !== false) throw err;
-      this.#bridge = await this.#reconnect();
+      if (!this.#reconnect) throw err;
+      // Two ways a socket is lost. Closed, which the bridge reports. Or STALLED: the game's
+      // inspector lost sync on the connection (its log says "failed to read WebSocket frames")
+      // and never answers on it again, while the socket stays open and the game plays on. Every
+      // read then timed out at 30s, the seat wait ran out, and the match was declared crashed
+      // at a healthy game — turn 24 of a live run. A stall on a live game is a dead socket.
+      const dead = used.alive === false;
+      const stalled = err instanceof BridgeTimeout;
+      if (!dead && !stalled) throw err;
+      try {
+        this.#bridge = await this.#reopen(used);
+      } catch {
+        throw err; // the game itself is gone; the original failure is the true one
+      }
       // Replaying a MUTATION after a dead socket can execute it twice: sendRequest is
       // fire-and-forget, so the first eval may have sent the order and only the reply was lost.
       // Reads are safe to replay; a lost mutation must be re-checked, not re-sent.
@@ -84,6 +99,20 @@ export class GameAdapter {
       }
       return this.#bridge.eval<T>(js);
     }
+  }
+
+  /** Replace `failed` with a fresh bridge, once, however many callers ask at the same time. */
+  #reopen(failed: Bridge): Promise<Bridge> {
+    // Someone already replaced it; the new one is the answer.
+    if (this.#bridge !== failed) return Promise.resolve(this.#bridge);
+    if (!this.#reopening) {
+      this.#reopening = (async () => {
+        // Close the stalled socket ourselves: the game will not.
+        await failed.close().catch(() => undefined);
+        return await this.#reconnect!();
+      })().finally(() => { this.#reopening = null; });
+    }
+    return this.#reopening;
   }
 
   /** Every GameInfo table in this build. Adapts to DLC instead of hard-coding a list. */

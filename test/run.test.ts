@@ -1,7 +1,7 @@
 // A whole multi-turn match against the fake game (docs/PLAN.md §14).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GameAdapter } from "../src/adapter/game.ts";
@@ -44,6 +44,44 @@ test("a brain that hangs is timed out and its turn is forced", async () => {
   const outcomes = await runMatch(server, runDir, seats, { turnLimit: 2 });
   assert.ok(outcomes[0]!.timeouts >= 1, "the watchdog must fire");
   assert.ok(outcomes[0]!.forcedEndTurns >= 1, "and the turn must be ended for it");
+});
+
+test("a turn's reasoning reaches disk as it happens, even when the turn times out", async () => {
+  class Muser implements Brain {
+    readonly name = "muser";
+    playTurn({ log, thread }: TurnContext): Promise<TurnReport> {
+      log?.("--- thinking ---\nfirst thought");
+      thread?.({ event: "turn_start", turn: 1, model: "muser", memory: "fresh", carriedMessages: 0 });
+      return new Promise(() => {}); // still thinking when the clock runs out
+    }
+  }
+  const { runDir, server, seats } = makeMatch([new Muser()]);
+  seats[0]!.config.secondsPerTurn = 0.05;
+  await runMatch(server, runDir, seats, { turnLimit: 1 });
+  const turns = join(runDir, "agents", "alpha", "turns");
+  const transcript = readFileSync(join(turns, readdirSync(turns)[0]!, "transcript.md"), "utf8");
+  assert.match(transcript, /first thought/, "what it thought before the cutoff is on disk");
+  assert.match(transcript, /--- turn over ---\ntimed out/, "and the file says how the turn ended");
+  const thread = readFileSync(join(turns, readdirSync(turns)[0]!, "thread.jsonl"), "utf8").trim().split("\n");
+  assert.equal(JSON.parse(thread[0]!).event, "turn_start", "the thread is on disk");
+  assert.equal(JSON.parse(thread[1]!).reason, "timeout", "and so is how the turn ended");
+  assert.ok(existsSync(join(runDir, "briefing.md")), "the system prompt is saved with the run");
+});
+
+test("an error the model returned mid-turn is in the event log, not swallowed", async () => {
+  class Flaky implements Brain {
+    readonly name = "flaky";
+    async playTurn({ exec }: TurnContext): Promise<TurnReport> {
+      await exec("civ skip 10");
+      await exec("civ end-turn");
+      return { commands: 2, errors: ["This model's maximum context length is 1048576 tokens"] };
+    }
+  }
+  const { runDir, server, seats } = makeMatch([new Flaky()]);
+  await runMatch(server, runDir, seats, { turnLimit: 1 });
+  const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
+  assert.match(events, /"kind":"brain_error"/, "the error is an event");
+  assert.match(events, /maximum context length/, "with the model's own message");
 });
 
 test("a brain that throws does not crash the match, and the seat keeps playing", async () => {
@@ -265,3 +303,75 @@ test("the turn count runs on across an Age boundary, and the seat keeps playing"
   }
   assert.ok(!existsSync(join(runDir, "agents", "alpha", "turns", "t0001")), "and no turn is filed as a second turn 1");
 });
+
+// A harness attached to a game mid-round — the old one stopped at Bruno's turn 24, Ada had
+// already played — treated Bruno's and Cleo's turn 24 plus Ada's turn 25 as one full round,
+// saved, and waited 60s for a turn advance that Bruno and Cleo still had to play. Every round.
+test("a match attached mid-round does not wait for a turn advance after the first seat", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-attach-"));
+  const world = makeWorld({ seats: 2, players: [0, 1] });
+  const adapter = new GameAdapter(new FakeBridge(world));
+  // Seat 0 has already ended this turn; the game is waiting on seat 1.
+  await adapter.run("endturn", 0, { FORCED: true, CLEAR_ONLY: false });
+  const cfgs = [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 20, secondsPerTurn: 10 },
+    { slot: 1, playerId: 1, name: "beta", actionsPerTurn: 20, secondsPerTurn: 10 },
+  ];
+  const server = new MatchServer(adapter, runDir, cfgs);
+  const started = Date.now();
+  await runMatch(server, runDir, cfgs.map((config) => ({ config, brain: new ScriptedBrain() })), { turnLimit: 2 });
+  const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
+  assert.doesNotMatch(events, /turn_advance_timeout/, "the round must not be declared over after one seat");
+  assert.ok(Date.now() - started < 30_000, "and nothing waited out a barrier");
+});
+
+// Cleo lost her last settlement at turn 58. Hotseat still handed her seat the turn — defeat
+// screen up, turn active — and the living-only seat read saw nothing, so the loop saved and
+// waited for forty minutes. An eliminated seat's turn is ended for it and it plays no more.
+test("an eliminated seat's turn is ended for it and the round moves on", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-dead-"));
+  // Three seats, one dead: with two the match would be over, which is a different rule.
+  const world = makeWorld({ seats: 3, players: [0, 1, 2] });
+  world.dead.add(2);
+  world.deadTurnPending.add(2); // the defeat turn: the game still hands the dead seat a turn
+  const cfgs = [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 20, secondsPerTurn: 10 },
+    { slot: 1, playerId: 1, name: "beta", actionsPerTurn: 20, secondsPerTurn: 10 },
+    { slot: 2, playerId: 2, name: "gamma", actionsPerTurn: 20, secondsPerTurn: 10 },
+  ];
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, cfgs);
+  const lines: string[] = [];
+  const started = Date.now();
+  const outcomes = await runMatch(server, runDir, cfgs.map((config) => ({ config, brain: new ScriptedBrain() })), { turnLimit: 2 }, (l) => lines.push(l));
+  const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
+  assert.ok(lines.some((l) => /gamma has been eliminated/.test(l)), lines.join("\n"));
+  assert.match(events, /"playerName":"gamma","kind":"turn_end_forced"/, "the dead seat's turn is ended for it");
+  assert.doesNotMatch(events, /turn_advance_timeout/, "and nothing waits out a barrier");
+  assert.equal(outcomes[2]!.turnsPlayed, 0, "an eliminated seat plays no turns");
+  assert.ok(outcomes[0]!.turnsPlayed >= 2, "the living seat keeps playing");
+  assert.ok(Date.now() - started < 30_000);
+});
+
+// After the defeat turn the game stops offering the dead seat a turn at all. Marking only an
+// ACTIVE dead seat left Cleo a candidate every round, and each round waited the full two-minute
+// seat timeout for her: 121s of dead air per round, for hours.
+test("a dead seat the game no longer offers a turn is dropped without waiting for it", async () => {
+  const runDir = mkdtempSync(join(tmpdir(), "civbench-dead2-"));
+  const world = makeWorld({ seats: 3, players: [0, 1, 2] });
+  world.dead.add(2); // never active again
+  const cfgs = [
+    { slot: 0, playerId: 0, name: "alpha", actionsPerTurn: 20, secondsPerTurn: 10 },
+    { slot: 1, playerId: 1, name: "beta", actionsPerTurn: 20, secondsPerTurn: 10 },
+    { slot: 2, playerId: 2, name: "gamma", actionsPerTurn: 20, secondsPerTurn: 10 },
+  ];
+  const server = new MatchServer(new GameAdapter(new FakeBridge(world)), runDir, cfgs);
+  const lines: string[] = [];
+  const started = Date.now();
+  const outcomes = await runMatch(server, runDir, cfgs.map((config) => ({ config, brain: new ScriptedBrain() })), { turnLimit: 2 }, (l) => lines.push(l));
+  assert.ok(lines.some((l) => /gamma has been eliminated/.test(l)), lines.join("\n"));
+  assert.ok(!lines.some((l) => /waiting for p2/.test(l)), "the dead seat is never waited for");
+  assert.equal(outcomes[2]!.turnsPlayed, 0);
+  assert.ok(outcomes[0]!.turnsPlayed >= 2);
+  assert.ok(Date.now() - started < 30_000, "no seat timeout was paid");
+});
+

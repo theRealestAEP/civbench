@@ -103,15 +103,18 @@ export function renderHud(
       ? shown
           .map((l) => {
             const name = l.type.replace(/^LEGACY_PATH_/, "").toLowerCase();
-            return `${name} ${num(l.score, 0)}${l.target ? `/${num(l.target, 0)}` : ""}`;
+            return `${name} ${num(l.score, 0)}${l.target ? `/${num(l.target, 0)}` : ""}${l.does ? ` (${l.does})` : ""}`;
           })
           .join("  ")
       : "none";
   // A human has both of these permanently on screen. Without them an agent spent a command every
   // turn asking what it was already researching.
+  // With turns left, as the dock shows them permanently.
+  const eta = (node: { turnsLeft?: number | null } | null) =>
+    node && node.turnsLeft !== null && node.turnsLeft !== undefined ? ` (${node.turnsLeft} turns)` : "";
   const studying = [
-    header.researching ? `researching ${header.researching.node}` : null,
-    header.adopting ? `civic ${header.adopting.node}` : null,
+    header.researching ? `researching ${header.researching.node}${eta(header.researching)}` : null,
+    header.adopting ? `civic ${header.adopting.node}${eta(header.adopting)}` : null,
   ].filter(Boolean).join("  ");
 
   const s = header.settlements;
@@ -136,8 +139,15 @@ export function renderHud(
     `turn ${header.turn}${limit ? `/${limit}` : ""}  ${ageBit}`,
     ...matchLine,
     `you: p${header.playerId} ${header.civ ?? "?"} / ${header.leader ?? "?"}`,
-    `gold ${num(header.gold, 0)} (${signed(y.gold)})  sci ${signed(y.science)}  cult ${signed(y.culture)}  food ${signed(y.food)}  prod ${signed(y.production)}  happiness ${signed(header.happiness.net)}`,
+    `gold ${num(header.gold, 0)} (${signed(y.gold)})  influence ${num(header.influence, 0)} (${signed(y.diplomacy)})  sci ${signed(y.science)}  cult ${signed(y.culture)}  food ${signed(y.food)}  prod ${signed(y.production)}  happiness ${signed(header.happiness.net)}`,
     `legacy: ${legacy}`,
+    ...((header.victories ?? []).length > 0
+      ? [
+          `victory progress: ${(header.victories ?? [])
+            .map((v) => `${v.type.replace(/^VICTORY_/, "").toLowerCase()} ${num(v.current, 0)}/${num(v.total, 0)}`)
+            .join("  ")}`,
+        ]
+      : []),
     ...(studying ? [studying] : []),
     `settlements ${num(s.total, 0)} (${num(s.cities, 0)} cities, ${num(s.towns, 0)} towns, cap ${num(s.cap, 0)})  pop ${num(s.population, 0)}  units ${header.unitCount}`,
     `pending: ${pending.items.length} items${pending.blockingType ? ` (blocking: ${pending.blockingType})` : ""} -> pending.txt`,

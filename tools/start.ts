@@ -7,6 +7,7 @@
 //   npm start -- --config configs/live-3.yaml   use a config file instead of flags
 //   npm start -- --fake                         no Civilization needed (harness only)
 //   npm start -- --resume civbench-t0006        continue a saved match
+//   npm start -- --attach --go                  join the match the game is already playing
 //
 // It does the whole sequence with no gaps, which matters: Civ VII's debug bridge is serviced on
 // the game thread, so any idle pause between steps can leave it unreachable (docs/FINDINGS.md).
@@ -92,6 +93,10 @@ const allAges = has("all-ages");
 // slow-but-working turn and short enough that a dead one is not free. 8 minutes by default.
 const turnSeconds = Number(flag("turn-seconds") ?? 480) || 480;
 const resumeFrom = flag("resume");
+// Join a match the game is already playing, without relaunching it. For swapping in a harness
+// change mid-run: the old harness is stopped, this one connects to the same game and carries on
+// from whichever seat is active. The agents start fresh conversations, as they do on a resume.
+const attach = has("attach");
 
 /**
  * Short, distinct names so a match can be discussed out loud. "Ada attacked Bruno" is followable;
@@ -170,7 +175,10 @@ const estimate = modelAgents.reduce((total, agent) => {
 }, 0);
 const modelSeats = modelAgents.length;
 const minutes = Math.round((modelSeats * turns * 40) / 60) + 3;
-console.log(`cost   : roughly $${estimate.toFixed(2)}   time: about ${minutes} min\n`);
+// Per 100 turns as well as at the limit: a config's turn_limit is a backstop (1000), and the
+// figure at the backstop read as the price of the match — "$400" for a game that ends by turn 150.
+const per100 = (estimate * 100) / Math.max(1, turns);
+console.log(`cost   : roughly $${per100.toFixed(2)} per 100 turns ($${estimate.toFixed(2)} at the ${turns}-turn limit)   time: about ${Math.round((modelSeats * 100 * 40) / 60)} min per 100 turns (${minutes} min at the limit)\n`);
 
 // ---------------------------------------------------------------- the game
 
@@ -237,14 +245,6 @@ function settingsSummary(): string {
 }
 
 /** Let each model-driven agent choose its leader; fill `players` with the picks. Never throws. */
-/** Bound a promise; on timeout it rejects, so a stalled model falls back to the default leader. */
-function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    work,
-    new Promise<T>((_r, reject) => setTimeout(() => reject(new Error(`timed out after ${ms / 1000}s`)), ms)),
-  ]);
-}
-
 async function chooseLeaders(players: Record<number, { leader?: string }>): Promise<void> {
   // The leader roster is a STATIC local list (src/agent/leaders-list.ts, extracted from the game's
   // own leaders.xml) — no live query. Reading it from the shell was fragile: GameInfo.Leaders is
@@ -253,13 +253,16 @@ async function chooseLeaders(players: Record<number, { leader?: string }>): Prom
   const { system, user } = leaderPrompt(settingsSummary(), leaders);
   const pickers = config.agents.filter((a) => a.brain.kind === "model");
   console.log(`   ${pickers.length} agent(s) choosing a leader (high reasoning; this takes a moment)...`);
-  // In parallel and each on a timeout: a slow/stalled model (high thinking, and DeepSeek has a stall
-  // history) must NOT hang the whole setup — it falls back to the game's default leader.
+  // In parallel, each try bounded and retried: a stalled model (DeepSeek has a stall history)
+  // must NOT hang the whole setup, and one silent stream must not hand the seat the game's
+  // default leader either — pickLeader asks again before giving up.
   await Promise.all(
     pickers.map(async (agent) => {
       if (agent.brain.kind !== "model") return;
       try {
-        const answer = await withTimeout(pickLeader(agent.brain.model, system, user, agent.brain.thinking), 120_000);
+        const answer = await pickLeader(agent.brain.model, system, user, agent.brain.thinking, {
+          onRetry: (attempt, reason) => console.log(`   ${agent.name}'s pick stalled (${reason}); asking again (try ${attempt + 1})`),
+        });
         const type = matchLeader(answer, leaders);
         if (type) {
           players[agent.playerId] = { leader: type };
@@ -382,13 +385,19 @@ if (useFake) {
   console.log("transport: fake Civ 7 (harness only)\n");
 } else {
   keepAwake();
-  console.log("1. launching Civilization VII");
-  await launchGame();
+  if (attach) {
+    console.log("1. attaching to the running game");
+  } else {
+    console.log("1. launching Civilization VII");
+    await launchGame();
+  }
 
   // Declared out here because the gameplay-context connection below reuses it.
   let bridge: CdpBridge;
 
-  if (resumeFrom) {
+  if (attach) {
+    // The match exists; nothing to load or host.
+  } else if (resumeFrom) {
     // Resuming skips setup entirely: the save carries the map, the seats and the turn.
     console.log(`2. loading save "${resumeFrom}"`);
     await loadSave(resumeFrom);
@@ -432,7 +441,7 @@ if (useFake) {
 
   yieldPriority();
   console.log("4. waiting for the map");
-  const game = await waitForTarget((t) => t.url.includes("root-game"), "gameplay context", 300);
+  const game = await waitForTarget((t) => t.url.includes("root-game"), "gameplay context", attach ? 30 : 300);
   bridge = await CdpBridge.connect(game.webSocketDebuggerUrl);
   // The debug server is serviced on the game thread and goes quiet while the engine is busy, so
   // over 50 turns the socket does eventually drop. Nothing used to reconnect it: every read after
@@ -440,6 +449,7 @@ if (useFake) {
   // spent printing that line at a game that was fine. Re-discover, because the target gets a new
   // id when the UI context reloads.
   const reopen = async () => {
+    console.log("   the debug connection stalled — reconnecting to the game");
     const again = await waitForTarget((t) => t.url.includes("root-game"), "gameplay context", 60);
     bridge = await CdpBridge.connect(again.webSocketDebuggerUrl);
     closeBridge = () => bridge.close();
@@ -456,10 +466,14 @@ if (useFake) {
   // Verify we actually got the seats we asked for. A single-player host silently gives one.
   // POLLED: right after a save loads, the seat flags lag the map by several seconds, and the
   // first live resume died here with "got 1" while the save genuinely held three.
+  // Asked with the seats we expect, so an ELIMINATED human seat still counts: it is human, it is
+  // just no longer alive, and a harness attaching after a defeat must not read that as a host
+  // that converted a seat to AI.
+  const expectedSeats = config.agents.map((a) => a.playerId);
   let humans: number[] = [];
   for (let i = 0; i < 20; i++) {
     const seatCheck = await adapter
-      .run<{ majors: Array<{ id: number; human: boolean }> }>("seats", 0)
+      .run<{ majors: Array<{ id: number; human: boolean }> }>("seats", 0, { SEAT_IDS: expectedSeats })
       .catch(() => ({ majors: [] }));
     humans = seatCheck.majors.filter((m) => m.human).map((m) => m.id);
     if (humans.length >= config.agents.length) break;
@@ -535,10 +549,20 @@ if (!useFake && !has("go")) {
     }
     tty.on("error", () => resolve()); // no controlling terminal -> do not block
     console.log("\n▶ READY — press Enter to start the match (--go skips this pause)");
-    tty.once("data", () => {
+    // Only an Enter pressed AFTER the prompt counts. The terminal is in line mode, so anything
+    // typed during the two-minute launch sits in its input buffer and the first read hands it
+    // over at once — an Enter pressed while the map was loading started the match the instant
+    // this prompt appeared. Let that buffered input drain first, then wait for a fresh line.
+    let armed = false;
+    tty.on("data", () => {
+      if (!armed) {
+        console.log("   (ignoring input typed before the prompt)");
+        return;
+      }
       tty.close();
       resolve();
     });
+    setTimeout(() => { armed = true; }, 300);
   });
 }
 

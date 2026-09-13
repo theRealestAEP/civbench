@@ -131,6 +131,16 @@ export const MODELS = {
   "z-ai/glm-5.3-flash": openrouter("z-ai/glm-5.3-flash", "GLM 5.3 Flash", 0.075, 0.25, 0.015, 1_310_720, false),
   "deepseek/deepseek-v4-flash": openrouter("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", 0.081, 0.162, 0.016, 1_048_576, false),
   "moonshotai/kimi-k3": openrouter("moonshotai/kimi-k3", "Kimi K3", 3, 15, 0.3, 262_144, true),
+  // Meta's Muse Spark 1.3 (prices from OpenRouter's catalogue on 2026-09-13). Probed the same
+  // day: with the flag on, OpenRouter answers "400 Reasoning is mandatory for this endpoint and
+  // cannot be disabled" before a token arrives; with it off the tool call comes back in one
+  // pass. It reasons anyway, hidden — 850 reasoning tokens for a three-word reply — so the
+  // monologue gets no thinking text from this seat, only its commands.
+  "meta/muse-spark-1.3": openrouter("meta/muse-spark-1.3", "Muse Spark 1.3", 1.25, 4.25, 0.15, 1_048_576, false),
+  // The same model at the "contributor" price (12x cheaper; OpenRouter's description says what
+  // Meta gets in return). Glimmer is the distilled 30B with a 131K window, so it compacts hard.
+  "meta/muse-spark-1.3-contributor": openrouter("meta/muse-spark-1.3-contributor", "Muse Spark 1.3 (contributor)", 0.1, 0.2, 0.002, 1_048_576, false),
+  "meta/muse-glimmer-30b": openrouter("meta/muse-glimmer-30b", "Muse Glimmer 30B", 0.35, 1.5, 0.04, 131_072, false),
 } satisfies Record<string, ModelDescriptor>;
 
 /**

@@ -17,12 +17,20 @@ const ANSWERS: Array<[RegExp, string]> = [
   [/STORY_DIRECTION|NARRATIVE/, "civ story"],
   [/GOLDEN_AGE|CELEBRATION/, "civ celebration"],
   [/PANTHEON/, "civ pantheon"],
-  [/ATTRIBUTE/, "civ attribute"],
+  [/BELIEF/, "civ belief"],
+  [/FOUND_RELIGION|CHOOSE_RELIGION/, "civ religion"],
+  // Buying does not clear this one either: the attribute screen signals "considered" when it
+  // closes, and `civ attribute done` sends that — bank the points or spend them, then say so.
+  [/ATTRIBUTE/, "civ attribute <NODE> or nothing, then `civ attribute done`"],
+  [/RAZE_CITY/, "civ capture <city> keep|raze|liberate"],
+  [/PLAYER_MET|FIRST_MEET/, "civ diplomacy <player> greet friendly|neutral|unfriendly — `civ diplomacy` says who is owed a greeting"],
+  [/DIPLOMATIC_RESPONSE_REQUIRED/, "civ diplomacy respond <ID> accept|reject — `civ diplomacy` lists the proposals waiting on you"],
   [/GOVERNMENT/, "civ government"],
   // Adopting does NOT clear this one. The game's policy screen sends its "finished considering"
   // signal when it closes, and that is what the notification waits for.
   [/TRADITION|POLICY|POLICIES/, "civ tradition <TYPE>, then `civ tradition done`"],
-  [/AGE_TRANSITION|AGE_ENDED|CHOOSE_AGE/, "civ age finish"],
+  [/ADVANCED_START|DEDICATION/, "civ age <CARD> (up to three dedications; `civ age` lists them), then `civ age done`"],
+  [/AGE_TRANSITION|AGE_ENDED|CHOOSE_AGE/, "civ age finish — and once that is accepted, `civ age` lists the new Age's dedications"],
   [/UNIT_PROMOTION|PROMOTION_AVAILABLE/, "civ promote <unit>"],
   // The notification command sends the same acknowledgment as the advisor popup button.
   [/ADVISOR_WARNING/, "civ dismiss"],
@@ -32,12 +40,13 @@ const ANSWERS: Array<[RegExp, string]> = [
   // NOTIFICATION_CRISIS blocked the end of a turn 86 times across the runs and was never once
   // resolved by an agent. `civ tradition` lists the crisis cards and adopts them.
   [/CRISIS/, "civ tradition <TYPE>, then `civ tradition done`"],
-  // A town picks a project through the same production chooser as a city — the game just opens it
-  // (notification-handlers.ts ChooseTownProject selects the town). So it is answered by `civ build`.
-  [/TOWN_PROJECT/, "civ build <town>"],
+  // A town that has grown enough picks a FOCUS — a town-only project, chosen through the same
+  // production chooser as a city's builds. `civ build <town>` lists the focus projects the engine
+  // will start there; the end-turn refusal names the town and the choices outright.
+  [/TOWN_PROJECT/, "civ build <town> PROJECT_TOWN_<FOCUS> — `civ build <town>` lists the focus choices"],
   // A new resource must be assigned to a settlement. `civ resource` lists the unassigned resources
   // and the settlements that can take them, and assigns one.
-  [/ASSIGN.*RESOURCE|NEW_RESOURCE/, "civ resource, then `civ resource <resource> <city>`"],
+  [/ASSIGN.*RESOURCE|NEW_RESOURCE/, "civ resource — it lists what is waiting and which settlements have a free slot; `civ resource <resource> <city>` places one; `civ resource done` when nothing can be placed"],
   [/PRODUCTION|CHOOSE_PRODUCTION/, "civ build <city>"],
   [/COMMAND_UNITS|MOVE_A_UNIT|UNIT/, "civ move <unit> <x,y>, or civ skip <unit>"],
 ];

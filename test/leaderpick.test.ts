@@ -3,7 +3,7 @@
 // block the start. A static list (leaders-list.ts) holds the choices; the game applies them.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { matchLeader, type LeaderOption } from "../src/agent/pick-leader.ts";
+import { matchLeader, pickLeader, type LeaderOption, type PickStream } from "../src/agent/pick-leader.ts";
 import { LEADERS as LEADER_LIST } from "../src/agent/leaders-list.ts";
 
 const LEADERS: LeaderOption[] = [
@@ -30,4 +30,51 @@ test("the static leader list holds real leaders and no placeholders", () => {
     !types.some((t) => /RANDOM|NONE|_DEFAULT|_ABSTRACT|INDEPENDENT/.test(t)),
     "no placeholder/non-playable rows are offered",
   );
+});
+
+// One live pick sat silent for the whole 120s cap — a stream that opened and never answered —
+// while the same call normally returns in a second. The seat then played the default leader,
+// which is the one outcome the pick exists to avoid. A silent try is abandoned and asked again.
+test("a stalled pick is abandoned after its time and asked again", async () => {
+  process.env.OPEN_ROUTER_API_KEY ??= "test-key";
+  let calls = 0;
+  const retries: string[] = [];
+  const stream: PickStream = (_model, _context, options) => ({
+    async *[Symbol.asyncIterator]() {
+      calls++;
+      yield { type: "start" }; // the stream opens either way
+      if (calls === 1) {
+        // Silent until aborted, like the stalled stream.
+        await new Promise<void>((resolve) => options.signal.addEventListener("abort", () => resolve()));
+        throw new Error("aborted");
+      }
+      yield { type: "text_delta", delta: "LEADER_XERXES" };
+    },
+  });
+  const answer = await pickLeader("deepseek/deepseek-v4-flash", "sys", "user", "medium", {
+    attemptMs: 20,
+    stream,
+    onRetry: (attempt, reason) => retries.push(`${attempt}: ${reason}`),
+  });
+  assert.equal(answer, "LEADER_XERXES");
+  assert.equal(calls, 2, "the second try answered");
+  assert.deepEqual(retries, ["1: no answer in 0.02s"]);
+});
+
+test("three silent tries give up, so the launcher can fall back to the default", async () => {
+  process.env.OPEN_ROUTER_API_KEY ??= "test-key";
+  let calls = 0;
+  const stream: PickStream = (_m, _c, options) => ({
+    async *[Symbol.asyncIterator]() {
+      calls++;
+      yield { type: "start" };
+      await new Promise<void>((resolve) => options.signal.addEventListener("abort", () => resolve()));
+      throw new Error("aborted");
+    },
+  });
+  await assert.rejects(
+    pickLeader("deepseek/deepseek-v4-flash", "sys", "user", "medium", { attemptMs: 10, stream }),
+    /no answer in 0.01s \(3 tries\)/,
+  );
+  assert.equal(calls, 3);
 });

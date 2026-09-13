@@ -1,4 +1,11 @@
 // Runs inside Civ 7. Settlements PLAYER_ID may legitimately see (docs/PLAN.md §7).
+
+/** "expand" or "project": the growth mode a town is in, from the GrowthTypes enum. */
+function growthName(value) {
+  if (value === null || value === undefined || typeof GrowthTypes === "undefined") return null;
+  const key = Object.keys(GrowthTypes).find((k) => GrowthTypes[k] === value);
+  return key ? key.toLowerCase() : null;
+}
 // Own settlements get full detail. Foreign ones are limited to what the map reveals.
 const VISIBLE = RevealedStates.VISIBLE;
 
@@ -26,9 +33,16 @@ for (const id of player?.Cities?.getCityIds?.() ?? []) {
     population: city.population ?? null,
     // The NAME, not the hash. A raw type hash in an agent-readable file is the one thing this
     // codebase forbids, and this one was surviving into settlements.jsonl on every line.
-    growthType: typeName("Types", city.Growth?.growthType) ?? null,
+    // GrowthTypes is an ENUM (EXPAND or PROJECT), not a GameInfo.Types row, and the project is a
+    // Projects row hash — model-city-details.ts reads both that way. Looked up as Types they were
+    // null on every town line of every run, so a town's focus was invisible.
+    growthType: growthName(city.Growth?.growthType),
     currentFood: city.Growth?.currentFood ?? null,
-    projectType: typeName("Projects", city.Growth?.projectType) ?? null,
+    projectType: (() => {
+      const h = city.Growth?.projectType;
+      if (h === null || h === undefined || h === -1) return null;
+      try { return GameInfo.Projects.lookup(h)?.ProjectType ?? typeName("Projects", h) ?? null; } catch { return null; }
+    })(),
 
     // The NAME, resolved here. The raw hash used to be all the dump carried, and it survived only
     // into the JSONL — the one thing this codebase forbids showing an agent. So `prod_turns_left=3`

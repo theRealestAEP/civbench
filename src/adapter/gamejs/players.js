@@ -52,9 +52,11 @@ for (const other of Players.getAlive()) {
   const met = myDiplomacy?.hasMet?.(other.id) ?? false;
   if (!met) continue;
 
+  // Relationship levels are a major-civ notion; asked about an independent the API answered
+  // "Neutral" on the same line as `at_war=yes`, which read as a contradiction every turn.
   let relationship = null;
   try {
-    relationship = locText(myDiplomacy?.getRelationshipLevelName?.(other.id) ?? null);
+    if (other.isMajor) relationship = locText(myDiplomacy?.getRelationshipLevelName?.(other.id) ?? null);
   } catch { relationship = null; }
 
     // Real independent name (Carthage, not "Villages") only for a confirmed independent, matching
@@ -66,11 +68,13 @@ for (const other of Players.getAlive()) {
     name: locText(indName ?? other.civilizationName ?? other.leaderName ?? null),
     kind: other.isMajor ? "civilization" : "city_state",
     civ: locText(indName ?? other.civilizationName ?? other.civilizationType ?? null),
-    leader: locText(other.leaderName ?? other.leaderType ?? null),
+    // An independent has no leader; its "leaderName" is the generic label "Villages".
+    leader: other.isMajor ? locText(other.leaderName ?? other.leaderType ?? null) : null,
     isHuman: Players.isHuman?.(other.id) ?? null,
     isMajor: other.isMajor ?? null,
     atWar: myDiplomacy?.isAtWarWith?.(other.id) ?? false,
-    suzerain: other.Influence?.getSuzerain?.() ?? null,
+    // -1 is the engine's "nobody"; printed as `suzerain=p-1` on every line of every run.
+    suzerain: (() => { const id = other.Influence?.getSuzerain?.(); return typeof id === "number" && id >= 0 ? id : null; })(),
     relationship,
     // How they are doing. The ribbon shows all of this for every met civ.
     gold: netYield(other, "YIELD_GOLD"),

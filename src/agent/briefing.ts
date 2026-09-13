@@ -47,8 +47,31 @@ Settlements come in two kinds. Towns are small and largely manage themselves; th
 food or gold to nearby cities. Cities have production queues and build things. You choose which a
 settlement becomes.
 
+A town builds nothing itself. The one decision a town puts to you is its FOCUS: when it has grown
+enough, the game asks, and \`civ build <town>\` lists the focus projects it can take. Units and
+buildings in a town are bought with gold: \`civ buy <town>\` lists what it can buy and the price.
+
 Armies are led by Commanders. A Commander packs several units into one stack that moves as a unit
 and gains promotions. This is the main lever on how much micromanagement a war costs you.
+
+How commanders work here. A commander is a unit like any other (\`type=army_commander\`); its line
+shows \`army_units=N army_capacity=M\` and \`army_members=\` for the units packed into it, and a
+packed unit shows \`packed_in=<commander id>\`. The commands, all listed in actions.txt when they
+apply:
+
+  civ do unit-cmd <unit> UNITCOMMAND_ADD_TO_ARMY        a unit next to a commander joins its army
+  civ do unit-cmd <commander> UNITCOMMAND_PACK_ARMY      pack the units on the commander's tile
+  civ do unit-cmd <commander> UNITCOMMAND_UNPACK_ARMY    unpack them around the commander
+  civ do unit-cmd <unit> UNITCOMMAND_REMOVE_FROM_ARMY    take one unit back out
+  civ do unit-op <unit> UNITOPERATION_REINFORCE_ARMY     send a unit to walk to a commander on its own
+  civ do unit-cmd <commander> UNITCOMMAND_DEFENSIVE_PERIMETER   the army digs in where it stands
+  civ do unit-cmd <commander> UNITCOMMAND_FOCUSED_ATTACK_LAND_MELEE / _LAND_RANGED
+                                                         the army attacks together
+  civ promote <commander>                                spend the promotions it has earned
+
+A packed army moves as one unit: move the commander, not its members. Units inside it do not ask
+for orders and cannot be ordered separately until they are deployed. A commander earns experience
+from fights near it, so keep it with the army.
 
 # The rest of the state
 
@@ -78,7 +101,7 @@ Triumph or Legacy shown as completed on turn 1.
   /run/turns/<turn>/...     every past turn, same layout
   /run/index.md             one line per past turn
   /run/rules/               the full ruleset: costs, trees, unlocks, unit stats
-  /notes/notes.md           your journal. The ONLY thing you keep between turns.
+  /notes/notes.md           your journal. It survives everything and is never trimmed.
   civ note <text>           add a line to it. Appends; cannot overwrite.
 
 Shell tools: grep sed sort uniq head tail wc cat ls cp mv rm mkdir touch stat cut tr test jq js.
@@ -152,12 +175,31 @@ A unit with \`busy=yes\` is part-way through an operation. It will refuse new or
 NOT hold your turn open — leave it alone, or cancel it with
 \`civ do unit-cmd <unit> UNITCOMMAND_CANCEL\`.
 
+A unit with \`needs_orders=yes\` has not been given an order this turn, and the turn cannot end
+until every unit has one. This is the game's normal rhythm, not a problem: each turn, each unit
+gets one order. Skipping counts — \`civ skip <unit>\` is the right order for a unit you have no
+better use for right now. Give every flagged unit its order in your first pass (a move, a skip,
+or a standing order such as sleep or fortify, which stops it asking every turn) rather than
+finding out from a refused end-turn. A unit on a standing order can show this too: auto-explore
+pauses beside a discovery, a queued path pauses when it is blocked. \`civ skip\` finishes it
+for the turn; a new move replaces the order.
+
   settlement Waset kind=city engine_id=196611 owner=self at=12,20 pop=7 capital=yes
              food=3.2 food_per_turn=2.1 food_to_grow=14 turns_to_grow=4
              production=6 gold=3 science=4 culture=2
              building=UNIT_WARRIOR production_turns=3 queue_empty=no happiness=1
 
+A settlement with \`unrest=yes\` is in revolt: its yields are cut and \`unrest_turns\` counts
+down to it flipping to an independent power. Negative \`happiness\` is the warning before that.
+Raise happiness there (a Monument, a celebration, fewer settlements over the cap) before it
+reaches zero turns.
+
   player p2 civ=Han leader=Confucius major=yes at_war=no relationship=Neutral
+  player p10 civ=Khalchyan major=no at_war=yes
+
+An independent power (\`major=no\`: a village or city-state) starts at war with everyone; that
+\`at_war=yes\` is normal, needs no answer, and offers no peace deal. Its warriors will raid
+you if you leave them; a few of your units can clear a hostile village for gold and loot.
              gold=12 sci=9 cult=7 settlements=3/5 suzerain=none
 
   pending 0 type=NOTIFICATION_CHOOSE_RESEARCH blocking=yes summary=Choose_a_technology
@@ -182,6 +224,8 @@ The shell reads. The \`civ\` command is the only way to act.
   civ what-can city:<id>     legal actions for a settlement
   civ build <city> [THING] [x,y]   what that settlement can build, or start building it.
                              A BUILDING occupies a tile: name one, or let the game choose.
+  civ buy <city> [THING] [x,y]     what that settlement can buy with gold, or buy it.
+                             A town buys; it builds nothing but its focus.
   civ expand <city> [x,y]    where a grown city can place its new citizen
   civ tech [NODE]            your research: what you can pick, or pick it
   civ civic [NODE]           your civics: what you can adopt, or adopt it
@@ -192,14 +236,24 @@ The shell reads. The \`civ\` command is the only way to act.
   civ promote <unit> [PROM]  promotions this unit has earned, or take one
   civ tradition done         say you have finished with policies — this is what clears the
                              "policies available" notification, adopting one does not
-  civ age finish             say you are done choosing at an Age transition
+  civ age                    the Age-boundary step waiting on you
+  civ age finish             say you are done choosing at an Age transition (the civilization
+                             pick is made for you)
+  civ age <CARD>             pick a dedication for the new Age (up to three); \`civ age -CARD\`
+                             drops one, \`civ age done\` closes the choice
   civ celebration [TYPE]     what a Celebration can give you, or your pick
   civ pantheon [BELIEF]      found a pantheon
   civ attribute [NODE]       spend an attribute point
+  civ attribute done         say you are finished with attribute points — this is what clears the
+                             "attribute point available" notification, buying a node does not
+  civ capture <city> keep|raze|liberate   decide the fate of a settlement you just conquered;
+                             the game waits on this after every conquest
   civ what-can player        legal player actions (research, policies, and so on)
   civ combat-preview <unit> <x,y>   what an attack would cost, before you commit
   civ diplomacy [player]     who you have met, and what the game will let you do to them
   civ diplomacy <player> <ACTION>   declare war, open borders, make peace, form an alliance
+  civ diplomacy <player> greet friendly|neutral|unfriendly   answer a civ that has just met you
+  civ diplomacy respond <ID> accept|reject   answer a proposal another civ sent you (\`civ diplomacy\` lists them)
   civ deal items <player>    what each side could put on the table
   civ deal offer <player> <KIND> [AMOUNT]   put one thing on the table
   civ deal send <player>     propose what you have built
@@ -208,9 +262,28 @@ The shell reads. The \`civ\` command is the only way to act.
   civ deal clear <player>    start the deal over
   civ list-ops <kind>        every operation name this build knows
   civ move <unit> <x,y>      move
-  civ attack <unit> <x,y>    attack
-  civ skip <unit>            skip this unit
+  civ attack <unit> <x,y>    attack — a ranged unit strikes from where it stands; a melee unit
+                             moves in. If the plot is out of reach, the refusal lists the plots
+                             the unit can hit right now.
+  civ skip <unit>            skip this unit for THIS turn — a normal, valid order for a unit you
+                             have no better use for right now
+  civ do unit-op <unit> UNITOPERATION_FORTIFY          a standing order: the unit stops asking
+  civ do unit-op <unit> UNITOPERATION_SLEEP            for orders every turn until you wake it
+  civ do unit-op <unit> UNITOPERATION_ALERT            (\`civ do unit-cmd <unit> UNITCOMMAND_WAKE\`)
+  civ do unit-op <unit> UNITOPERATION_AUTOMATE_EXPLORE a scout that explores on its own
+                             Give a standing order BEFORE the unit moves this turn. Once it has
+                             moved, the engine refuses one: skip it now, order it next turn.
+  civ resource [<resource> <city>]   resources waiting to be placed and where there is room, or place one
+  civ resource done          say you are finished placing resources (when every slot is full)
+                             Slots: each settlement holds a fixed number of resources. More come
+                             from buildings — Market +1, Lighthouse +2 (coast), the Colossus and
+                             Monks Mound wonders — and policies such as Commodities. City
+                             resources go only to cities (never towns); the rest go anywhere with
+                             room; no settlement holds the same resource twice.
+  civ inbox                  what other civs have said to you
+  civ deal pending <player>  deals awaiting a response
   civ do unit-op <unit> <TYPE> [k=v ...]
+  civ do unit-cmd <unit> <TYPE> [k=v ...]
   civ do city-op <city> <TYPE> [k=v ...]
   civ do player-op <TYPE> [k=v ...]
   civ say <text>             tell every civ you have met
@@ -264,8 +337,9 @@ out, the turn ends where it stands and any unfinished work is lost. Run \`civ ti
 seconds left right now. Watch it on long turns, and call \`civ end-turn\` yourself before the clock
 runs out.
 
-You keep your own reasoning between turns, but not the file contents you read: older tool output
-is dropped to save room, and you will see a note saying so. Anything dropped is still on disk —
+You keep your recent reasoning between turns. As the match runs on, the oldest turns are trimmed
+to fit your context, in this order: first the file contents you read, then your reasoning, then
+whole turns. You will see a note where something was dropped. Nothing trimmed is gone from disk —
 re-read it rather than trusting a stale memory of it.
 
 /notes/notes.md survives everything, including compaction. Write to it before you end your turn:
@@ -294,14 +368,29 @@ a founder's move spends all of its movement, and a settlement cannot be founded 
 \`units.txt\` marks the ones that can found where they stand — \`can_found_here=yes\`. If it says yes
 and the plot is acceptable, found there rather than walking one tile for a better one.
 
-A turn will not end while a notification blocks it, or while a unit still needs orders. If
-\`civ end-turn\` refuses it names the exact thing — the unit, the settlement, or the decision —
-and the command that answers it. Read the full response, including its hint. Resolve the
-stated blocker before retrying end-turn. Note that a unit having movement left
-is not the same as needing orders: only a unit that has not moved AT ALL holds the turn open. One
-that is fortified, asleep, busy (\`busy=yes\`), or has spent part of its movement blocks nothing.
-\`civ skip <unit>\` finishes a unit that is waiting for orders; a busy unit refuses it and does
-not need it.
+A turn will not end while a notification blocks it, or while a unit has not been given an order
+this turn. If \`civ end-turn\` refuses it names the exact thing — the unit, the settlement, or
+the decision — and the command that answers it. Read the full response, including its hint.
+Resolve the stated blocker before retrying end-turn. A unit having movement left is not the
+same as needing an order: only a unit that has not moved AT ALL still waits. One that is
+fortified, asleep, busy (\`busy=yes\`), or has spent part of its movement blocks nothing.
+\`units.txt\` marks the ones that do with \`needs_orders=yes\`. \`civ skip <unit>\` is the
+one-command answer for a unit you have nothing better for; a busy unit refuses it and does not
+need it. Rarely the game refuses to skip a unit it still waits on (one built this turn): the
+refusal says so, and a one-tile move is what clears it.
+
+What you read from /run/rules does not stay in your context forever: when the context gets
+full, old command output is dropped, and only your notes survive. When you look a rule up — a
+unit's cost, how founding works — write the fact into your notes so you never have to look it
+up again. Most questions have a command that answers them without the rules files:
+\`civ tech\` and \`civ civic\` say what each option unlocks, \`civ build\` and \`civ buy\` say
+turns and price, and the status block's legacy line says what earns points on each path.
+/run/rules/README.md lists every table's columns and a few jq recipes.
+
+Religion: \`civ religion\` lists the religions still unfounded and \`civ religion <RELIGION_TYPE>\`
+founds one; \`civ belief\` lists the beliefs you may claim, with what each does, and
+\`civ belief <BELIEF_TYPE>\` claims one. Answer NOTIFICATION_CHOOSE_BELIEF with these — never
+through the game's own picker screen.
 
 \`civ dismiss\` only clears an ALERT. A decision — a policy, a tech, a citizen to place — ignores
 dismissal and must actually be answered.

@@ -6,10 +6,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readTurns, interestOf, shouldSpeak, HEARTBEAT_EVERY } from "../src/commentary/brief.ts";
+import { readTurns, interestOf, shouldSpeak, HEARTBEAT_EVERY, inProgressTurn, liveSnapshot } from "../src/commentary/brief.ts";
 import type { CompleteTurn, TurnBrief, SeatStats } from "../src/commentary/brief.ts";
 import {
-  commentateTurn, hasCommentary, promptFor, writeCommentary, newMemory, MEMORY_TURNS, PLAY_KEY } from "../src/commentary/commentate.ts";
+  commentateTurn, commentateLive, hasCommentary, promptFor, writeCommentary, newMemory, MEMORY_TURNS, PLAY_KEY } from "../src/commentary/commentate.ts";
 import type { Speak } from "../src/commentary/speak.ts";
 
 type Event = Record<string, unknown>;
@@ -586,3 +586,73 @@ test("plumbing in a seat's notes and reasoning never reaches the caster prompt",
   assert.match(prompt, /founded second city/, "the game-world half of the note survives");
   assert.match(prompt, /horsemen north/, "the game-world half of the reasoning survives");
 });
+
+// ---- live play-by-play between finished turns ----
+//
+// A turn runs several minutes and the per-turn segment left all of it as dead air. The live line
+// reads the seat mid-turn: what it did since the caster's last look, its latest reasoning, and its
+// mistakes glossed for a viewer — never the console.
+test("the in-progress turn is the last begin without an end that took", () => {
+  const runDir = makeRun([
+    begin(1, "Ada"), end(1, "Ada"), begin(1, "Bruno"),
+    { turn: 1, player: 1, playerName: "Bruno", kind: "turn_end", ok: false, code: "CANNOT_END_TURN" },
+  ]);
+  assert.deepEqual(inProgressTurn(runDir)?.seat, "Bruno", "a refused end-turn does not close it");
+  const done = makeRun([begin(1, "Ada"), end(1, "Ada")]);
+  assert.equal(inProgressTurn(done), null);
+});
+
+test("a live snapshot carries new moves, glossed mistakes with repeats, and the latest reasoning", () => {
+  const runDir = makeRun([
+    begin(3, "Ada"),
+    action(3, "Ada", { kind: "unit_operation", targetId: "10", actionType: "UNITOPERATION_MOVE_TO", args: { X: 2, Y: 1 } }),
+    action(3, "Ada", { kind: "unit_operation", targetId: "10", actionType: "UNITOPERATION_MOVE_TO", args: { X: 7, Y: 7 } }, false, { code: "NO_PATH" }),
+    action(3, "Ada", { kind: "unit_operation", targetId: "10", actionType: "UNITOPERATION_MOVE_TO", args: { X: 7, Y: 8 } }, false, { code: "NO_PATH" }),
+    { turn: 3, player: 0, playerName: "Ada", kind: "turn_end", ok: false, code: "CANNOT_END_TURN" },
+  ]);
+  writeTranscript(runDir, "Ada", 3, "--- thinking ---\nFirst I read the map.\n--- ran ---\n$ cat x\n--- thinking ---\nThe river blocks the scout; I will swing north instead.\n--- ran ---\n$ civ move 10 7,8\n");
+  const snap = liveSnapshot(runDir, "Ada", 3);
+  assert.equal(snap.did.length, 1, "only the move that took is a did-line");
+  assert.match(snap.did[0]!, /^ok UNITOPERATION_MOVE_TO/);
+  assert.deepEqual(snap.mistakes, ["ordered a unit somewhere it cannot go (2 times)"], "one refused end-turn is routine, not a mistake");
+  assert.match(snap.thinking, /swing north/, "the LATEST reasoning block, not the first");
+  assert.ok(snap.lastSeq > 0);
+  const again = liveSnapshot(runDir, "Ada", 3, snap.lastSeq);
+  assert.equal(again.did.length + again.mistakes.length, 0, "nothing new since the last look");
+});
+
+test("a live line is one sentence from the seat's snapshot, with mistakes and reasoning in the prompt", async () => {
+  const runDir = makeRun([
+    begin(3, "Ada"),
+    action(3, "Ada", { kind: "unit_operation", targetId: "10", actionType: "UNITOPERATION_MOVE_TO", args: { X: 7, Y: 7 } }, false, { code: "NO_PATH" }),
+  ]);
+  writeTranscript(runDir, "Ada", 3, "--- thinking ---\nThe river blocks the scout; swing north.\n--- ran ---\n$ x\n");
+  const speak = stub("They just sent a scout at a river, again.");
+  const line = await commentateLive(liveSnapshot(runDir, "Ada", 3), speak, newMemory());
+  assert.equal(line.seat, "live");
+  assert.match(line.text, /scout/);
+  const prompt = speak.prompts[0]!;
+  assert.match(prompt, /Ada is mid-turn/);
+  assert.match(prompt, /ordered a unit somewhere it cannot go/, "the mistake is glossed, not a code");
+  assert.doesNotMatch(prompt, /NO_PATH/, "the code never reaches the caster");
+  assert.match(prompt, /swing north/);
+});
+
+// The live caster called end-of-turn skips blunders and scored twenty of them as twenty
+// decisions. They collapse to one housekeeping line, and a refused end-turn only counts as a
+// mistake once it has repeated.
+test("skips collapse to one housekeeping line and routine refusals are not mistakes", () => {
+  const runDir = makeRun([
+    begin(5, "Bruno"),
+    action(5, "Bruno", { kind: "unit_operation", targetId: "1", actionType: "UNITOPERATION_SKIP_TURN" }),
+    action(5, "Bruno", { kind: "unit_operation", targetId: "2", actionType: "UNITOPERATION_SKIP_TURN" }),
+    action(5, "Bruno", { kind: "unit_operation", targetId: "3", actionType: "UNITOPERATION_SKIP_TURN" }),
+    { turn: 5, player: 1, playerName: "Bruno", kind: "turn_end", ok: false, code: "CANNOT_END_TURN" },
+    { turn: 5, player: 1, playerName: "Bruno", kind: "turn_end", ok: false, code: "CANNOT_END_TURN" },
+    action(5, "Bruno", { kind: "unit_operation", targetId: "4", actionType: "UNITOPERATION_FORTIFY" }, false, { code: "ILLEGAL_ACTION" }),
+  ]);
+  const snap = liveSnapshot(runDir, "Bruno", 5);
+  assert.deepEqual(snap.did, ["ok put 3 idle units on hold for the turn (routine housekeeping, not a decision)"]);
+  assert.deepEqual(snap.mistakes, [], "two refused end-turns and one bare refusal are noise");
+});
+

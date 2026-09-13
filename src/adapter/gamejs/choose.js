@@ -7,6 +7,70 @@
 //
 // It replaced build.js, research.js and government.js — three scripts with the same shape and
 // three chances to get it subtly wrong. Adding a decision is a row in DECISIONS, not a new file.
+/**
+ * Every plot the engine will let a constructible go on, or null when it named none.
+ *
+ * Two lists, not one. `Plots` is the urban tiles with a free slot; `ExpandUrbanPlots` is the
+ * rural tiles the building could turn urban — the game's own placement mode offers both
+ * (building-placement-manager.ts selectPlacementData). Reading only `Plots` sent an order for
+ * a saw pit without a plot when the city's districts were full: the engine accepted it, queued
+ * nothing, and the listing kept offering the saw pit as buildable.
+ */
+function buildPlots(result) {
+  const urban = Array.isArray(result?.Plots) ? result.Plots : null;
+  const expand = Array.isArray(result?.ExpandUrbanPlots) ? result.ExpandUrbanPlots : null;
+  if (urban === null && expand === null) return null;
+  return [...(urban ?? []), ...(expand ?? [])];
+}
+
+/**
+ * Whether a unit may take a promotion, the way the game's own panel decides it
+ * (panel-unit-promotion.ts): a point to spend, not already held, and the discipline tree
+ * allows it. `canStart` is not that gate — it said yes to eleven promotions in one turn and
+ * the engine applied none of them, so the point stayed unspent and the turn ran out.
+ */
+function promotionGate(unit, disciplineType, promotionType) {
+  const args = {
+    PromotionType: Database.makeHash(promotionType),
+    PromotionDisciplineType: Database.makeHash(disciplineType),
+  };
+  const xp = unit?.Experience;
+  if (xp && typeof xp.canEarnPromotion === "function") {
+    try {
+      if (xp.canPromote !== true) return { ok: false, args };
+      if (typeof xp.hasPromotion === "function" && xp.hasPromotion(disciplineType, promotionType) === true) return { ok: false, args };
+      return { ok: xp.canEarnPromotion(disciplineType, promotionType, false) === true, args };
+    } catch { return { ok: false, args }; }
+  }
+  let ok = false;
+  try { ok = Game.UnitCommands.canStart(unit.id, UnitCommandTypes.PROMOTE, args, false)?.Success === true; }
+  catch { ok = false; }
+  return { ok, args };
+}
+
+/** The discipline rows that apply to this unit: an army commander's are the ARMY ones. */
+function promotionRows(unit) {
+  const type = String(typeName("Units", unit?.type) ?? "");
+  const family = /ARMY|FLEET|SQUADRON/.exec(type)?.[0] ?? null;
+  return tableRows(GameInfo.UnitPromotionDisciplineDetails).filter((d) =>
+    d?.UnitPromotionType && (family === null || String(d.UnitPromotionDisciplineType).includes(`_${family}_`)));
+}
+
+/** Every promotion this unit can take right now, by name, with what it does. */
+function promotionChoices(unit) {
+  const seen = new Set();
+  const out = [];
+  for (const detail of promotionRows(unit)) {
+    const name = detail.UnitPromotionType;
+    if (seen.has(name)) continue;
+    if (!promotionGate(unit, detail.UnitPromotionDisciplineType, name).ok) continue;
+    seen.add(name);
+    const def = GameInfo.UnitPromotions?.lookup?.(Database.makeHash(name));
+    out.push({ name, title: locText(def?.Name ?? null), does: locText(def?.Description ?? null), available: true });
+  }
+  return out;
+}
+
 const player = Players.get(PLAYER_ID);
 const ACTIVATE = typeof PlayerOperationParameters !== "undefined" ? PlayerOperationParameters.Activate : 1;
 const DEACTIVATE = typeof PlayerOperationParameters !== "undefined" ? PlayerOperationParameters.Deactivate : 2;
@@ -30,17 +94,35 @@ const DECISIONS = {
   build: {
     // The key follows the thing's Kind, and the value is its hash.
     scope: "city",
+    // A town's focus is chosen through the production chooser, and that panel tells the engine
+    // "I have considered this town's project" the moment it opens for a town
+    // (panel-production-chooser.ts, CONSIDER_TOWN_PROJECT). That signal, not the project order,
+    // is what clears NOTIFICATION_CHOOSE_TOWN_PROJECT — 116 blocks, 115 never resolved.
+    after: (cityId, args) => {
+      if (args?.ProjectType === undefined) return;
+      const op = CityOperationTypes.CONSIDER_TOWN_PROJECT;
+      if (op === undefined || !Cities.get(cityId)?.isTown) return;
+      try {
+        if (Game.CityOperations.canStart(cityId, op, {}, false)?.Success === true) {
+          Game.CityOperations.sendRequest(cityId, op, {});
+        }
+      } catch { /* the notification says whether it cleared */ }
+    },
     // What this settlement can build right now. canStartQuery returns [{ index, result }] where
     // index is a row index into GameInfo — not a hash, and there is no .Items wrapper.
     list: () => {
       const out = [];
       const city = findOwnCity(PLAYER_ID, TARGET_ID);
       if (!city || typeof CityQueryType === "undefined") return out;
-      for (const [query, table, field] of [
+      // A town builds nothing. The game's chooser offers a town only purchases and its focus,
+      // and this harness has no purchase yet — so a town's list is its focus projects, below.
+      // The engine still answers "yes" to a BUILD query in a town, which is how one seat put
+      // seventeen scouts into two towns' queues while the real prompt stood unanswered.
+      const kinds = city.isTown ? [] : [
         [CityQueryType.Unit, "Units", "UnitType"],
         [CityQueryType.Constructible, "Constructibles", "ConstructibleType"],
-        [CityQueryType.Project, "Projects", "ProjectType"],
-      ]) {
+      ];
+      for (const [query, table, field] of kinds) {
         let rows = [];
         try { rows = Game.CityOperations.canStartQuery(city.id, CityOperationTypes.BUILD, query) ?? []; }
         catch { rows = []; }
@@ -48,13 +130,45 @@ const DECISIONS = {
           if (row?.result?.Requirements?.FullFailure || row?.result?.Requirements?.Obsolete) continue;
           const def = GameInfo[table]?.lookup?.(row?.index);
           if (!def?.[field]) continue;
+          let available = row?.result?.Success === true;
+          let why = available ? null : needed(row?.result);
+          // A building the city may make but has nowhere to put. The query says yes, the
+          // placement has no legal tile, and an order sent without one is accepted and never
+          // queued — 78 times in one run, all buildings and wonders. Ask the placement too.
+          if (available && field === "ConstructibleType") {
+            let placement = null;
+            try { placement = Game.CityOperations.canStart(city.id, CityOperationTypes.BUILD, { ConstructibleType: def.$index }, false); }
+            catch { placement = null; }
+            if (placement && buildPlots(placement)?.length === 0) {
+              available = false;
+              why = "no tile in this settlement can take it right now";
+            }
+          }
           out.push({
             name: def[field],
             turns: city.BuildQueue?.getTurnsLeft?.(def[field]) ?? null,
-            available: row?.result?.Success === true,
-            why: row?.result?.Success ? null : needed(row?.result),
+            available,
+            why,
           });
         }
+      }
+      // Projects, the way the game's own chooser does it (production-chooser-helpers.ts): walk the
+      // table and ask per project, keeping city-only projects out of towns and town-only ones out
+      // of cities. The BUILD query by kind never returned a town's focus projects.
+      for (const def of tableRows(GameInfo.Projects)) {
+        if (!def?.ProjectType) continue;
+        if (city.isTown ? def.CityOnly : def.TownOnly) continue;
+        let check = null;
+        try { check = Game.CityOperations.canStart(city.id, CityOperationTypes.BUILD, { ProjectType: def.$index }, false); }
+        catch { check = null; }
+        const req = check?.Requirements;
+        if (!check || (req && (req.FullFailure || req.Obsolete || req.MeetsRequirements === false))) continue;
+        out.push({
+          name: def.ProjectType,
+          turns: city.BuildQueue?.getTurnsLeft?.(def.ProjectType) ?? null,
+          available: check.Success === true,
+          why: check.Success ? null : needed(check),
+        });
       }
       return out;
     },
@@ -115,34 +229,142 @@ const DECISIONS = {
       const PLOT = typeof BUILD_PLOT === "undefined" ? null : BUILD_PLOT;
       const row = GameInfo.Types.lookup(name);
       if (!row) return null;
+      const city = findOwnCity(PLAYER_ID, TARGET_ID);
+      // Refuse what the game's own screen would never offer a town (see list above).
+      if (city?.isTown && row.Kind !== "KIND_PROJECT") return null;
       if (row.Kind === "KIND_UNIT") return { UnitType: row.Hash };
       for (const [table, key] of [["Constructibles", "ConstructibleType"], ["Projects", "ProjectType"]]) {
         for (const def of GameInfo[table] ?? []) {
           if (def[key] !== name) continue;
           const base = { [key]: def.$index };
-          // Projects are placed by the engine; only constructibles want a plot.
-          if (key !== "ConstructibleType") return base;
-          const city = findOwnCity(PLAYER_ID, TARGET_ID);
+          // Projects are placed by the engine; only constructibles want a plot. A town's focus
+          // replaces whatever is queued — the game's chooser sends it exclusive.
+          if (key !== "ConstructibleType") {
+            return city?.isTown && typeof CityOperationsParametersValues !== "undefined"
+              ? { ...base, InsertMode: CityOperationsParametersValues.Exclusive }
+              : base;
+          }
           if (!city) return base;
           let check = null;
           try { check = Game.CityOperations.canStart(city.id, CityOperationTypes.BUILD, base, false); }
           catch { check = null; }
-          const plots = check?.Plots ?? [];
-          if (plots.length === 0) return base;
+          const plots = buildPlots(check);
+          if (plots !== null && plots.length === 0) {
+            // Sent without a plot, the engine accepts this and queues nothing. Say why instead.
+            return {
+              __refuse: {
+                code: "NO_PLOT",
+                message: `${locText(city.name ?? null) ?? "this settlement"} has no tile that can take ${name} right now — ` +
+                  `every tile a building can go on is in use`,
+                hint: `a building needs a free slot in one of the settlement's districts, or a tile it can turn urban; ` +
+                  `\`civ build ${TARGET_ID}\` lists what it can place today`,
+              },
+            };
+          }
+          if (plots === null) return base; // the engine listed no plots at all; let it decide
           // An explicit "THING at x,y" wins when the agent named one and it is legal.
-          let chosen = plots[0];
+          let candidates = plots;
           if (typeof PLOT === "string" && /^\d+\s*,\s*\d+$/.test(PLOT)) {
             const [px, py] = PLOT.split(",").map((n) => Number(n.trim()));
-            for (const index of plots) {
+            const named = plots.filter((index) => {
               const at = GameplayMap.getLocationFromIndex(index);
-              if (at?.x === px && at?.y === py) { chosen = index; break; }
-            }
+              return at?.x === px && at?.y === py;
+            });
+            if (named.length > 0) candidates = named;
           }
-          const at = GameplayMap.getLocationFromIndex(chosen);
-          return at ? { ...base, X: at.x, Y: at.y } : base;
+          // Confirm the plot the way the game's placement mode does before it sends
+          // (interface-mode-place-building.ts commitPlot): canStart with X and Y. A plot the list
+          // offers can still be refused with the building on it, and the engine then accepts
+          // the order and queues nothing.
+          for (const index of candidates) {
+            const at = GameplayMap.getLocationFromIndex(index);
+            if (!at) continue;
+            const placed = { ...base, X: at.x, Y: at.y };
+            let ok = false;
+            try { ok = Game.CityOperations.canStart(city.id, CityOperationTypes.BUILD, placed, false)?.Success === true; }
+            catch { ok = false; }
+            if (ok) return placed;
+          }
+          return {
+            __refuse: {
+              code: "NO_PLOT",
+              message: `${locText(city.name ?? null) ?? "this settlement"} offers ${plots.length} tile(s) for ${name}, ` +
+                `but the engine refuses to place it on any of them right now`,
+              hint: `\`civ build ${TARGET_ID}\` lists what it can place today`,
+            },
+          };
         }
       }
       return null;
+    },
+  },
+  buy: {
+    // Buying with gold: what a TOWN does instead of building, and what a city does in a hurry.
+    // The game's chooser (Construct() in production-chooser-helpers.ts) sends PURCHASE with the
+    // same type keys as a build and prices it through city.Gold. The CLI checks the treasury
+    // afterwards, so an accepted-but-empty purchase is reported as one.
+    scope: "city",
+    operation: () => CityCommandTypes.PURCHASE,
+    api: () => Game.CityCommands,
+    list: () => {
+      const out = [];
+      const city = findOwnCity(PLAYER_ID, TARGET_ID);
+      if (!city || typeof CityQueryType === "undefined") return out;
+      const goldYield = typeof YieldTypes !== "undefined" ? YieldTypes.YIELD_GOLD : undefined;
+      const priced = [
+        [CityQueryType.Unit, "Units", "UnitType", (name) => city.Gold?.getUnitPurchaseCost?.(goldYield, name)],
+        [CityQueryType.Constructible, "Constructibles", "ConstructibleType", (name) => city.Gold?.getBuildingPurchaseCost?.(goldYield, name)],
+      ];
+      for (const [query, table, field, price] of priced) {
+        let rows = [];
+        try { rows = Game.CityCommands.canStartQuery(city.id, CityCommandTypes.PURCHASE, query) ?? []; }
+        catch { rows = []; }
+        for (const row of rows) {
+          if (row?.result?.Requirements?.FullFailure || row?.result?.Requirements?.Obsolete) continue;
+          const def = GameInfo[table]?.lookup?.(row?.index);
+          if (!def?.[field]) continue;
+          let cost = null;
+          try { cost = price(def[field]) ?? null; } catch { cost = null; }
+          out.push({
+            name: def[field],
+            cost,
+            available: row?.result?.Success === true,
+            why: row?.result?.Success ? null : needed(row?.result),
+          });
+        }
+      }
+      return out;
+    },
+    current: () => {
+      let gold = null;
+      try { gold = player?.Treasury?.goldBalance ?? null; } catch { gold = null; }
+      return gold === null ? null : `${Math.floor(gold)} gold in the treasury`;
+    },
+    args: (name) => {
+      const PLOT = typeof BUILD_PLOT === "undefined" ? null : BUILD_PLOT;
+      const row = GameInfo.Types.lookup(name);
+      if (!row) return null;
+      if (row.Kind === "KIND_UNIT") return { UnitType: row.Hash };
+      if (row.Kind !== "KIND_CONSTRUCTIBLE") return null;
+      // A building needs a plot, exactly as a build does; the engine lists the legal ones.
+      const base = { ConstructibleType: row.Hash };
+      const city = findOwnCity(PLAYER_ID, TARGET_ID);
+      if (!city) return base;
+      let check = null;
+      try { check = Game.CityCommands.canStart(city.id, CityCommandTypes.PURCHASE, base, false); }
+      catch { check = null; }
+      const plots = check?.Plots ?? [];
+      if (plots.length === 0) return base;
+      let chosen = plots[0];
+      if (typeof PLOT === "string" && /^\d+\s*,\s*\d+$/.test(PLOT)) {
+        const [px, py] = PLOT.split(",").map((n) => Number(n.trim()));
+        for (const index of plots) {
+          const at = GameplayMap.getLocationFromIndex(index);
+          if (at?.x === px && at?.y === py) { chosen = index; break; }
+        }
+      }
+      const at = GameplayMap.getLocationFromIndex(chosen);
+      return at ? { ...base, X: at.x, Y: at.y } : base;
     },
   },
   tech: {
@@ -300,12 +522,82 @@ const DECISIONS = {
     },
     current: () => null,
   },
+  belief: {
+    // A belief for the player's religion (panel-belief-picker.ts addNextBelief): ADD_BELIEF with
+    // the belief's hash, one at a time. NOTIFICATION_CHOOSE_BELIEF blocked a whole turn while an
+    // agent drove the game's own picker through the generic screen reader, whose belief cards
+    // carry no names — it clicked blind and the turn ran out.
+    scope: "player",
+    operation: () => PlayerOperationTypes.ADD_BELIEF,
+    api: () => Game.PlayerOperations,
+    args: (value) => {
+      const row = GameInfo.Types.lookup(value);
+      return row ? { BeliefType: row.Hash } : null;
+    },
+    list: () => {
+      const out = [];
+      try {
+        for (const belief of GameInfo.Beliefs ?? []) {
+          const cls = String(belief.BeliefClassType ?? "");
+          if (cls.includes("PANTHEON")) continue; // those are `civ pantheon`
+          let claimable = false;
+          try { claimable = Game.Religion?.isBeliefClaimable?.(belief.BeliefType) === true; } catch { claimable = false; }
+          if (!claimable) continue;
+          out.push({
+            name: belief.BeliefType,
+            title: locText(belief.Name ?? null),
+            does: `${shortName(cls) ?? "belief"}: ${locText(belief.Description ?? null) ?? ""}`,
+            available: true,
+          });
+        }
+      } catch { /* no religion API in this build */ }
+      return out;
+    },
+    current: () => {
+      try {
+        const religion = Game.Religion?.getPlayerReligion?.(PLAYER_ID) ?? null;
+        const held = religion?.getBeliefs?.() ?? [];
+        return held.length > 0 ? `beliefs held: ${held.map((b) => typeName("Beliefs", b) ?? String(b)).join(", ")}` : null;
+      } catch { return null; }
+    },
+  },
+  religion: {
+    // Founding a religion (panel-belief-picker.ts foundReligion): FOUND_RELIGION with the
+    // religion's hash. The beliefs come after, through `civ belief`.
+    scope: "player",
+    operation: () => PlayerOperationTypes.FOUND_RELIGION,
+    api: () => Game.PlayerOperations,
+    args: (value) => {
+      const row = GameInfo.Types.lookup(value);
+      return row ? { ReligionType: row.Hash } : null;
+    },
+    list: () => {
+      const out = [];
+      try {
+        for (const religion of GameInfo.Religions ?? []) {
+          let taken = false;
+          try { taken = Game.Religion?.hasBeenFounded?.(religion.ReligionType) === true; } catch { taken = false; }
+          if (taken) continue;
+          out.push({ name: religion.ReligionType, title: locText(religion.Name ?? null), available: true });
+        }
+      } catch { /* no religion API in this build */ }
+      return out;
+    },
+    current: () => null,
+  },
   attribute: {
     // Attribute points accumulate and are spent on tree nodes. Takes the node's ROW INDEX, not
     // its hash — another operation, another convention.
     scope: "player",
     operation: () => PlayerOperationTypes.BUY_ATTRIBUTE_TREE_NODE,
     api: () => Game.PlayerOperations,
+    // What clears NOTIFICATION_CAN_BUY_ATTRIBUTE_SKILL. The game's attribute screen sends this
+    // when it CLOSES (screen-attribute-trees.ts close()), buying or not — an agent that wanted to
+    // bank its points had no way to say so, and the prompt blocked 30 turns, 24 never resolved.
+    finish: () => ({
+      operation: PlayerOperationTypes.CONSIDER_ASSIGN_ATTRIBUTE,
+      args: {},
+    }),
     args: (value) => {
       for (const node of GameInfo.ProgressionTreeNodes ?? []) {
         if (node.ProgressionTreeNodeType === value) return { ProgressionTreeNodeType: node.$index };
@@ -326,6 +618,32 @@ const DECISIONS = {
     },
     current: () => null,
   },
+  capture: {
+    // A settlement just taken must be kept, razed or handed back to its founder before the turn
+    // ends (NOTIFICATION_CONSIDER_RAZE_CITY). The game's chooser sends CityCommandTypes.DESTROY
+    // with a Directive (model-city-capture-chooser.ts); it is a HUD panel `civ screen` never
+    // lists, and nothing here could send the command. In a domination match this fires on every
+    // conquest.
+    scope: "city",
+    operation: () => CityCommandTypes.DESTROY,
+    api: () => Game.CityCommands,
+    args: (value) => {
+      const directive = captureChoices()[String(value).toLowerCase()];
+      return directive === undefined ? null : { Directive: directive };
+    },
+    list: () => {
+      const city = findOwnCity(PLAYER_ID, TARGET_ID);
+      if (!city) return [];
+      return Object.entries(captureChoices()).map(([name, directive]) => {
+        let check = null;
+        try { check = Game.CityCommands.canStart(city.id, CityCommandTypes.DESTROY, { Directive: directive }, false); }
+        catch { check = null; }
+        const available = check?.Success === true;
+        return { name, available, why: available ? null : needed(check) };
+      });
+    },
+    current: () => null,
+  },
   promote: {
     // A promotion needs BOTH hashes: the promotion and the discipline it belongs to
     // (panel-unit-promotion.ts). UNITCOMMAND_PROMOTE reached agents only inside the
@@ -340,44 +658,27 @@ const DECISIONS = {
     // pairing with canStart, the same check the list uses.
     args: (name) => {
       const unit = findOwnUnit(PLAYER_ID, TARGET_ID);
-      let fallback = null;
-      for (const detail of tableRows(GameInfo.UnitPromotionDisciplineDetails)) {
+      if (!unit) return null;
+      for (const detail of promotionRows(unit)) {
         if (detail.UnitPromotionType !== name) continue;
-        const candidate = {
-          PromotionType: Database.makeHash(name),
-          PromotionDisciplineType: Database.makeHash(detail.UnitPromotionDisciplineType),
-        };
-        fallback ??= candidate;
-        if (!unit) continue;
-        try {
-          if (Game.UnitCommands.canStart(unit.id, UnitCommandTypes.PROMOTE, candidate, false)?.Success === true) {
-            return candidate;
-          }
-        } catch { /* try the next discipline */ }
+        const gate = promotionGate(unit, detail.UnitPromotionDisciplineType, name);
+        if (gate.ok) return gate.args;
       }
-      return fallback;
+      // Not one the tree allows. The old fallback sent the first pairing anyway; canStart said
+      // yes, the engine did nothing, and the agent read "ok" eleven times in one 480s turn.
+      const legal = promotionChoices(unit).map((c) => c.name);
+      return {
+        __refuse: {
+          code: "NOT_AVAILABLE",
+          message: `${name} is not a promotion this unit can take now` +
+            (legal.length > 0 ? `; it can take: ${legal.join(", ")}` : "; it has none to take"),
+          hint: `\`civ promote ${TARGET_ID}\` lists the ones it can take, with what each does`,
+        },
+      };
     },
     list: () => {
       const unit = findOwnUnit(PLAYER_ID, TARGET_ID);
-      if (!unit) return [];
-      const seen = new Set();
-      const out = [];
-      for (const detail of tableRows(GameInfo.UnitPromotionDisciplineDetails)) {
-        const name = detail.UnitPromotionType;
-        if (!name || seen.has(name)) continue;
-        const args = {
-          PromotionType: Database.makeHash(name),
-          PromotionDisciplineType: Database.makeHash(detail.UnitPromotionDisciplineType),
-        };
-        let available = false;
-        try { available = Game.UnitCommands.canStart(unit.id, UnitCommandTypes.PROMOTE, args, false)?.Success === true; }
-        catch { available = false; }
-        if (!available) continue;
-        seen.add(name);
-        const def = GameInfo.UnitPromotions?.lookup?.(Database.makeHash(name));
-        out.push({ name, title: locText(def?.Name ?? null), does: locText(def?.Description ?? null), available: true });
-      }
-      return out;
+      return unit ? promotionChoices(unit) : [];
     },
     current: () => {
       const unit = findOwnUnit(PLAYER_ID, TARGET_ID);
@@ -515,31 +816,96 @@ const DECISIONS = {
   },
 
   age: {
-    // Finishing an Age transition. The only call the game's own age-transition screen makes is
-    // { Finished: true } — the civ and bonus picks go through their own choosers first, and this
-    // says "I am done". Nothing else takes an argument, so this decision takes no value.
+    // The Age boundary has TWO steps, and this decision covers both.
+    //
+    // `finish`: the transition itself — { Finished: true }, the one call the game's own
+    // age-transition screen makes once the civ pick is made (agefinish.js makes it for you).
+    //
+    // A CARD: the new Age's dedications. The dedication screen is a deck of "advanced start"
+    // cards: ADVANCED_START_MODIFY_DECK adds or removes one, then USE_EFFECT per card effect and
+    // ADVANCED_START_MARK_COMPLETED close it (legacies-support.ts, dedications-model.ts). None
+    // of that had a command: `civ age` printed nothing while end-turn demanded `civ age finish`,
+    // and agents drove the screen by hand 44 times with truncated control labels.
     scope: "player",
-    operation: () => PlayerOperationTypes.SET_AGE_TRANSITION_DATA,
+    operation: (value) =>
+      String(value).toLowerCase() === "finish"
+        ? PlayerOperationTypes.SET_AGE_TRANSITION_DATA
+        : PlayerOperationTypes.ADVANCED_START_MODIFY_DECK,
     api: () => Game.PlayerOperations,
-    args: () => ({ Finished: true }),
+    args: (value) => {
+      const typed = String(value).trim();
+      if (typed.toLowerCase() === "finish") return { Finished: true };
+      const drop = typed.startsWith("-");
+      const id = drop ? typed.slice(1) : typed;
+      const known = dedicationCards().some((card) => card.id === id) || deckCards().includes(id);
+      return known ? { Type: drop ? "REMOVE" : "ADD", ID: id } : null;
+    },
     list: () => {
-      // Offer it only when the engine will accept it, so it never appears as a dead option.
+      const out = [];
+      // Offer the transition only when the engine will accept it, so it never appears as a dead option.
       let allowed = false;
       try {
         allowed = Game.PlayerOperations.canStart(PLAYER_ID, PlayerOperationTypes.SET_AGE_TRANSITION_DATA, { Finished: true }, false)?.Success === true;
       } catch { allowed = false; }
-      return allowed ? [{ name: "finish", available: true }] : [];
+      if (allowed) out.push({ name: "finish", title: "submit the Age transition (the civilization pick is made for you)", available: true });
+      const deck = deckCards();
+      for (const card of dedicationCards()) {
+        const held = deck.includes(card.id);
+        let can = false;
+        try {
+          can = Game.PlayerOperations.canStart(PLAYER_ID, PlayerOperationTypes.ADVANCED_START_MODIFY_DECK, { Type: "ADD", ID: card.id }, false)?.Success === true;
+        } catch { can = false; }
+        out.push({ name: card.id, title: card.title, does: card.does, available: held || can, active: held, why: held || can ? null : "not affordable or the deck is full" });
+      }
+      return out;
     },
-    current: () => null,
+    current: () => {
+      const deck = deckCards();
+      const points = legacyPoints();
+      if (deck.length === 0 && points.length === 0) return null;
+      return `${deck.length > 0 ? `dedications chosen: ${deck.join(", ")}` : "no dedication chosen yet"}` +
+        (points.length > 0 ? `; points to spend: ${points.join(", ")}` : "");
+    },
+    // Closing the dedication screen: use every effect of every card in the deck, keep the
+    // capital, then mark the deck complete — confirmDeck() in dedications-model.ts, in order.
+    finish: () => {
+      const start = player?.AdvancedStart;
+      const ops = Game.PlayerOperations;
+      try {
+        for (const card of start?.getCards?.() ?? []) {
+          for (const effect of card?.info?.effects ?? []) {
+            for (let i = 0; i < (effect?.amount ?? 1); i++) {
+              const args = { ID: effect.id };
+              if (ops.canStart(PLAYER_ID, PlayerOperationTypes.ADVANCED_START_USE_EFFECT, args, false)?.Success === true) {
+                ops.sendRequest(PLAYER_ID, PlayerOperationTypes.ADVANCED_START_USE_EFFECT, args);
+              }
+            }
+          }
+        }
+        const capital = player?.Cities?.getCapital?.();
+        if (capital?.id && PlayerOperationTypes.SELECT_CAPITAL !== undefined) {
+          const swap = player.previousAgeCivilizationType !== undefined && player.previousAgeCivilizationType !== player.civilizationType;
+          const args = { Player1: PLAYER_ID, City: capital.id.id ?? capital.id, Swap: swap };
+          if (ops.canStart(PLAYER_ID, PlayerOperationTypes.SELECT_CAPITAL, args, false)?.Success === true) {
+            ops.sendRequest(PLAYER_ID, PlayerOperationTypes.SELECT_CAPITAL, args);
+          }
+        }
+      } catch { /* the mark-completed below is what the notification waits on */ }
+      return { operation: PlayerOperationTypes.ADVANCED_START_MARK_COMPLETED, args: {} };
+    },
   },
   government: {
     // Row index, not hash, plus an Action enum — a different convention again.
     scope: "player",
     operation: () => PlayerOperationTypes.CHANGE_GOVERNMENT,
     api: () => Game.PlayerOperations,
+    // Accept the short form too: CLASSICAL_REPUBLIC means GOVERNMENT_CLASSICAL_REPUBLIC.
     args: (name) => {
+      const wanted = String(name).toUpperCase();
       for (const def of GameInfo.Governments ?? []) {
-        if (def.GovernmentType === name) return { GovernmentType: def.$index, Action: ACTIVATE };
+        if (def.GovernmentType === wanted || def.GovernmentType === `GOVERNMENT_${wanted}`) {
+          return { GovernmentType: def.$index, Action: ACTIVATE };
+        }
       }
       return null;
     },
@@ -593,7 +959,11 @@ function storyChoices() {
       try {
         const target = GameInfo.NarrativeStories.lookup(Database.makeHash(link.ToNarrativeStoryType));
         title = locText(target?.Name ?? null);
-        does = locText(target?.Completion ?? target?.Description ?? null);
+        // A completion text the game has no string for comes back as its LOC key; that told an
+        // agent nothing (105 of 129 option lines). Fall back to the description, then to nothing.
+        does = [target?.Completion, target?.Description]
+          .map((text) => locText(text ?? null))
+          .find((text) => text && !String(text).startsWith("LOC_")) ?? null;
       } catch { /* id alone is still an answer */ }
       links.push({ name: link.ToNarrativeStoryType, title, does });
     }
@@ -612,6 +982,50 @@ function promotionDetail(name) {
 }
 
 /** The engine's own words for why something is unavailable. */
+/** The dedication cards on offer at the start of an Age, by id, with their text. */
+function dedicationCards() {
+  const out = [];
+  try {
+    const start = player?.AdvancedStart;
+    if (start?.getPlacementComplete?.() === true) return out;
+    for (const card of start?.getAvailableCards?.() ?? []) {
+      if (!card?.id) continue;
+      out.push({ id: String(card.id), title: cardText(card.name), does: cardText(card.description) });
+    }
+  } catch { /* no Age boundary */ }
+  return out;
+}
+
+/** The ids already in the dedication deck. */
+function deckCards() {
+  try { return (player?.AdvancedStart?.getCards?.() ?? []).map((card) => String(card?.info?.id ?? card?.id ?? "")).filter(Boolean); }
+  catch { return []; }
+}
+
+/** Legacy points still unspent, as "category N". */
+function legacyPoints() {
+  try {
+    return (player?.AdvancedStart?.getLegacyPoints?.() ?? [])
+      .filter((point) => (point?.value ?? 0) > 0)
+      .map((point) => `${shortName(String(point.category ?? "")) || point.category} ${point.value}`);
+  } catch { return []; }
+}
+
+/** Card text is a LOC key, or an array whose first element is the key and the rest its arguments. */
+function cardText(value) {
+  if (Array.isArray(value)) {
+    try { return Locale.compose(...value.map((part) => (typeof part === "string" && part.startsWith("LOC_") ? Locale.compose(part) : part))); }
+    catch { return value[0] ?? null; }
+  }
+  return locText(value ?? null);
+}
+
+/** The three answers to a conquest, by the word an agent types. */
+function captureChoices() {
+  if (typeof DirectiveTypes === "undefined") return {};
+  return { keep: DirectiveTypes.KEEP, raze: DirectiveTypes.RAZE, liberate: DirectiveTypes.LIBERATE_FOUNDER };
+}
+
 function needed(result) {
   const req = result?.Requirements;
   if (req?.NeededPopulation) return `needs population ${req.NeededPopulation}`;
@@ -629,9 +1043,31 @@ function nodeList(tree) {
   const out = [];
   for (const nodeType of tree?.getAllAvailableNodeTypes?.() ?? []) {
     const def = GameInfo.ProgressionTreeNodes.lookup(nodeType);
-    if (def) out.push({ name: def.ProgressionTreeNodeType, turns: tree.getTurnsForNode?.(nodeType) ?? null });
+    if (!def) continue;
+    out.push({
+      name: def.ProgressionTreeNodeType,
+      title: locText(def.Name ?? null) || null,
+      // What it unlocks, on the line. Agents read ProgressionTreeNodeUnlocks.json 179 times in
+      // one night to learn this, and forgot it two turns later each time.
+      does: unlocksOf(def.ProgressionTreeNodeType),
+      turns: tree.getTurnsForNode?.(nodeType) ?? null,
+    });
   }
   return out;
+}
+
+/** "unlocks: brickyard, granary" for a tech or civic — the names, modifiers left out. */
+function unlocksOf(nodeType) {
+  const names = [];
+  try {
+    for (const row of tableRows(GameInfo.ProgressionTreeNodeUnlocks)) {
+      if (row.ProgressionTreeNodeType !== nodeType || row.Hidden || !row.TargetType) continue;
+      if (row.TargetKind === "KIND_MODIFIER") continue;
+      const short = shortName(row.TargetType);
+      if (short && !names.includes(short)) names.push(short);
+    }
+  } catch { /* no unlock table */ }
+  return names.length > 0 ? `unlocks ${names.join(", ")}` : null;
 }
 
 /** What a tree is working on. getResearching() returns an OBJECT whose .type is the hash. */
@@ -663,6 +1099,8 @@ const BLOCKER_DECISIONS = [
   [/TRADITION|POLICY|POLICIES/, "tradition"],
   [/GOVERNMENT/, "government"],
   [/PANTHEON/, "pantheon"],
+  [/BELIEF/, "belief"],
+  [/FOUND_RELIGION|CHOOSE_RELIGION/, "religion"],
   [/ATTRIBUTE/, "attribute"],
   [/NARRATIVE|STORY/, "story"],
   [/CELEBRATION|GOLDEN/, "celebration"],
@@ -670,7 +1108,43 @@ const BLOCKER_DECISIONS = [
   [/TECH|RESEARCH/, "tech"],
   // Not a bare /AGE/: that matched VILLAGE, PILLAGE and DAMAGE, and the misclassification hid
   // the real blocker. required.ts uses the same safe pattern.
-  [/AGE_TRANSITION|AGE_ENDED|CHOOSE_AGE/, "age"],
+  [/AGE_TRANSITION|AGE_ENDED|CHOOSE_AGE|ADVANCED_START|DEDICATION/, "age"],
+  // Settlement- and unit-scoped decisions, with the finder that names their subject. These
+  // came back NEEDS_A_TARGET before, which the forced end-turn could do nothing with: a citizen
+  // to place, an empty build queue, a town focus, a promotion or a conquest each stalled the
+  // seat until the harness answered "?" and gave up.
+  [/RAZE_CITY/, "capture", () => justConqueredCity(PLAYER_ID)?.id ?? null],
+  [/TOWN_PROJECT/, "build", () => {
+    for (const cid of player?.Cities?.getCityIds?.() ?? []) {
+      const city = Cities.get(cid);
+      if (city?.isTown && townFocusChoices(city).length > 0) return String(cid.id ?? cid);
+    }
+    return null;
+  }],
+  [/CITY_PRODUCTION|CHOOSE_PRODUCTION/, "build", () => {
+    for (const cid of player?.Cities?.getCityIds?.() ?? []) {
+      const queue = Cities.get(cid)?.BuildQueue;
+      let empty = false;
+      try { empty = queue?.isEmpty === true || (queue?.getQueue?.() ?? []).length === 0; } catch { empty = false; }
+      if (empty) return String(cid.id ?? cid);
+    }
+    return null;
+  }],
+  [/NEW_POPULATION|POPULATION_GROWTH/, "expand", () => {
+    for (const cid of player?.Cities?.getCityIds?.() ?? []) {
+      if (expandPlots(cid).length > 0) return String(cid.id ?? cid);
+    }
+    return null;
+  }],
+  [/UNIT_PROMOTION|PROMOTION_AVAILABLE/, "promote", () => {
+    for (const cid of player?.Units?.getUnitIds?.() ?? []) {
+      const xp = Units.get(cid)?.Experience;
+      let can = false;
+      try { can = xp?.canPromote === true || (xp?.getStoredPromotionPoints ?? 0) > 0; } catch { can = false; }
+      if (can) return String(cid.id ?? cid);
+    }
+    return null;
+  }],
 ];
 
 // `typeof` because the adapter declares a const only for the values it was given, and the two
@@ -680,8 +1154,12 @@ if (typeof BLOCKER !== "undefined" && BLOCKER) {
   if (!match) return { ok: false, code: "NO_AUTO_ANSWER", blocker: BLOCKER };
   const what = match[1];
   const auto = DECISIONS[what];
-  // A city-scoped decision needs to know WHICH settlement, and a blocker name does not say.
-  if (auto.scope !== "player") return { ok: false, code: "NEEDS_A_TARGET", what, blocker: BLOCKER };
+  // A city- or unit-scoped decision needs to know WHICH subject, and a blocker name does not
+  // say. The row's finder names it; the caller then lists that subject's options and picks one.
+  if (auto.scope !== "player") {
+    const target = match[2]?.() ?? null;
+    return { ok: false, code: "NEEDS_A_TARGET", what, blocker: BLOCKER, target };
+  }
 
   const tried = [];
   for (const item of auto.list?.() ?? []) {
@@ -689,7 +1167,7 @@ if (typeof BLOCKER !== "undefined" && BLOCKER) {
     const autoArgs = auto.args(item.name);
     if (!autoArgs) continue;
     tried.push(item.name);
-    const attempt = startOperation(auto.api(), PLAYER_ID, auto.operation(), autoArgs);
+    const attempt = startOperation(auto.api(), PLAYER_ID, auto.operation(item.name), autoArgs);
     if (attempt.ok) {
       // Adopting is not the same as being finished. Close the consideration too, or the blocker
       // survives the answer and the turn still cannot end.
@@ -741,7 +1219,13 @@ if (!THING) {
   // the command must still return the options an agent needs.
   let current = null;
   try { current = decision.current?.() ?? null; } catch { current = null; }
-  return { ok: true, listing: true, current, options };
+  const result = { ok: true, listing: true, current, options };
+  // Say in plain words why a town's list is so short.
+  if (WHAT === "build" && findOwnCity(PLAYER_ID, TARGET_ID)?.isTown) {
+    result.note = "this is a town: the only thing a town builds is its focus. Its units and buildings " +
+      "are bought with gold — `civ buy " + String(TARGET_ID) + "` lists what it can buy";
+  }
+  return result;
 }
 
 // "done" closes a decision the agent has finished with, where the game has such a step.
@@ -756,6 +1240,7 @@ if (decision.finish && String(THING).toLowerCase() === "done") {
 }
 
 const args = decision.args(THING);
+if (args && args.__refuse) return { ok: false, ...args.__refuse };
 if (!args) {
   // Name what there IS. "This game has no story named DISCOVERY_24001C" is true and useless: the
   // agent invented the name because it had no list, and a hint that says "run the command again
@@ -765,7 +1250,19 @@ if (!args) {
   // Story ids are per-instance: an id from an earlier story WAS valid when the harness printed
   // it. "This game has no story named X" read as a contradiction, because the hint had offered
   // that exact id a turn before. Say what actually happened.
-  const message = WHAT === "story"
+  // A unit or building named for a town. "This game has no build named UNIT_SCOUT" is false and
+  // sends the agent to try another unit.
+  let townRefusal = null;
+  if (WHAT === "build") {
+    const kind = GameInfo.Types.lookup(THING)?.Kind;
+    const city = findOwnCity(PLAYER_ID, TARGET_ID);
+    if (city?.isTown && (kind === "KIND_UNIT" || kind === "KIND_CONSTRUCTIBLE")) {
+      townRefusal = `${locText(city.name ?? null) || `settlement ${TARGET_ID}`} is a town, and a town builds ` +
+        `no units or buildings — it buys them with gold: \`civ buy ${TARGET_ID} ${THING}\`. ` +
+        `The only thing to BUILD in a town is its focus`;
+    }
+  }
+  const message = townRefusal ? townRefusal : WHAT === "story"
     ? `${THING} is not an answer to the story waiting on you` +
       (storyName() ? ` (${storyName()})` : "") +
       ` — story ids are new for every story, so an id from an earlier one is never valid again`
@@ -794,14 +1291,20 @@ if (decision.scope === "unit" && !target) {
   return { ok: false, code: "NO_SUCH_UNIT", message: `you have no unit ${TARGET_ID}` };
 }
 
-const result = startOperation(decision.api(), target, decision.operation(), args);
+const result = startOperation(decision.api(), target, decision.operation(THING), args);
 if (!result.ok) {
   // A refusal the engine will not explain, on a decision whose list already knows the answer.
   // `civ tradition X` was refused with "no reason" while `civ tradition` was saying, in the same
   // breath, that every slot was full. Ask the list.
   const options = decision.list?.() ?? [];
   const listed = options.find((item) => item.name === THING);
-  if (listed?.why) result.message = listed.why;
+  // "Not enough gold" with no price sent agents guessing; the list knows the price.
+  if (listed?.why) {
+    result.message = listed.why;
+    if (WHAT === "buy" && listed.cost !== null && listed.cost !== undefined) {
+      result.message += ` — it costs ${listed.cost} gold and you have ${Math.floor(player?.Treasury?.goldBalance ?? 0)}`;
+    }
+  }
   else if (listed?.active) result.message = `you already have ${THING}`;
   else if (!listed && options.length === 0 && WHAT === "expand") {
     // No plots at all means no citizen is waiting, not a badly chosen plot. Saying "26,25 is not
@@ -829,6 +1332,20 @@ if (!result.ok) {
         (available.length > 12 ? `, and ${available.length - 12} more` : "");
     }
   }
+  if (WHAT === "age") {
+    // `civ age finish` was refused 59 times in one run, 46 of them repeats: the seat had already
+    // finished, the transition's dedication screen stood open, and "no reason" sent it back to
+    // the same command. Say what is left.
+    const open = typeof screenInventory === "function" ? screenInventory() : [];
+    const cards = dedicationCards();
+    result.message = "the Age transition has nothing left for you to submit — it is already finished for " +
+      "your seat, or it has not begun";
+    result.hint = cards.length > 0
+      ? `the new Age's dedications are what is waiting: \`civ age\` lists them, \`civ age <CARD>\` picks one (up to three), \`civ age done\` closes the choice`
+      : open.length > 0
+      ? `a screen is waiting on you instead: \`civ screen ${open[open.length - 1].id}\``
+      : "check /current/pending.txt for what the game is waiting on";
+  }
   if (!result.hint) result.hint = `run \`civ ${WHAT}\` with no value to see what there is`;
   return result;
 }
@@ -838,8 +1355,12 @@ if (!result.ok) {
 // with no value reads the truth a moment later, and so do the files under /current.
 // `build` appends to a queue; every other decision replaces a single choice. Saying "set to"
 // for a build was how an agent came to believe its order had been ignored.
+if (decision.after) {
+  try { decision.after(target, args); } catch { /* the notification says whether it cleared */ }
+}
 result.note =
   WHAT === "build" ? `${THING} added to the build queue`
+  : WHAT === "buy" ? `purchase of ${THING} sent`
   : WHAT === "story" ? `story answered with ${THING}`
   : `${WHAT} set to ${THING}`;
 return result;
